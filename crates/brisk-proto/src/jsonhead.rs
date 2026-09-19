@@ -76,8 +76,9 @@ pub enum HeadError {
     /// Valid JSON whose top-level value is not an object.
     #[error("request body must be a JSON object")]
     NotAnObject,
-    /// Malformed JSON, a wrong type for `stream`, nesting deeper than 128
-    /// levels, or a recognized member given twice.
+    /// Malformed JSON, a wrong type for `stream`, more than 127 nested
+    /// arrays and objects (`serde_json`'s recursion limit), or a recognized
+    /// member given twice.
     #[error("invalid request body: {0}")]
     Json(#[source] serde_json::Error),
     /// No top-level `model` member.
@@ -106,8 +107,8 @@ pub enum HeadError {
 impl<'a> ChatHead<'a> {
     /// Parses `body`, borrowing from it.
     ///
-    /// The whole body is validated (syntax, trailing bytes, at most 128
-    /// levels of nesting), but only `model`, `stream`, `stream_options` and
+    /// The whole body is validated (syntax, trailing bytes, at most 127
+    /// nested arrays and objects), but only `model`, `stream`, `stream_options` and
     /// `stream_options.include_usage` are decoded. Without escapes in the
     /// model name nothing is allocated.
     pub fn parse(body: &'a [u8]) -> Result<Self, HeadError> {
@@ -290,6 +291,14 @@ fn parse_stream_options(body: &[u8], raw: &str) -> Result<StreamOptions, HeadErr
     if !raw.starts_with('{') {
         return Err(HeadError::InvalidStreamOptions);
     }
+    // The top-level pass captured `raw` without a depth limit, and the
+    // second pass below starts a fresh one, so a value nested exactly one
+    // level too deep for the whole body would pass both.
+    if nesting_depth(raw.as_bytes()) >= MAX_NESTING {
+        return Err(HeadError::Json(de::Error::custom(
+            "recursion limit exceeded",
+        )));
+    }
 
     // `raw` was only syntax-checked by the top-level pass; this second pass
     // over the (short) object applies the duplicate, case-folding and
@@ -324,6 +333,42 @@ fn parse_stream_options(body: &[u8], raw: &str) -> Result<StreamOptions, HeadErr
         value,
         include_usage,
     })
+}
+
+/// Most arrays and objects `serde_json` lets a document nest, the top-level
+/// object included; one more is a recursion-limit error.
+const MAX_NESTING: usize = 127;
+
+/// Deepest nesting of arrays and objects in `raw`, a value `serde_json` has
+/// already found syntactically valid, so brackets inside strings are the
+/// only ones to skip.
+fn nesting_depth(raw: &[u8]) -> usize {
+    let mut depth = 0_usize;
+    let mut deepest = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in raw {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 /// A fold-equivalent key is at most this many bytes longer than its field:
@@ -670,6 +715,15 @@ mod tests {
         assert!(!folds_to("\u{ff4d}odel".as_bytes(), b"model"));
         // The Kelvin sign folds onto `k`, which no declared field contains.
         assert!(folds_to("\u{212a}ey".as_bytes(), b"key"));
+    }
+
+    #[test]
+    fn nesting_depth_skips_brackets_in_strings() {
+        assert_eq!(nesting_depth(b"1"), 0);
+        assert_eq!(nesting_depth(b"{}"), 1);
+        assert_eq!(nesting_depth(br#"{"a":[[1],{"b":[]}]}"#), 4);
+        assert_eq!(nesting_depth(br#"{"a":"[[[{{\"]]"}"#), 1);
+        assert_eq!(nesting_depth(br#"{"a\\":["\\"]}"#), 2);
     }
 
     #[test]
