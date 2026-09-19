@@ -2,9 +2,47 @@
 //! model routes), reached only through a single accessor so that swapping it
 //! at runtime later touches this module alone (R10, D9).
 
+use std::sync::Arc;
+
 use hashbrown::HashMap;
 
+use crate::auth::KeyTable;
 use crate::spec::ChannelSpec;
+use crate::upstream::registry::ChannelSet;
+
+/// Everything a request reads from the configuration, built once by
+/// `Gateway::new` and never modified afterwards.
+#[derive(Debug)]
+pub(crate) struct Snapshot {
+    /// Virtual keys by digest.
+    pub(crate) keys: KeyTable,
+    /// Validated channels with their clients and weights.
+    pub(crate) channels: ChannelSet,
+    /// Channels per client-facing model name.
+    pub(crate) routes: ModelRoutes,
+}
+
+/// Holder of the current [`Snapshot`].
+#[derive(Debug)]
+pub(crate) struct State {
+    snapshot: Arc<Snapshot>,
+}
+
+impl State {
+    /// Holds `snapshot` for the lifetime of the gateway (D9).
+    pub(crate) fn new(snapshot: Snapshot) -> Self {
+        Self {
+            snapshot: Arc::new(snapshot),
+        }
+    }
+
+    /// The only way to reach the snapshot (R10). Returning a borrow keeps
+    /// the request path free of reference-count traffic; a later hot-reload
+    /// changes this accessor alone.
+    pub(crate) fn resolve(&self) -> &Snapshot {
+        &self.snapshot
+    }
+}
 
 /// Model name to the bitmap of channels serving it; bit `i` is
 /// `GatewaySpec::channels[i]`.
@@ -55,10 +93,33 @@ impl ModelRoutes {
 mod tests {
     use super::*;
     use crate::secret::Redacted;
+    use crate::spec::KeySpec;
     use crate::spec::{StreamUsage, Timeouts, WarmupTarget};
     use crate::upstream::UpstreamClientConfig;
 
     const TEST_MODEL: &str = "grok-4.6(xhigh)";
+
+    #[test]
+    fn resolve_returns_the_snapshot_it_was_built_with() {
+        let mut specs = [channel("a", &[TEST_MODEL]), channel("b", &["grok-4.6"])];
+        for spec in &mut specs {
+            // The test base URL is a loopback literal.
+            spec.client.allow_private = true;
+        }
+        let state = State::new(Snapshot {
+            keys: KeyTable::build(&[KeySpec {
+                name: String::from("k"),
+                sha256: [7; 32],
+            }])
+            .expect("one key"),
+            channels: ChannelSet::build(&specs).expect("valid channels"),
+            routes: ModelRoutes::build(&specs),
+        });
+        let snapshot = state.resolve();
+        assert_eq!(snapshot.channels.len(), 2);
+        assert_eq!(snapshot.routes.candidates(TEST_MODEL), 0b01);
+        assert!(std::ptr::eq(snapshot, state.resolve()));
+    }
 
     fn channel(name: &str, models: &[&str]) -> ChannelSpec {
         ChannelSpec {
