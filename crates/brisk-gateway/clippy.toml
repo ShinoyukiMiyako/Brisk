@@ -1,0 +1,19 @@
+# Crate-local clippy configuration for brisk-gateway (R1: no file I/O, blocking
+# calls or synchronous DNS on the request path). Clippy reads this file because
+# it looks for clippy.toml in CARGO_MANIFEST_DIR before walking up to parents.
+
+disallowed-methods = [
+    { path = "std::fs::read", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::read_to_string", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::read_dir", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::write", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::copy", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::File::open", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::File::create", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::File::create_new", reason = "R1: no file I/O in the data plane" },
+    { path = "std::fs::OpenOptions::open", reason = "R1: no file I/O in the data plane" },
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "R1: blocking DNS; resolve through the async resolver" },
+    { path = "tokio::task::spawn_blocking", reason = "R1: no blocking work on the data-plane runtime" },
+    { path = "tokio::task::block_in_place", reason = "R1: no blocking work on the data-plane runtime", allow-invalid = true },
+    { path = "std::thread::sleep", reason = "R1: blocks a runtime worker; use tokio::time::sleep" },
+]
