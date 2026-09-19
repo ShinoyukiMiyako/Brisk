@@ -279,7 +279,7 @@ fn the_checks_catch_unsanitised_content() {
             "gemini response id",
             br#"{"responseId":"31d38a12-6d2c-97cf-aa2f-de99d438b420"}"#,
         ),
-        ("escaped id", br#"{"id":"abc"}"#),
+        ("escaped id", br#"{"id":"\u0061bc"}"#),
         (
             "cache key",
             br#"{"prompt_cache_key":"4f7c7ed7-3afc-5169-8f1f-bad75c178a20"}"#,
