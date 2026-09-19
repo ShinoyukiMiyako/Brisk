@@ -234,9 +234,44 @@ fn stream_records_ttft_and_chunk_metrics_and_compares() {
     assert!(ttft.min_ns >= 20_000_000, "{ttft:?}");
     let chunks = run_a.summary[&Metric::ChunkLatency];
     assert!(chunks.count > ttft.count, "{chunks:?} {ttft:?}");
-    assert_eq!(run_a.summary[&Metric::ChunkWire].count, chunks.count);
-    assert_eq!(run_a.summary[&Metric::MockWriteLag].count, chunks.count);
+    // Each received marker records one wire time, one mock write lag and one
+    // chunk counted in its interval, all at the same receive time.
+    let markers = run_a.summary[&Metric::ChunkWire].count;
+    assert_eq!(run_a.summary[&Metric::MockWriteLag].count, markers);
+    let measured_chunks: u64 = run_a
+        .intervals
+        .iter()
+        .filter(|i| i.index >= run_a.warmup_intervals)
+        .map(|i| i.chunks)
+        .sum();
+    assert_eq!(measured_chunks, markers);
     assert!(run_a.summary[&Metric::EmitLag].count > 0);
+    let counters = &read_document(&a)["loadgen"]["counters"];
+    let counter = |name: &str| counters[name].as_u64().unwrap();
+    // Chunk latency also holds lower bounds for the chunks already due on
+    // streams still open when the run ends, which carry no marker. With the
+    // default request timeout nothing times out here, so those streams are
+    // the only censored requests and all their samples land in the last,
+    // measured interval: the chunk-latency surplus is part of them. Slow
+    // hosts leave more chunks overdue at the end, so the surplus itself
+    // varies.
+    assert!(chunks.count >= markers, "{chunks:?} markers {markers}");
+    assert!(
+        chunks.count - markers <= counter("censored_samples"),
+        "{chunks:?} markers {markers} {counters}"
+    );
+    assert!(
+        counter("censored_requests") <= counter("open_at_end"),
+        "{counters}"
+    );
+    // The contract requires a kernel receive timestamp for every receive on
+    // Linux; other platforms have none and fall back to the clock.
+    let untimed = counter("rx_batches_without_timestamp");
+    if cfg!(target_os = "linux") {
+        assert_eq!(untimed, 0, "{counters}");
+    } else {
+        assert_eq!(untimed, counter("rx_batches"), "{counters}");
+    }
     let errors: u64 = run_a
         .intervals
         .iter()
