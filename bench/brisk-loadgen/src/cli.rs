@@ -37,7 +37,9 @@ pub(crate) enum Command {
     /// Checks the load generator against the mock at twice a target
     /// concurrency.
     Selfcheck(SelfcheckCmd),
-    /// Compares two arms of result files with a moving-block bootstrap.
+    /// Compares two arms of result files, paired by repetition: a t
+    /// interval over the per-pair deltas, and a two-level bootstrap (whole
+    /// repetitions, then blocks within each run) for arm A's baseline.
     Compare(CompareCmd),
 }
 
@@ -77,6 +79,12 @@ pub(crate) struct CommonArgs {
     /// schedules, which pairs the arms of an A/B comparison.
     #[arg(long, default_value_t = 1)]
     pub(crate) seed: u64,
+    /// Repetition this run belongs to, e.g. `s1-P-r2`, recorded in the
+    /// result. Both arms of a repetition take the same id and `--seed`;
+    /// `compare` pairs the runs of its two arms by it, or by their seed when
+    /// no run carries one.
+    #[arg(long, value_parser = parse_pair_id)]
+    pub(crate) pair_id: Option<String>,
     /// Abandon a request that has not completed this long after its
     /// scheduled start, seconds.
     #[arg(long, default_value_t = 300.0, value_parser = parse_positive)]
@@ -263,12 +271,21 @@ pub(crate) struct CompareCmd {
     /// Bootstrap resamples.
     #[arg(long, default_value_t = stats::DEFAULT_RESAMPLES)]
     pub(crate) resamples: usize,
-    /// Moving-block length in intervals.
+    /// Moving-block length in intervals, for the resampling within each
+    /// run.
     #[arg(long, default_value_t = stats::DEFAULT_BLOCK_LEN)]
     pub(crate) block_len: usize,
     /// Bootstrap seed.
     #[arg(long, default_value_t = stats::DEFAULT_SEED)]
     pub(crate) seed: u64,
+    /// Metrics whose baseline criterion (arm A's p99 95% CI half-width
+    /// below 5% of its p99) decides the gate; each must be compared. The
+    /// other compared metrics are judged and reported but do not gate.
+    /// Without the flag, the compared ones of `ttft,chunk_latency` gate, or
+    /// every compared metric when neither is compared (e.g. S2's
+    /// `request_latency`).
+    #[arg(long, value_delimiter = ',', num_args = 1..)]
+    pub(crate) gate_metrics: Option<Vec<Metric>>,
     /// Accept result files whose run was judged invalid, or whose failure
     /// share exceeds a tenth of the highest quantile's tail.
     #[arg(long)]
@@ -359,6 +376,18 @@ pub(crate) fn parse_percent(s: &str) -> Result<f64, String> {
     }
 }
 
+/// Accepts a pairing id without whitespace or control characters, so it
+/// reads unambiguously in logs and file names.
+pub(crate) fn parse_pair_id(s: &str) -> Result<String, String> {
+    if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Err(format!(
+            "{s:?} is not a pairing id (non-empty, no whitespace)"
+        ))
+    } else {
+        Ok(s.to_owned())
+    }
+}
+
 /// Parses `Name: value`.
 pub(crate) fn parse_header(s: &str) -> Result<Header, String> {
     let (name, value) = s
@@ -441,6 +470,7 @@ mod tests {
         assert_eq!(cmd.max_slip_us, None);
         assert_eq!(cmd.common.shards, 1);
         assert_eq!(cmd.common.label, "run");
+        assert_eq!(cmd.common.pair_id, None);
         assert!(cmd.common.cpu_list.is_none());
     }
 
@@ -478,6 +508,8 @@ mod tests {
             "x-trace:1",
             "--label",
             "direct-T",
+            "--pair-id",
+            "sc-T-r1",
             "--out",
             "sc.json",
         ])
@@ -486,6 +518,7 @@ mod tests {
             panic!("expected selfcheck");
         };
         assert_eq!(cmd.common.shards, 2);
+        assert_eq!(cmd.common.pair_id.as_deref(), Some("sc-T-r1"));
         assert_eq!(cmd.common.cpu_list, Some(CpuSet(vec![2, 3])));
         assert_eq!(cmd.common.headers.len(), 2);
         assert_eq!(cmd.common.headers[0].name, "Authorization");
@@ -611,6 +644,7 @@ mod tests {
         assert_eq!(cmd.metric, [Metric::ChunkLatency, Metric::Ttft]);
         assert_eq!(cmd.quantiles, [0.5, 0.99, 0.999]);
         assert_eq!(cmd.resamples, stats::DEFAULT_RESAMPLES);
+        assert_eq!(cmd.gate_metrics, None);
         assert!(!cmd.allow_invalid);
 
         let explicit = parse(&[
@@ -623,6 +657,8 @@ mod tests {
             "ttft",
             "--quantiles",
             "90,99.99",
+            "--gate-metrics",
+            "ttft",
             "--out",
             "c",
         ])
@@ -630,6 +666,7 @@ mod tests {
         let Command::Compare(cmd) = explicit.command else {
             panic!("expected compare");
         };
+        assert_eq!(cmd.gate_metrics.as_deref(), Some(&[Metric::Ttft][..]));
         assert_eq!(cmd.quantiles.len(), 2);
         assert_eq!(cmd.quantiles[1], 0.9999);
         assert!(
@@ -649,6 +686,29 @@ mod tests {
         assert_eq!(parse_percent(".5"), Ok(0.005));
         assert_eq!(parse_percent("100"), Ok(1.0));
         assert_eq!(parse_percent("050"), Ok(0.5));
+    }
+
+    #[test]
+    fn pair_ids_are_validated() {
+        assert_eq!(parse_pair_id("s1-P-r2"), Ok("s1-P-r2".to_owned()));
+        assert!(parse_pair_id("").is_err());
+        assert!(parse_pair_id("r 1").is_err());
+        assert!(parse_pair_id("r1\u{7}").is_err());
+        for scenario in [
+            &["stream", "http://h:1", "--concurrency", "1"][..],
+            &["nonstream", "http://h:1", "--rate", "1"],
+            &["bigbody", "http://h:1", "--sizes", "1k", "--rate", "1"],
+        ] {
+            let mut args = scenario.to_vec();
+            args.extend_from_slice(&["--pair-id", "s1-P-r3", "--out", "o.json"]);
+            let pair_id = match parse(&args).unwrap().command {
+                Command::Stream(cmd) => cmd.common.pair_id,
+                Command::Nonstream(cmd) => cmd.common.pair_id,
+                Command::Bigbody(cmd) => cmd.common.pair_id,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(pair_id.as_deref(), Some("s1-P-r3"));
+        }
     }
 
     #[test]

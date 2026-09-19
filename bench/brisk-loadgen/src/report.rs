@@ -65,10 +65,13 @@ fn render_run(run: &RunResult, extension: &Extension) -> String {
 fn header(out: &mut String, run: &RunResult, extension: &Extension, measured: usize) {
     put!(
         out,
-        "{} {}  label={}  target={}{}",
+        "{} {}  label={}{}  target={}{}",
         run.tool,
         run.scenario,
         run.label,
+        run.pair_id
+            .as_deref()
+            .map_or_else(String::new, |id| format!("  pair={id}")),
         extension.target,
         if extension.tls { " (TLS)" } else { "" }
     );

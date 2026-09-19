@@ -13,7 +13,7 @@
 //! - [`transport`]: plaintext/TLS connections on nonblocking sockets with
 //!   `SO_TIMESTAMPNS` receive timestamps, listener setup, certificates;
 //! - [`dist`]: truncated log-normal stream lifetimes and Poisson arrivals;
-//! - [`stats`]: per-interval HDR histograms and block-bootstrap comparison;
+//! - [`stats`]: per-interval HDR histograms and paired bootstrap comparison;
 //! - [`result`] and [`fingerprint`]: the JSON result document;
 //! - [`cpu`]: CPU lists and thread pinning;
 //! - [`rlimit`]: raising the open-file limit.

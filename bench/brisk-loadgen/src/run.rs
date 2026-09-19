@@ -513,6 +513,7 @@ fn build_result(
         tool: TOOL.to_owned(),
         scenario: scenario.to_owned(),
         label: common.label.clone(),
+        pair_id: common.pair_id.clone(),
         params,
         fingerprint: Fingerprint::collect(),
         started_unix_ms: outcome.started_unix_ms,

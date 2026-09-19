@@ -1,11 +1,14 @@
-//! Per-interval latency histograms and block-bootstrap comparison of runs.
+//! Per-interval latency histograms and paired bootstrap comparison of runs.
 //!
 //! Every latency is recorded in nanoseconds into an HDR histogram covering
 //! 1 ns to 120 s with 3 significant digits. An [`IntervalRecorder`] keeps one
 //! live set of histograms and closes an interval (1 s by default) by encoding
 //! it with the V2 format plus base64, so memory does not grow with the length
-//! of a run. [`compare`] turns runs of two arms into bootstrap confidence
-//! intervals for quantile differences.
+//! of a run. [`compare`] turns paired repetitions of two arms into confidence
+//! intervals for quantile differences: a Student t interval over the
+//! per-pair differences, and a two-level bootstrap (whole repetitions, then
+//! blocks of intervals within each run) whose spread, widened for the few
+//! repetitions it draws from, bounds arm A's own quantiles.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -33,6 +36,8 @@ pub const DEFAULT_BLOCK_LEN: usize = 10;
 pub const DEFAULT_RESAMPLES: usize = 2000;
 /// Default bootstrap seed; fixed so reports are reproducible.
 pub const DEFAULT_SEED: u64 = 0x6272_6973_6b5f_6d30;
+/// Two-sided 95% quantile of the standard normal distribution.
+const Z_975: f64 = 1.959_963_984_540_054;
 
 /// Errors from histogram decoding and run comparison.
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +58,35 @@ pub enum StatsError {
         arm: &'static str,
         /// The compared metric.
         metric: Metric,
+    },
+    /// One run of an arm has no recorded values for the metric after warmup,
+    /// so its repetition has nothing to stand for.
+    #[error("run {run} of arm {arm} has no {metric} samples after warmup")]
+    EmptyRun {
+        /// `"A"` or `"B"`.
+        arm: &'static str,
+        /// Position of the run in its arm.
+        run: usize,
+        /// The compared metric.
+        metric: Metric,
+    },
+    /// The arms hold different numbers of runs, so they do not form pairs.
+    #[error("arm A has {a} run(s) and arm B {b}; runs compare in pairs, one per repetition")]
+    UnpairedRuns {
+        /// Runs of arm A.
+        a: usize,
+        /// Runs of arm B.
+        b: usize,
+    },
+    /// The two runs of a pair carry different pairing ids.
+    #[error("pair {pair} matches pairing id {a:?} of arm A with {b:?} of arm B")]
+    PairMismatch {
+        /// Position of the pair.
+        pair: usize,
+        /// Pairing id of the A run.
+        a: String,
+        /// Pairing id of the B run.
+        b: String,
     },
     /// A bootstrap resample drew only empty intervals.
     #[error("a bootstrap resample of arm {0} contained no samples")]
@@ -494,9 +528,9 @@ pub fn summarize(
 pub struct CompareOptions {
     /// Number of bootstrap resamples.
     pub resamples: usize,
-    /// Moving-block length in intervals.
+    /// Moving-block length in intervals, for the resampling within a run.
     pub block_len: usize,
-    /// RNG seed; arm B uses a derived seed so the arms resample independently.
+    /// RNG seed of the bootstrap.
     pub seed: u64,
 }
 
@@ -510,27 +544,86 @@ impl Default for CompareOptions {
     }
 }
 
-/// Bootstrap result for one quantile.
+/// Result for one quantile.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuantileDelta {
     /// The quantile in `[0, 1]`.
     pub quantile: f64,
-    /// Point estimate for arm A, nanoseconds.
+    /// Point estimate for arm A over all its runs, nanoseconds.
     pub a_ns: u64,
-    /// Point estimate for arm B, nanoseconds.
+    /// Point estimate for arm B over all its runs, nanoseconds.
     pub b_ns: u64,
     /// `b_ns − a_ns`.
     pub delta_ns: i64,
-    /// Lower end of the 95% percentile interval of Δ.
+    /// Lower end of the 95% interval of Δ, built as
+    /// [`Comparison::delta_interval`] says.
     pub delta_ci_low_ns: f64,
-    /// Upper end of the 95% percentile interval of Δ.
+    /// Upper end of the 95% interval of Δ.
     pub delta_ci_high_ns: f64,
-    /// Lower end of the 95% interval of arm A's quantile.
+    /// Lower end of the two-level bootstrap's 95% percentile interval of Δ.
+    /// Diagnostic only: with few repetitions it is too narrow whenever the
+    /// pairs differ more than their runs' own noise explains.
+    pub delta_bootstrap_ci_low_ns: f64,
+    /// Upper end of the bootstrap percentile interval of Δ.
+    pub delta_bootstrap_ci_high_ns: f64,
+    /// Lower end of the 95% interval of arm A's quantile: the bootstrap
+    /// percentile interval widened around `a_ns` by
+    /// [`Comparison::a_interval_scale`].
     pub a_ci_low_ns: f64,
     /// Upper end of the 95% interval of arm A's quantile.
     pub a_ci_high_ns: f64,
-    /// Half-width of arm A's interval divided by `a_ns`.
+    /// Lower end of the unwidened bootstrap percentile interval of arm A's
+    /// quantile (diagnostic).
+    pub a_bootstrap_ci_low_ns: f64,
+    /// Upper end of the unwidened bootstrap percentile interval of arm A.
+    pub a_bootstrap_ci_high_ns: f64,
+    /// Half-width of arm A's (widened) interval divided by `a_ns`.
     pub a_ci_half_width_ratio: f64,
+}
+
+/// How [`QuantileDelta::delta_ci_low_ns`] and `delta_ci_high_ns` were built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeltaInterval {
+    /// Student t interval over the per-pair Δ with `pairs − 1` degrees of
+    /// freedom, centred on the pooled point estimate.
+    PairedT,
+    /// One repetition only: the block bootstrap percentile interval within
+    /// its two runs, which leaves out the run-to-run spread.
+    WithinRunBootstrap,
+}
+
+/// One quantile of a single pair of runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairQuantile {
+    /// The quantile in `[0, 1]`.
+    pub quantile: f64,
+    /// The A run's quantile, nanoseconds.
+    pub a_ns: u64,
+    /// The B run's quantile, nanoseconds.
+    pub b_ns: u64,
+    /// `b_ns − a_ns`.
+    pub delta_ns: i64,
+}
+
+/// The quantiles of one repetition: `a_runs[pair]` against `b_runs[pair]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairDelta {
+    /// Position of the pair in the compared run lists.
+    pub pair: usize,
+    /// The runs' [`RunResult::pair_id`], when they carry one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
+    /// Post-warmup intervals of the A run.
+    pub a_intervals: usize,
+    /// Post-warmup intervals of the B run.
+    pub b_intervals: usize,
+    /// Samples of the A run.
+    pub a_count: u64,
+    /// Samples of the B run.
+    pub b_count: u64,
+    /// One entry per requested quantile, in request order.
+    pub quantiles: Vec<PairQuantile>,
 }
 
 /// Output of [`compare`].
@@ -544,38 +637,101 @@ pub struct Comparison {
     pub block_len: usize,
     /// RNG seed.
     pub seed: u64,
-    /// Post-warmup intervals pooled for arm A.
+    /// Repetitions compared, each a pair of one A run and one B run.
+    pub pairs: usize,
+    /// Only one repetition was given, so every resample drew blocks within
+    /// that one pair of runs: the intervals leave out the run-to-run spread
+    /// of the load and understate the uncertainty of the measurement.
+    pub single_repetition_fallback: bool,
+    /// How the intervals of Δ were built.
+    pub delta_interval: DeltaInterval,
+    /// Factor by which arm A's bootstrap percentile interval is widened
+    /// around its point estimate: `t(pairs − 1) / z · √(pairs / (pairs − 1))`,
+    /// 1 for a single repetition.
+    pub a_interval_scale: f64,
+    /// Post-warmup intervals of all A runs.
     pub a_intervals: usize,
-    /// Post-warmup intervals pooled for arm B.
+    /// Post-warmup intervals of all B runs.
     pub b_intervals: usize,
-    /// Samples pooled for arm A.
+    /// Samples of all A runs.
     pub a_count: u64,
-    /// Samples pooled for arm B.
+    /// Samples of all B runs.
     pub b_count: u64,
     /// One entry per requested quantile, in request order.
     pub quantiles: Vec<QuantileDelta>,
-    /// Half-width of arm A's p99 95% interval relative to its p99 (the M0
-    /// exit criterion requires `< 0.05`).
+    /// Half-width of arm A's (widened) p99 95% interval relative to its p99
+    /// (the M0 exit criterion requires `< 0.05`).
     pub baseline_p99_ci_half_width_ratio: f64,
+    /// Each repetition's own quantiles and Δ, in pair order; their spread is
+    /// the run-to-run variation the intervals account for.
+    pub per_pair: Vec<PairDelta>,
 }
 
-/// One arm's post-warmup intervals as sparse counts over a shared value axis.
+/// One run's post-warmup intervals as sparse counts over its arm's value
+/// axis.
+#[derive(Debug)]
+struct RunSeries {
+    /// Per interval: `(index into the arm's values, count)`.
+    intervals: Vec<Vec<(usize, u64)>>,
+    /// Samples over all intervals.
+    total: u64,
+}
+
+impl RunSeries {
+    /// Adds every interval into `counts`.
+    fn add_all(&self, counts: &mut [u64]) {
+        for &(idx, c) in self.intervals.iter().flatten() {
+            counts[idx] += c;
+        }
+    }
+
+    /// Adds one circular block resample of the run, as many intervals long
+    /// as the run, into `counts` and returns the samples added.
+    ///
+    /// Whole blocks keep the correlation between neighbouring intervals
+    /// (queues and load drift over seconds), which resampling single
+    /// intervals would break and so understate the variance. Blocks wrap
+    /// around the end of the run so that every interval is drawn equally
+    /// often; plain moving blocks under-draw the first and last
+    /// `block_len − 1` intervals.
+    fn add_resample(&self, rng: &mut fastrand::Rng, block_len: usize, counts: &mut [u64]) -> u64 {
+        let n = self.intervals.len();
+        let block = block_len.min(n);
+        let mut drawn = 0;
+        let mut total = 0;
+        while drawn < n {
+            let start = rng.usize(..n);
+            let take = block.min(n - drawn);
+            for offset in 0..take {
+                for &(idx, c) in &self.intervals[(start + offset) % n] {
+                    counts[idx] += c;
+                    total += c;
+                }
+            }
+            drawn += take;
+        }
+        total
+    }
+}
+
+/// One arm's runs over a value axis shared by those runs.
+#[derive(Debug)]
 struct Arm {
     /// Sorted distinct values (bucket highest-equivalent values).
     values: Vec<u64>,
-    /// Per interval: `(index into values, count)`.
-    series: Vec<Vec<(usize, u64)>>,
-    /// Valid block starts with their lengths; blocks never span two runs.
-    blocks: Vec<(usize, usize)>,
+    /// The runs, in pair order; none is empty.
+    runs: Vec<RunSeries>,
+    /// Samples over all runs.
     total: u64,
 }
 
 impl Arm {
-    fn build(runs: &[RunResult], metric: Metric, block_len: usize) -> Result<Self, StatsError> {
-        let mut raw: Vec<Vec<(u64, u64)>> = Vec::new();
-        let mut blocks = Vec::new();
+    /// Decodes the post-warmup histograms of `metric`; fails if the arm or
+    /// any of its runs holds no sample.
+    fn build(runs: &[RunResult], metric: Metric, arm: &'static str) -> Result<Self, StatsError> {
+        let mut raw: Vec<Vec<Vec<(u64, u64)>>> = Vec::with_capacity(runs.len());
         for run in runs {
-            let start = raw.len();
+            let mut intervals = Vec::new();
             for interval in run
                 .intervals
                 .iter()
@@ -589,34 +745,47 @@ impl Arm {
                             .map(|v| (v.value_iterated_to(), v.count_at_value())),
                     );
                 }
-                raw.push(entries);
+                intervals.push(entries);
             }
-            let len = raw.len() - start;
-            if len > 0 {
-                let block = block_len.min(len);
-                blocks.extend((start..=start + len - block).map(|s| (s, block)));
-            }
+            raw.push(intervals);
         }
-        let mut values: Vec<u64> = raw.iter().flatten().map(|&(v, _)| v).collect();
+        let mut values: Vec<u64> = raw.iter().flatten().flatten().map(|&(v, _)| v).collect();
         values.sort_unstable();
         values.dedup();
-        let series = raw
+        let runs: Vec<RunSeries> = raw
             .into_iter()
-            .map(|entries| {
-                entries
+            .map(|intervals| {
+                let intervals: Vec<Vec<(usize, u64)>> = intervals
                     .into_iter()
-                    // Every value is on the axis, so the search always hits.
-                    .map(|(v, c)| (values.binary_search(&v).unwrap_or_else(|at| at), c))
-                    .collect()
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            // Every value is on the axis, so the search always hits.
+                            .map(|(v, c)| (values.binary_search(&v).unwrap_or_else(|at| at), c))
+                            .collect()
+                    })
+                    .collect();
+                let total = intervals.iter().flatten().map(|&(_, c)| c).sum();
+                RunSeries { intervals, total }
             })
-            .collect::<Vec<Vec<_>>>();
-        let total = series.iter().flatten().map(|&(_, c)| c).sum();
+            .collect();
+        let total = runs.iter().map(|run| run.total).sum();
+        if total == 0 {
+            return Err(StatsError::EmptyArm { arm, metric });
+        }
+        if let Some(run) = runs.iter().position(|run| run.total == 0) {
+            return Err(StatsError::EmptyRun { arm, run, metric });
+        }
         Ok(Self {
             values,
-            series,
-            blocks,
+            runs,
             total,
         })
+    }
+
+    /// Post-warmup intervals over all runs.
+    fn intervals(&self) -> usize {
+        self.runs.iter().map(|run| run.intervals.len()).sum()
     }
 
     /// Fills `out` with one value per quantile; `false` if there are no
@@ -632,41 +801,21 @@ impl Arm {
         true
     }
 
-    /// Point estimates over all pooled intervals; `None` if the arm is empty.
-    fn pooled(&self, qs: &[f64]) -> Option<Vec<u64>> {
-        let mut counts = vec![0u64; self.values.len()];
-        for &(idx, c) in self.series.iter().flatten() {
-            counts[idx] += c;
-        }
-        let mut out = Vec::new();
-        self.quantiles(&counts, self.total, qs, &mut out)
-            .then_some(out)
-    }
-
-    /// One moving-block resample; returns `false` if it drew no samples.
-    fn resample(
+    /// Quantiles over the full data of `runs`; `None` if they hold no
+    /// sample.
+    fn quantiles_over<'r>(
         &self,
-        rng: &mut fastrand::Rng,
-        counts: &mut [u64],
+        runs: impl IntoIterator<Item = &'r RunSeries>,
         qs: &[f64],
-        out: &mut Vec<u64>,
-    ) -> bool {
-        counts.fill(0);
-        let n = self.series.len();
-        let mut drawn = 0;
+    ) -> Option<Vec<u64>> {
+        let mut counts = vec![0u64; self.values.len()];
         let mut total = 0;
-        while drawn < n {
-            let (start, len) = self.blocks[rng.usize(..self.blocks.len())];
-            let take = len.min(n - drawn);
-            for interval in &self.series[start..start + take] {
-                for &(idx, c) in interval {
-                    counts[idx] += c;
-                    total += c;
-                }
-            }
-            drawn += take;
+        for run in runs {
+            run.add_all(&mut counts);
+            total += run.total;
         }
-        self.quantiles(counts, total, qs, out)
+        let mut out = Vec::with_capacity(qs.len());
+        self.quantiles(&counts, total, qs, &mut out).then_some(out)
     }
 }
 
@@ -684,6 +833,60 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo as f64)
 }
 
+/// Two-sided 95% quantile of Student's t distribution with `df` degrees of
+/// freedom (`df ≥ 1`).
+///
+/// Exact to six decimals: tabulated up to 30 degrees of freedom, and above
+/// that the Cornish–Fisher expansion in `1 / df`, whose error there is
+/// below `1e-6`.
+fn student_t_975(df: usize) -> f64 {
+    const TABLE: [f64; 30] = [
+        12.706_205, 4.302_653, 3.182_446, 2.776_445, 2.570_582, 2.446_912, 2.364_624, 2.306_004,
+        2.262_157, 2.228_139, 2.200_985, 2.178_813, 2.160_369, 2.144_787, 2.131_450, 2.119_905,
+        2.109_816, 2.100_922, 2.093_024, 2.085_963, 2.079_614, 2.073_873, 2.068_658, 2.063_899,
+        2.059_539, 2.055_529, 2.051_831, 2.048_407, 2.045_230, 2.042_272,
+    ];
+    assert!(df >= 1, "a t interval needs at least one degree of freedom");
+    if let Some(&t) = TABLE.get(df - 1) {
+        return t;
+    }
+    let z = Z_975;
+    let v = as_f64(u64::try_from(df).unwrap_or(u64::MAX));
+    let (z3, z5, z7, z9) = (z.powi(3), z.powi(5), z.powi(7), z.powi(9));
+    z + (z3 + z) / (4.0 * v)
+        + (5.0 * z5 + 16.0 * z3 + 3.0 * z) / (96.0 * v.powi(2))
+        + (3.0 * z7 + 19.0 * z5 + 17.0 * z3 - 15.0 * z) / (384.0 * v.powi(3))
+        + (79.0 * z9 + 776.0 * z7 + 1482.0 * z5 - 1920.0 * z3 - 945.0 * z) / (92_160.0 * v.powi(4))
+}
+
+/// Factor that widens a percentile interval drawn from `pairs` repetitions
+/// to a 95% interval.
+///
+/// Resampling `R` repetitions with replacement estimates the run-to-run
+/// variance with divisor `R` instead of `R − 1` and uses the normal quantile
+/// where only `R − 1` degrees of freedom back it; at `R = 3` the percentile
+/// interval is barely the range of the three runs and covers about 80%.
+/// `t(R − 1) / z · √(R / (R − 1))` undoes both (2.69, 1.58 and 1.22 at 3, 5
+/// and 10 repetitions), which brought arm A's coverage to 93–95% in
+/// Monte Carlo runs drawn from the pilot data.
+fn run_to_run_scale(pairs: usize) -> f64 {
+    if pairs < 2 {
+        return 1.0;
+    }
+    let r = as_f64(u64::try_from(pairs).unwrap_or(u64::MAX));
+    student_t_975(pairs - 1) / Z_975 * (r / (r - 1.0)).sqrt()
+}
+
+/// 95% Student t interval of the mean of `values` (at least two), centred
+/// on `centre`.
+fn t_interval(centre: f64, values: &[f64]) -> (f64, f64) {
+    let n = as_f64(u64::try_from(values.len()).unwrap_or(u64::MAX));
+    let mean = values.iter().sum::<f64>() / n;
+    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let half = student_t_975(values.len() - 1) * (var / n).sqrt();
+    (centre - half, centre + half)
+}
+
 /// `b − a` as `i64`, saturating (histogram values stay far below 2^63).
 fn signed_delta(b: u64, a: u64) -> i64 {
     let d = i128::from(b) - i128::from(a);
@@ -695,6 +898,14 @@ fn signed_delta(b: u64, a: u64) -> i64 {
     reason = "nanosecond latencies are far below 2^53"
 )]
 fn as_f64(v: u64) -> f64 {
+    v as f64
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "nanosecond deltas are far below 2^53"
+)]
+fn delta_f64(v: i64) -> f64 {
     v as f64
 }
 
@@ -720,9 +931,36 @@ pub fn compare(
     )
 }
 
-/// Compares two arms: pools each arm's post-warmup intervals across runs,
-/// runs a moving-block bootstrap on each and reports `Δ = B − A` per quantile
-/// with 95% percentile intervals.
+/// Compares two arms of paired repetitions and reports `Δ = B − A` per
+/// quantile with 95% intervals.
+///
+/// `a_runs[i]` and `b_runs[i]` form repetition `i`: the two runs that shared
+/// its schedule (same seed) and its place in the session. Point estimates
+/// come from the full data of each arm, and every pair's own quantiles and
+/// Δ are reported in [`Comparison::per_pair`].
+///
+/// The interval of Δ is a Student t interval over the per-pair Δ with
+/// `pairs − 1` degrees of freedom, centred on the pooled point estimate. The
+/// spread of the pairs is the run-to-run variation itself, whatever part of
+/// it the two runs of a pair share, so the interval neither ignores it nor
+/// counts the within-run noise twice; with 3 repetitions that makes it wide
+/// (`t(2) = 4.30`), which is the honest price of 2 degrees of freedom.
+///
+/// Arm A's quantiles, which the baseline criterion judges, have no pairs to
+/// difference, so their interval comes from a two-level bootstrap: each
+/// resample draws as many repetitions as there are, with replacement and the
+/// same draw for both arms, then a circular block resample of the measured
+/// intervals within every drawn run, and merges the histograms per arm. The
+/// percentile interval of that is too narrow for few repetitions and is
+/// widened around the point estimate by [`Comparison::a_interval_scale`].
+/// The bootstrap's own intervals of Δ and A stay in the output for
+/// diagnosis.
+///
+/// With one repetition no run-to-run spread can be estimated: Δ falls back
+/// to the within-run bootstrap and A is not widened, which
+/// [`Comparison::single_repetition_fallback`] flags. The two runs then draw
+/// their block starts independently, so load swings they share count as
+/// noise on both sides of Δ.
 pub fn compare_with(
     a_runs: &[RunResult],
     b_runs: &[RunResult],
@@ -730,6 +968,97 @@ pub fn compare_with(
     quantiles: &[f64],
     options: &CompareOptions,
 ) -> Result<Comparison, StatsError> {
+    check_inputs(a_runs, b_runs, quantiles, options)?;
+    let a = Arm::build(a_runs, metric, "A")?;
+    let b = Arm::build(b_runs, metric, "B")?;
+
+    // p99 is always evaluated for the baseline criterion.
+    let mut qs = quantiles.to_vec();
+    qs.push(0.99);
+    let p99_slot = qs.len() - 1;
+
+    let a_point = a
+        .quantiles_over(&a.runs, &qs)
+        .ok_or(StatsError::EmptyArm { arm: "A", metric })?;
+    let b_point = b
+        .quantiles_over(&b.runs, &qs)
+        .ok_or(StatsError::EmptyArm { arm: "B", metric })?;
+    let per_pair = pair_deltas(&a, &b, a_runs, b_runs, metric, quantiles)?;
+
+    let pairs = a.runs.len();
+    let dist = bootstrap(&a, &b, &qs, options)?;
+    let delta_interval = if pairs >= 2 {
+        DeltaInterval::PairedT
+    } else {
+        DeltaInterval::WithinRunBootstrap
+    };
+    let a_scale = run_to_run_scale(pairs);
+    let entry = |i: usize, quantile: f64| {
+        let a_ns = a_point[i];
+        let delta_ns = signed_delta(b_point[i], a_ns);
+        let bootstrap_delta = dist.delta_percentile(i);
+        let (delta_ci_low_ns, delta_ci_high_ns) = match delta_interval {
+            DeltaInterval::PairedT => {
+                let deltas: Vec<f64> = per_pair
+                    .iter()
+                    .map(|pair| delta_f64(pair.quantiles[i].delta_ns))
+                    .collect();
+                t_interval(delta_f64(delta_ns), &deltas)
+            }
+            DeltaInterval::WithinRunBootstrap => bootstrap_delta,
+        };
+        let a_bootstrap = dist.a_percentile(i);
+        let a_ci = widen(a_bootstrap, a_ns, a_scale);
+        QuantileDelta {
+            quantile,
+            a_ns,
+            b_ns: b_point[i],
+            delta_ns,
+            delta_ci_low_ns,
+            delta_ci_high_ns,
+            delta_bootstrap_ci_low_ns: bootstrap_delta.0,
+            delta_bootstrap_ci_high_ns: bootstrap_delta.1,
+            a_ci_low_ns: a_ci.0,
+            a_ci_high_ns: a_ci.1,
+            a_bootstrap_ci_low_ns: a_bootstrap.0,
+            a_bootstrap_ci_high_ns: a_bootstrap.1,
+            a_ci_half_width_ratio: half_width_ratio(a_ci, a_ns),
+        }
+    };
+
+    Ok(Comparison {
+        metric,
+        resamples: options.resamples,
+        block_len: options.block_len,
+        seed: options.seed,
+        pairs,
+        single_repetition_fallback: pairs == 1,
+        delta_interval,
+        a_interval_scale: a_scale,
+        a_intervals: a.intervals(),
+        b_intervals: b.intervals(),
+        a_count: a.total,
+        b_count: b.total,
+        quantiles: quantiles
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| entry(i, q))
+            .collect(),
+        baseline_p99_ci_half_width_ratio: half_width_ratio(
+            widen(dist.a_percentile(p99_slot), a_point[p99_slot], a_scale),
+            a_point[p99_slot],
+        ),
+        per_pair,
+    })
+}
+
+/// Refuses out-of-range options and run lists that do not form pairs.
+fn check_inputs(
+    a_runs: &[RunResult],
+    b_runs: &[RunResult],
+    quantiles: &[f64],
+    options: &CompareOptions,
+) -> Result<(), StatsError> {
     if options.resamples < 2 {
         return Err(StatsError::InvalidOption("resamples must be at least 2"));
     }
@@ -739,33 +1068,97 @@ pub fn compare_with(
     if quantiles.iter().any(|q| !(0.0..=1.0).contains(q)) {
         return Err(StatsError::InvalidOption("quantiles must be within [0, 1]"));
     }
-    let a = Arm::build(a_runs, metric, options.block_len)?;
-    let b = Arm::build(b_runs, metric, options.block_len)?;
+    if a_runs.len() != b_runs.len() {
+        return Err(StatsError::UnpairedRuns {
+            a: a_runs.len(),
+            b: b_runs.len(),
+        });
+    }
+    if a_runs.is_empty() {
+        return Err(StatsError::InvalidOption("each arm needs at least one run"));
+    }
+    for (pair, (a_run, b_run)) in a_runs.iter().zip(b_runs).enumerate() {
+        if let (Some(a_id), Some(b_id)) = (&a_run.pair_id, &b_run.pair_id)
+            && a_id != b_id
+        {
+            return Err(StatsError::PairMismatch {
+                pair,
+                a: a_id.clone(),
+                b: b_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
 
-    // p99 is always evaluated for the baseline criterion.
-    let mut qs = quantiles.to_vec();
-    qs.push(0.99);
-    let p99_slot = qs.len() - 1;
+/// Sorted bootstrap values, one list per quantile slot.
+#[derive(Debug)]
+struct Distributions {
+    /// Arm A's quantile.
+    a: Vec<Vec<f64>>,
+    /// `B − A`.
+    delta: Vec<Vec<f64>>,
+}
 
-    let a_point = a
-        .pooled(&qs)
-        .ok_or(StatsError::EmptyArm { arm: "A", metric })?;
-    let b_point = b
-        .pooled(&qs)
-        .ok_or(StatsError::EmptyArm { arm: "B", metric })?;
+impl Distributions {
+    /// 95% percentile interval of arm A's quantile in slot `i`.
+    fn a_percentile(&self, i: usize) -> (f64, f64) {
+        (percentile(&self.a[i], 0.025), percentile(&self.a[i], 0.975))
+    }
 
-    let mut rng_a = fastrand::Rng::with_seed(options.seed);
-    let mut rng_b = fastrand::Rng::with_seed(options.seed ^ 0x9e37_79b9_7f4a_7c15);
+    /// 95% percentile interval of Δ in slot `i`.
+    fn delta_percentile(&self, i: usize) -> (f64, f64) {
+        (
+            percentile(&self.delta[i], 0.025),
+            percentile(&self.delta[i], 0.975),
+        )
+    }
+}
+
+/// Widens `(lo, hi)` around `point` by `scale`; an end on the wrong side of
+/// the point counts as no width.
+fn widen((lo, hi): (f64, f64), point: u64, scale: f64) -> (f64, f64) {
+    let point = as_f64(point);
+    (
+        point - scale * (point - lo).max(0.0),
+        point + scale * (hi - point).max(0.0),
+    )
+}
+
+/// Half-width of `(lo, hi)` relative to `point`.
+fn half_width_ratio((lo, hi): (f64, f64), point: u64) -> f64 {
+    (hi - lo) / 2.0 / as_f64(point.max(1))
+}
+
+/// Runs the paired two-level bootstrap over the quantiles `qs`.
+fn bootstrap(
+    a: &Arm,
+    b: &Arm,
+    qs: &[f64],
+    options: &CompareOptions,
+) -> Result<Distributions, StatsError> {
+    let pairs = a.runs.len();
+    let mut rng = fastrand::Rng::with_seed(options.seed);
     let mut counts_a = vec![0u64; a.values.len()];
     let mut counts_b = vec![0u64; b.values.len()];
     let (mut qa, mut qb) = (Vec::new(), Vec::new());
     let mut a_dist: Vec<Vec<f64>> = vec![Vec::with_capacity(options.resamples); qs.len()];
     let mut d_dist: Vec<Vec<f64>> = vec![Vec::with_capacity(options.resamples); qs.len()];
     for _ in 0..options.resamples {
-        if !a.resample(&mut rng_a, &mut counts_a, &qs, &mut qa) {
+        counts_a.fill(0);
+        counts_b.fill(0);
+        let (mut total_a, mut total_b) = (0, 0);
+        // One draw of a repetition serves both arms, so a pair's shared
+        // schedule and moment in the session stay on both sides of Δ.
+        for _ in 0..pairs {
+            let pair = rng.usize(..pairs);
+            total_a += a.runs[pair].add_resample(&mut rng, options.block_len, &mut counts_a);
+            total_b += b.runs[pair].add_resample(&mut rng, options.block_len, &mut counts_b);
+        }
+        if !a.quantiles(&counts_a, total_a, qs, &mut qa) {
             return Err(StatsError::EmptyResample("A"));
         }
-        if !b.resample(&mut rng_b, &mut counts_b, &qs, &mut qb) {
+        if !b.quantiles(&counts_b, total_b, qs, &mut qb) {
             return Err(StatsError::EmptyResample("B"));
         }
         for i in 0..qs.len() {
@@ -776,40 +1169,61 @@ pub fn compare_with(
     for dist in a_dist.iter_mut().chain(d_dist.iter_mut()) {
         dist.sort_unstable_by(f64::total_cmp);
     }
-
-    let entry = |i: usize, quantile: f64| {
-        let a_lo = percentile(&a_dist[i], 0.025);
-        let a_hi = percentile(&a_dist[i], 0.975);
-        let a_ns = a_point[i];
-        QuantileDelta {
-            quantile,
-            a_ns,
-            b_ns: b_point[i],
-            delta_ns: signed_delta(b_point[i], a_ns),
-            delta_ci_low_ns: percentile(&d_dist[i], 0.025),
-            delta_ci_high_ns: percentile(&d_dist[i], 0.975),
-            a_ci_low_ns: a_lo,
-            a_ci_high_ns: a_hi,
-            a_ci_half_width_ratio: (a_hi - a_lo) / 2.0 / as_f64(a_ns.max(1)),
-        }
-    };
-
-    Ok(Comparison {
-        metric,
-        resamples: options.resamples,
-        block_len: options.block_len,
-        seed: options.seed,
-        a_intervals: a.series.len(),
-        b_intervals: b.series.len(),
-        a_count: a.total,
-        b_count: b.total,
-        quantiles: quantiles
-            .iter()
-            .enumerate()
-            .map(|(i, &q)| entry(i, q))
-            .collect(),
-        baseline_p99_ci_half_width_ratio: entry(p99_slot, 0.99).a_ci_half_width_ratio,
+    Ok(Distributions {
+        a: a_dist,
+        delta: d_dist,
     })
+}
+
+/// Every pair's own quantiles, from the full data of its two runs.
+fn pair_deltas(
+    a: &Arm,
+    b: &Arm,
+    a_runs: &[RunResult],
+    b_runs: &[RunResult],
+    metric: Metric,
+    quantiles: &[f64],
+) -> Result<Vec<PairDelta>, StatsError> {
+    a.runs
+        .iter()
+        .zip(&b.runs)
+        .zip(a_runs.iter().zip(b_runs))
+        .enumerate()
+        .map(|(pair, ((a_series, b_series), (a_run, b_run)))| {
+            let a_q = a
+                .quantiles_over([a_series], quantiles)
+                .ok_or(StatsError::EmptyRun {
+                    arm: "A",
+                    run: pair,
+                    metric,
+                })?;
+            let b_q = b
+                .quantiles_over([b_series], quantiles)
+                .ok_or(StatsError::EmptyRun {
+                    arm: "B",
+                    run: pair,
+                    metric,
+                })?;
+            Ok(PairDelta {
+                pair,
+                pair_id: a_run.pair_id.clone().or_else(|| b_run.pair_id.clone()),
+                a_intervals: a_series.intervals.len(),
+                b_intervals: b_series.intervals.len(),
+                a_count: a_series.total,
+                b_count: b_series.total,
+                quantiles: quantiles
+                    .iter()
+                    .zip(a_q.iter().zip(&b_q))
+                    .map(|(&quantile, (&a_ns, &b_ns))| PairQuantile {
+                        quantile,
+                        a_ns,
+                        b_ns,
+                        delta_ns: signed_delta(b_ns, a_ns),
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -923,9 +1337,10 @@ mod tests {
         assert_eq!(post[&Metric::EmitLag].count, 1);
     }
 
-    /// A run whose interval `i` holds 1000 samples around `base`, with extra
-    /// noise; warmup intervals hold absurd values that must be ignored.
-    fn synthetic_run(seed: u64, base: u64, intervals: u64, warmup: u64) -> RunResult {
+    /// A run whose post-warmup intervals hold 1000 samples each of
+    /// `base + shift` plus noise that depends only on `seed` and `base`;
+    /// warmup intervals hold absurd values that must be ignored.
+    fn shifted_run(seed: u64, base: u64, shift: u64, intervals: u64, warmup: u64) -> RunResult {
         let mut rng = fastrand::Rng::with_seed(seed);
         let mut r = IntervalRecorder::new(0);
         for i in 0..intervals {
@@ -934,7 +1349,7 @@ mod tests {
                 let value = if i < warmup {
                     50_000_000
                 } else {
-                    base + rng.u64(0..base / 5) + if k % 100 == 0 { base } else { 0 }
+                    base + shift + rng.u64(0..base / 5) + if k % 100 == 0 { base } else { 0 }
                 };
                 r.record(Metric::ChunkLatency, at, value);
             }
@@ -945,6 +1360,7 @@ mod tests {
             tool: "test".into(),
             scenario: "s1".into(),
             label: "x".into(),
+            pair_id: None,
             params: serde_json::Value::Null,
             fingerprint: Fingerprint::collect(),
             started_unix_ms: 0,
@@ -954,6 +1370,38 @@ mod tests {
             validity: Validity::default(),
         }
     }
+
+    fn synthetic_run(seed: u64, base: u64, intervals: u64, warmup: u64) -> RunResult {
+        shifted_run(seed, base, 0, intervals, warmup)
+    }
+
+    /// One arm of runs with the given run-level shifts, seeds from
+    /// `first_seed` on.
+    fn arm(first_seed: u64, shifts: &[u64]) -> Vec<RunResult> {
+        (first_seed..)
+            .zip(shifts)
+            .map(|(seed, &shift)| shifted_run(seed, 10_000, shift, 30, 5))
+            .collect()
+    }
+
+    /// HDR buckets are 8 to 16 ns wide at the test values, so a quantile may
+    /// land a bucket or two away from the exact value.
+    const BUCKET_SLACK_NS: f64 = 32.0;
+
+    fn covers(q: &QuantileDelta, delta_ns: f64) -> bool {
+        q.delta_ci_low_ns - BUCKET_SLACK_NS <= delta_ns
+            && delta_ns <= q.delta_ci_high_ns + BUCKET_SLACK_NS
+    }
+
+    fn ci_width(q: &QuantileDelta) -> f64 {
+        q.delta_ci_high_ns - q.delta_ci_low_ns
+    }
+
+    const TEST_OPTIONS: CompareOptions = CompareOptions {
+        resamples: 400,
+        block_len: DEFAULT_BLOCK_LEN,
+        seed: DEFAULT_SEED,
+    };
 
     #[test]
     #[expect(clippy::cast_precision_loss, reason = "test deltas are small")]
@@ -967,8 +1415,15 @@ mod tests {
         let first = compare_with(&a, &b, Metric::ChunkLatency, &[0.5, 0.99], &opts).unwrap();
         let second = compare_with(&a, &b, Metric::ChunkLatency, &[0.5, 0.99], &opts).unwrap();
         assert_eq!(first, second);
+        assert_eq!(first.pairs, 3);
+        assert!(!first.single_repetition_fallback);
         assert_eq!(first.a_intervals, 105);
         assert_eq!(first.a_count, 105_000);
+        assert_eq!(first.per_pair.len(), 3);
+        assert_eq!(first.per_pair[2].pair, 2);
+        assert_eq!(first.per_pair[2].a_intervals, 35);
+        assert_eq!(first.per_pair[2].a_count, 35_000);
+        assert_eq!(first.per_pair[2].quantiles.len(), 2);
 
         let median = &first.quantiles[0];
         assert!(median.a_ns >= 10_000 && median.a_ns < 12_000, "{median:?}");
@@ -980,7 +1435,38 @@ mod tests {
         assert!(median.delta_ci_high_ns >= median.delta_ns as f64);
         assert!(median.delta_ci_low_ns > 0.0);
         assert!(first.baseline_p99_ci_half_width_ratio < 0.05);
+        for pair in &first.per_pair {
+            let d = pair.quantiles[0].delta_ns;
+            assert!(d > 500 && d < 1_500, "{pair:?}");
+        }
 
+        assert_eq!(first.delta_interval, DeltaInterval::PairedT);
+        assert!((first.a_interval_scale - 2.689).abs() < 1e-3, "{first:?}");
+        // The t interval sits on the per-pair spread: centred on the point
+        // estimate, with half-width t(2) · sd / √3.
+        let deltas: Vec<f64> = first
+            .per_pair
+            .iter()
+            .map(|p| delta_f64(p.quantiles[0].delta_ns))
+            .collect();
+        let mean = deltas.iter().sum::<f64>() / 3.0;
+        let sd = (deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / 2.0).sqrt();
+        let half = 4.302_653 * sd / 3f64.sqrt();
+        assert!((median.delta_ci_low_ns - (median.delta_ns as f64 - half)).abs() < 1e-6);
+        assert!((median.delta_ci_high_ns - (median.delta_ns as f64 + half)).abs() < 1e-6);
+        // Arm A's interval is the bootstrap one, widened around the point.
+        let a_ns = median.a_ns as f64;
+        assert!(
+            (a_ns
+                - median.a_ci_low_ns
+                - first.a_interval_scale * (a_ns - median.a_bootstrap_ci_low_ns).max(0.0))
+            .abs()
+                < 1e-6,
+            "{median:?}"
+        );
+        assert!(median.a_ci_high_ns >= median.a_bootstrap_ci_high_ns);
+
+        // Another bootstrap seed moves only the bootstrap intervals.
         let other_seed = compare_with(
             &a,
             &b,
@@ -989,7 +1475,334 @@ mod tests {
             &CompareOptions { seed: 1, ..opts },
         )
         .unwrap();
-        assert_eq!(other_seed.quantiles[0].delta_ns, median.delta_ns);
+        let moved = &other_seed.quantiles[0];
+        assert_eq!(moved.delta_ns, median.delta_ns);
+        assert_eq!(other_seed.per_pair, first.per_pair);
+        assert_eq!(
+            (moved.delta_ci_low_ns, moved.delta_ci_high_ns),
+            (median.delta_ci_low_ns, median.delta_ci_high_ns)
+        );
+        let bootstrap_ends = |c: &Comparison| -> Vec<f64> {
+            c.quantiles
+                .iter()
+                .flat_map(|q| {
+                    [
+                        q.delta_bootstrap_ci_low_ns,
+                        q.delta_bootstrap_ci_high_ns,
+                        q.a_bootstrap_ci_low_ns,
+                        q.a_bootstrap_ci_high_ns,
+                    ]
+                })
+                .collect()
+        };
+        assert_ne!(bootstrap_ends(&other_seed), bootstrap_ends(&first));
+    }
+
+    #[test]
+    fn t_quantiles_and_run_to_run_scale() {
+        assert!((student_t_975(1) - 12.706_205).abs() < 1e-9);
+        assert!((student_t_975(4) - 2.776_445).abs() < 1e-9);
+        // The expansion takes over seamlessly past the table.
+        assert!((student_t_975(31) - 2.039_513).abs() < 2e-6);
+        assert!((student_t_975(40) - 2.021_075).abs() < 2e-6);
+        assert!((student_t_975(100) - 1.983_972).abs() < 2e-6);
+        assert!((student_t_975(1_000_000) - Z_975).abs() < 1e-5);
+        assert!((run_to_run_scale(1) - 1.0).abs() < f64::EPSILON);
+        for (pairs, scale) in [(3, 2.689), (5, 1.584), (10, 1.216)] {
+            assert!(
+                (run_to_run_scale(pairs) - scale).abs() < 1e-3,
+                "{pairs}: {}",
+                run_to_run_scale(pairs)
+            );
+        }
+    }
+
+    /// A run of 12 one-second intervals of 100 samples each, uniform over
+    /// `[CAL_BASE + level, CAL_BASE + level + CAL_SPREAD)`, recorded into
+    /// histograms bounded just above the values so the many runs stay cheap.
+    fn level_run(rng: &mut fastrand::Rng, level: f64) -> RunResult {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "levels stay within a few thousand ns of the base"
+        )]
+        let low = (as_f64(CAL_BASE) + level).round() as u64;
+        let mut hist = Histogram::<u64>::new_with_bounds(1, 1 << 15, HISTOGRAM_SIGFIG).unwrap();
+        let intervals = (0..12)
+            .map(|index| {
+                hist.reset();
+                for _ in 0..100 {
+                    hist.record(low + rng.u64(..CAL_SPREAD)).unwrap();
+                }
+                IntervalResult {
+                    index,
+                    start_ns: index * SEC,
+                    duration_ns: SEC,
+                    histograms: BTreeMap::from([(Metric::ChunkLatency, encode_histogram(&hist))]),
+                    concurrency: ConcurrencyStats::default(),
+                    chunks: 100,
+                    requests: 0,
+                    errors: BTreeMap::new(),
+                    saturated: 0,
+                    negative: 0,
+                }
+            })
+            .collect();
+        RunResult {
+            schema_version: SCHEMA_VERSION,
+            tool: "test".into(),
+            scenario: "s1".into(),
+            label: "x".into(),
+            pair_id: None,
+            params: serde_json::Value::Null,
+            fingerprint: Fingerprint::collect(),
+            started_unix_ms: 0,
+            warmup_intervals: 0,
+            summary: BTreeMap::new(),
+            intervals,
+            validity: Validity::default(),
+        }
+    }
+
+    const CAL_BASE: u64 = 8_000;
+    const CAL_SPREAD: u64 = 2_000;
+
+    /// Standard normal draw (Box–Muller).
+    fn normal(rng: &mut fastrand::Rng) -> f64 {
+        let u = 1.0 - rng.f64();
+        (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * rng.f64()).cos()
+    }
+
+    /// Coverage of the Δ and arm A intervals over one set of A/A experiments.
+    #[derive(Debug)]
+    struct Calibration {
+        /// Share of Δ intervals (p50 and p90) that exclude 0.
+        delta_false_positive: f64,
+        /// Share of arm A's p50 intervals that cover the true median.
+        a_coverage: f64,
+        /// The same for the unwidened bootstrap interval.
+        a_bootstrap_coverage: f64,
+    }
+
+    /// Runs `experiments` A/A comparisons of `pairs` repetitions each. Every
+    /// run's level is a part its pair shares plus a part of its own, both
+    /// normal with sd 300 ns, against a within-run standard error of the
+    /// median near 10 ns: the run-to-run spread dominates, as it does for
+    /// the chunk metrics of the pilot, where pooled intervals claimed 95%
+    /// and excluded 0 in 40 of 108 A/A intervals.
+    #[expect(clippy::cast_precision_loss, reason = "counts are small")]
+    fn calibrate(pairs: usize, experiments: u64) -> Calibration {
+        // Levels are symmetric around 0, so the median of the whole
+        // population is the middle of the uniform spread; HDR reports the
+        // top of the bucket holding it, 8 ns wide here.
+        let true_median = (CAL_BASE + CAL_SPREAD / 2) as f64;
+        let mut rng = fastrand::Rng::with_seed(0x6361_6c69_6272_6174);
+        let (mut excluded, mut covered, mut covered_bootstrap) = (0u32, 0u32, 0u32);
+        for experiment in 0..experiments {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for _ in 0..pairs {
+                let shared = 300.0 * normal(&mut rng);
+                let (a_level, b_level) = (
+                    shared + 300.0 * normal(&mut rng),
+                    shared + 300.0 * normal(&mut rng),
+                );
+                a.push(level_run(&mut rng, a_level));
+                b.push(level_run(&mut rng, b_level));
+            }
+            let options = CompareOptions {
+                resamples: 200,
+                block_len: 3,
+                seed: experiment,
+            };
+            let c = compare_with(&a, &b, Metric::ChunkLatency, &[0.5, 0.9], &options).unwrap();
+            for q in &c.quantiles {
+                excluded += u32::from(q.delta_ci_low_ns > 0.0 || q.delta_ci_high_ns < 0.0);
+            }
+            let median = &c.quantiles[0];
+            let slack = 8.0;
+            covered += u32::from(
+                median.a_ci_low_ns - slack <= true_median
+                    && true_median <= median.a_ci_high_ns + slack,
+            );
+            covered_bootstrap += u32::from(
+                median.a_bootstrap_ci_low_ns - slack <= true_median
+                    && true_median <= median.a_bootstrap_ci_high_ns + slack,
+            );
+        }
+        let n = experiments as f64;
+        Calibration {
+            delta_false_positive: f64::from(excluded) / (2.0 * n),
+            a_coverage: f64::from(covered) / n,
+            a_bootstrap_coverage: f64::from(covered_bootstrap) / n,
+        }
+    }
+
+    /// The intervals must hold their nominal 95% in A/A experiments with a
+    /// dominant run-to-run spread; the unwidened bootstrap interval of A,
+    /// like the pooled one before it, does not.
+    #[test]
+    fn aa_intervals_hold_their_nominal_coverage() {
+        for pairs in [3, 5] {
+            let cal = calibrate(pairs, 200);
+            assert!(
+                (0.015..=0.09).contains(&cal.delta_false_positive),
+                "{pairs} pairs: {cal:?}"
+            );
+            assert!(
+                (0.9..=0.99).contains(&cal.a_coverage),
+                "{pairs} pairs: {cal:?}"
+            );
+            assert!(cal.a_bootstrap_coverage < 0.9, "{pairs} pairs: {cal:?}");
+        }
+    }
+
+    /// Runs that differ in their own level, independently in the two arms,
+    /// must widen the interval of Δ to the run-to-run spread and still cover
+    /// the true Δ; pooling their intervals would not.
+    #[test]
+    fn between_run_shifts_widen_the_interval_and_cover_the_true_delta() {
+        const TRUE_DELTA: f64 = 1_000.0;
+        let steady_a = arm(0, &[0; 5]);
+        let steady_b = arm(10, &[1_000; 5]);
+        // The same set of run levels in both arms, in another order, so the
+        // pooled distributions differ by exactly the true Δ while every
+        // pair's own Δ is off by up to 3 µs.
+        let a_shifts = [0, 2_000, 4_000, 1_000, 3_000];
+        let b_shifts = [3_000, 0, 1_000, 4_000, 2_000].map(|s| s + 1_000);
+        let shifted_a = arm(0, &a_shifts);
+        let shifted_b = arm(10, &b_shifts);
+
+        let steady = compare_with(
+            &steady_a,
+            &steady_b,
+            Metric::ChunkLatency,
+            &[0.5, 0.9],
+            &TEST_OPTIONS,
+        )
+        .unwrap();
+        let shifted = compare_with(
+            &shifted_a,
+            &shifted_b,
+            Metric::ChunkLatency,
+            &[0.5, 0.9],
+            &TEST_OPTIONS,
+        )
+        .unwrap();
+        for (s, w) in steady.quantiles.iter().zip(&shifted.quantiles) {
+            assert!(covers(s, TRUE_DELTA), "{s:?}");
+            assert!(covers(w, TRUE_DELTA), "{w:?}");
+            assert!(ci_width(s) < 400.0, "{s:?}");
+            assert!(ci_width(w) > 10.0 * ci_width(s), "{w:?} vs {s:?}");
+            assert!(ci_width(w) > 2_000.0, "{w:?}");
+        }
+        // The baseline interval grows with A's own run-to-run spread, past
+        // the M0 limit that the steady runs meet easily.
+        assert!(steady.baseline_p99_ci_half_width_ratio < 0.01, "{steady:?}");
+        assert!(
+            shifted.baseline_p99_ci_half_width_ratio > 0.05,
+            "{shifted:?}"
+        );
+        // Every pair reports its own Δ: the true Δ plus its level difference.
+        for (pair, (a_shift, b_shift)) in shifted.per_pair.iter().zip(a_shifts.iter().zip(b_shifts))
+        {
+            let expected = i64::try_from(b_shift).unwrap() - i64::try_from(*a_shift).unwrap();
+            let median = &pair.quantiles[0];
+            assert!(
+                (median.delta_ns - expected).abs() < 150,
+                "pair {}: {median:?}, expected {expected}",
+                pair.pair
+            );
+        }
+    }
+
+    /// A pair that shares its level must keep Δ tight however far the pairs
+    /// are from each other, which holds only while both arms draw the same
+    /// repetitions.
+    #[test]
+    fn pairs_stay_together() {
+        let levels = [0, 5_000, 2_000, 8_000, 1_000];
+        let a = arm(0, &levels);
+        let b = arm(10, &levels.map(|s| s + 1_000));
+        let paired =
+            compare_with(&a, &b, Metric::ChunkLatency, &[0.5, 0.9], &TEST_OPTIONS).unwrap();
+        for q in &paired.quantiles {
+            assert!(covers(q, 1_000.0), "{q:?}");
+            assert!(ci_width(q) < 400.0, "{q:?}");
+        }
+        for pair in &paired.per_pair {
+            let d = pair.quantiles[0].delta_ns;
+            assert!((d - 1_000).abs() < 150, "{pair:?}");
+        }
+        // The runs themselves differ a lot: A's own interval is wide.
+        assert!(
+            paired.baseline_p99_ci_half_width_ratio > 0.05,
+            "{}",
+            paired.baseline_p99_ci_half_width_ratio
+        );
+
+        // The same runs matched to the wrong partners lose that.
+        let mut rotated = b.clone();
+        rotated.rotate_left(1);
+        let mismatched = compare_with(
+            &a,
+            &rotated,
+            Metric::ChunkLatency,
+            &[0.5, 0.9],
+            &TEST_OPTIONS,
+        )
+        .unwrap();
+        for (p, m) in paired.quantiles.iter().zip(&mismatched.quantiles) {
+            assert_eq!(p.delta_ns, m.delta_ns);
+            assert!(ci_width(m) > 10.0 * ci_width(p), "{m:?} vs {p:?}");
+        }
+    }
+
+    #[test]
+    fn a_single_repetition_falls_back_to_within_run_blocks() {
+        let a = arm(0, &[0]);
+        let b = arm(10, &[1_000]);
+        let single = compare_with(&a, &b, Metric::ChunkLatency, &[0.5], &TEST_OPTIONS).unwrap();
+        assert!(single.single_repetition_fallback);
+        assert_eq!(single.pairs, 1);
+        assert_eq!(single.per_pair.len(), 1);
+        assert_eq!(
+            single.per_pair[0].quantiles[0].delta_ns,
+            single.quantiles[0].delta_ns
+        );
+        assert!(covers(&single.quantiles[0], 1_000.0), "{single:?}");
+
+        let two = compare_with(
+            &arm(0, &[0, 0]),
+            &arm(10, &[1_000, 1_000]),
+            Metric::ChunkLatency,
+            &[0.5],
+            &TEST_OPTIONS,
+        )
+        .unwrap();
+        assert!(!two.single_repetition_fallback);
+        assert_eq!(two.pairs, 2);
+    }
+
+    #[test]
+    fn pairing_ids_must_agree() {
+        let mut a = arm(0, &[0, 0]);
+        let mut b = arm(10, &[0, 0]);
+        for (i, (x, y)) in a.iter_mut().zip(&mut b).enumerate() {
+            x.pair_id = Some(format!("r{i}"));
+            y.pair_id = Some(format!("r{i}"));
+        }
+        let ok = compare_with(&a, &b, Metric::ChunkLatency, &[0.5], &TEST_OPTIONS).unwrap();
+        assert_eq!(ok.per_pair[1].pair_id.as_deref(), Some("r1"));
+
+        b.swap(0, 1);
+        assert!(matches!(
+            compare_with(&a, &b, Metric::ChunkLatency, &[0.5], &TEST_OPTIONS),
+            Err(StatsError::PairMismatch { pair: 0, .. })
+        ));
+        assert!(matches!(
+            compare_with(&a, &b[..1], Metric::ChunkLatency, &[0.5], &TEST_OPTIONS),
+            Err(StatsError::UnpairedRuns { a: 2, b: 1 })
+        ));
     }
 
     #[test]
@@ -1006,6 +1819,23 @@ mod tests {
         assert!(matches!(
             compare(&a, &a, Metric::ChunkLatency, &[0.5], 1),
             Err(StatsError::InvalidOption(_))
+        ));
+        assert!(matches!(
+            compare(&[], &[], Metric::ChunkLatency, &[0.5], 100),
+            Err(StatsError::InvalidOption(_))
+        ));
+        // A run left with nothing after its warmup cannot stand for its pair.
+        let two = vec![
+            synthetic_run(1, 10_000, 3, 0),
+            synthetic_run(2, 10_000, 3, 3),
+        ];
+        assert!(matches!(
+            compare(&two, &two, Metric::ChunkLatency, &[0.5], 100),
+            Err(StatsError::EmptyRun {
+                arm: "A",
+                run: 1,
+                ..
+            })
         ));
     }
 }

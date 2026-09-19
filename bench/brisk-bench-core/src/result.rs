@@ -167,6 +167,11 @@ pub struct RunResult {
     pub scenario: String,
     /// Arm label, e.g. `direct-P` or `floor-P`.
     pub label: String,
+    /// Repetition this run belongs to, e.g. `s1-P-r2`. The runs of the two
+    /// arms of one repetition carry the same id and form a pair in a
+    /// comparison; files written before the field existed have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_id: Option<String>,
     /// Command-line parameters, verbatim.
     pub params: serde_json::Value,
     /// Host and build environment.
@@ -238,6 +243,7 @@ mod tests {
             tool: "brisk-loadgen".into(),
             scenario: "stream".into(),
             label: "direct-P".into(),
+            pair_id: Some("s1-P-r1".into()),
             params: serde_json::json!({"concurrency": 1000}),
             fingerprint: Fingerprint::collect(),
             started_unix_ms: 1,
@@ -269,6 +275,15 @@ mod tests {
             run.summary[&Metric::Ttft].p99_ns
         );
         assert!(back.intervals[0].histogram(Metric::Ttft).unwrap().is_some());
+        assert_eq!(back.pair_id.as_deref(), Some("s1-P-r1"));
+
+        // Files written before the pairing id existed still read, without one.
+        let mut legacy = serde_json::to_value(&run).unwrap();
+        legacy.as_object_mut().unwrap().remove("pair_id").unwrap();
+        let legacy: RunResult = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.pair_id, None);
+        let unpaired = serde_json::to_value(&legacy).unwrap();
+        assert!(unpaired.get("pair_id").is_none());
 
         let mut wrong = run.clone();
         wrong.schema_version = 99;
