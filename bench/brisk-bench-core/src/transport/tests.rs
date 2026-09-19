@@ -484,6 +484,13 @@ fn connect_refused_is_reported() {
 #[test]
 fn tls_read_uses_read_size() {
     let mut pair = Pair::connect(Some(&tls_configs()));
+    // The whole payload has to fit in flight while the server does not read.
+    // Kernel defaults do not guarantee that: with net.ipv4.tcp_notsent_lowat
+    // set (as setup-host.sh does) the sender queues at most that much unsent
+    // data, so the receive window alone must hold the rest.
+    socket2::SockRef::from(pair.server.stream())
+        .set_recv_buffer_size(4 * 1024 * 1024)
+        .unwrap();
     let data = payload(256 * 1024);
     pair.client.write(&data).unwrap();
     pair.pump_until(|p| p.client.pending_bytes() == 0);
