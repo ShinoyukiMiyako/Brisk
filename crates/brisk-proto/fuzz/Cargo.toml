@@ -1,0 +1,42 @@
+[package]
+name = "brisk-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own: libfuzzer-sys needs nightly sanitizer flags that the
+# main workspace must never pick up.
+[workspace]
+members = ["."]
+
+[dependencies]
+brisk-proto = { path = ".." }
+bytes = "1.12.1"
+libfuzzer-sys = { version = "0.4.13", features = ["arbitrary-derive"] }
+serde = "1.0"
+serde_json = "1.0.151"
+
+[[bin]]
+name = "head"
+path = "fuzz_targets/head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "splice"
+path = "fuzz_targets/splice.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sse"
+path = "fuzz_targets/sse.rs"
+test = false
+doc = false
+bench = false

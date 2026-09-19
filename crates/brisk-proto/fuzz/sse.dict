@@ -1,0 +1,14 @@
+# libFuzzer dictionary for the sse target: field names, comments, line
+# endings and the byte order mark.
+"data:"
+"data: "
+"event:"
+"id:"
+": keep-alive"
+": xai-usage "
+"\x0d\x0a"
+"\x0a"
+"\x0d"
+"\x0d\x0a\x0d\x0a"
+"\xef\xbb\xbf"
+"[DONE]"
