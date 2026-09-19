@@ -27,12 +27,24 @@
 # either preset. The CPU sets must be online and must not overlap.
 #
 # Repetitions alternate the arm order (direct first in odd repetitions,
-# floor first in even ones) so a linear drift cancels in the pooled arms. A
-# repetition with an invalid run is rerun, both arms with the same seed, up
-# to RETRY_INVALID times. The selfcheck runs the load generator at twice
+# floor first in even ones) so a linear drift cancels between the arms. The
+# two arms of a repetition share its seed and a pairing id
+# (<scenario>-<config>[-<size>]-r<N>, passed as --pair-id), and the
+# comparison resamples whole repetitions as pairs, so the run-to-run spread
+# of the load enters the confidence intervals; each pair's own delta is
+# reported too. A single repetition leaves only the within-run bootstrap,
+# which understates that spread; use at least 3. A repetition with an invalid
+# run is rerun, both arms with the same seed and pairing id, up to
+# RETRY_INVALID times. The selfcheck runs the load generator at twice
 # SC_CONCURRENCY against a mock with the scenario core plan (and again over
 # TLS when CONFIGS has T); with SC_GATE=1 a FAIL ends the session.
-# Comparisons pool only repetitions whose two arms are both valid.
+# Comparisons use only repetitions whose two arms are both valid.
+#
+# The M0 baseline criterion (direct arm p99 95% CI half width below 5%) is
+# judged per metric; only the gate metrics (GATE_METRICS for S1,
+# S2_GATE_METRICS, S3_GATE_METRICS) decide the gate, the others are
+# reported. chunk_wire, the preferred per-chunk overhead metric, is reported
+# but not gated by default.
 #
 # The session refuses to start unless setup-host.sh --check passes
 # (ALLOW_UNPREPARED_HOST=1 overrides), holds $RESULTS_ROOT/.run-m0.lock for
@@ -44,13 +56,15 @@
 # compare/ (JSON and text), logs/, host/, bin/. Every process started here
 # is stopped on exit, failures included. The exit status is 1 if the
 # selfcheck fails, a load generator or floor run fails, a comparison is
-# missing or has fewer valid repetitions than planned, or the direct
-# baseline's p99 CI half width reaches 5% on a gated metric.
+# missing or has fewer valid repetitions than planned, or a comparison's
+# gate fails (the direct baseline's p99 CI half width reaches 5% on a gate
+# metric).
 
 set -euo pipefail
 
 usage() {
-    sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # The leading comment block after the shellcheck directive and its note.
+    awk 'NR < 4 { next } /^#/ { print; next } { exit }' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     echo
     echo "Knobs (default, meaning):"
     local entry name default meaning
@@ -74,7 +88,7 @@ knob_table=(
     "BIN_DIR|$HOME/brisk-target/release|directory of the three binaries"
     "CONFIGS|P T|configs to run, in order (P, T)"
     "SCENARIOS|sc s1 s2 s3|scenarios to run (sc, s1, s2, s3)"
-    "REPS|3|repetitions per scenario"
+    "REPS||repetitions of every scenario (default: S1 5, S2 3, S3 3)"
     "RETRY_INVALID|1|reruns of a repetition that has an invalid run"
     "SEED|1|schedule seed of repetition 1; repetition r uses SEED+r-1"
     "SPIN_US|50|busy-wait window of mock and loadgen, microseconds"
@@ -101,7 +115,7 @@ knob_table=(
     "SC_MOCK_SHARDS||shards of the selfcheck mock (default: MOCK_SHARDS)"
     "SC_LOADGEN_CPUS||CPUs of the selfcheck loadgen (default: LOADGEN_CPUS)"
     "SC_LOADGEN_SHARDS||selfcheck loadgen shard threads (default: LOADGEN_SHARDS)"
-    "S1_REPS||S1 repetitions (default: REPS)"
+    "S1_REPS||S1 repetitions (default: REPS, else 5)"
     "S1_CONCURRENCY|1000|S1 target concurrent streams"
     "S1_CHUNK_RATE|30|S1 chunks per second per stream"
     "S1_DUR_MEDIAN|5|S1 median stream duration, seconds"
@@ -111,14 +125,14 @@ knob_table=(
     "S1_CHUNK_BYTES|128|S1 content bytes per chunk"
     "S1_WARMUP_S|150|S1 warmup, seconds"
     "S1_MEASURE_S|300|S1 measurement, seconds"
-    "S2_REPS||S2 repetitions (default: REPS)"
+    "S2_REPS||S2 repetitions (default: REPS, else 3)"
     "S2_RATE|2000|S2 fixed request rate per second"
     "S2_TTFT_US|200|S2 mock delay, microseconds (see above)"
     "S2_RESP_BYTES|1024|S2 response content bytes"
     "S2_PROMPT_BYTES|1024|S2 user message bytes"
     "S2_WARMUP_S|30|S2 warmup, seconds"
     "S2_MEASURE_S|300|S2 measurement, seconds"
-    "S3_REPS||S3 repetitions (default: REPS)"
+    "S3_REPS||S3 repetitions (default: REPS, else 3)"
     "S3_SIZES|100k,1m,10m|S3 request body sizes, one loadgen run each"
     "S3_RATE|5|S3 request rate per second"
     "S3_TTFT_US|2000|S3 mock TTFT, microseconds (see above)"
@@ -129,6 +143,9 @@ knob_table=(
     "COMPARE_QUANTILES|50,99,99.9|compared quantiles of S1 and S2, percent"
     "S3_COMPARE_QUANTILES|50,99|compared quantiles of S3; its sample count leaves p99.9 at a handful of samples"
     "COMPARE_RESAMPLES|2000|bootstrap resamples"
+    "GATE_METRICS|chunk_latency|S1 metrics whose baseline p99 CI decides the gate (of ttft, chunk_latency, chunk_wire); ttft is left out because its tail varies with the seed-driven schedule itself and would need about 25 repetitions to reach the 5% bound"
+    "S2_GATE_METRICS|request_latency|S2 gate metrics (of request_latency)"
+    "S3_GATE_METRICS|ttft|S3 gate metrics (of ttft, chunk_latency)"
 )
 
 log() {
@@ -199,7 +216,7 @@ esac
 : "${SC_MOCK_CPUS:=$MOCK_CPUS}" "${SC_MOCK_SHARDS:=$MOCK_SHARDS}"
 : "${SC_LOADGEN_CPUS:=$LOADGEN_CPUS}" "${SC_LOADGEN_SHARDS:=$LOADGEN_SHARDS}"
 : "${SC_CONCURRENCY:=$S1_CONCURRENCY}"
-: "${S1_REPS:=$REPS}" "${S2_REPS:=$REPS}" "${S3_REPS:=$REPS}"
+: "${S1_REPS:=${REPS:-5}}" "${S2_REPS:=${REPS:-3}}" "${S3_REPS:=${REPS:-3}}"
 
 if ((print_config)); then
     for name in "${knob_names[@]}"; do
@@ -210,7 +227,8 @@ fi
 
 # ---------------------------------------------------------------- checks
 
-for name in REPS S1_REPS S2_REPS S3_REPS RETRY_INVALID SEED SPIN_US S3_SPIN_US \
+[[ -z "$REPS" || "$REPS" =~ ^[0-9]+$ ]] || die "REPS must be a non-negative integer, got '$REPS'"
+for name in S1_REPS S2_REPS S3_REPS RETRY_INVALID SEED SPIN_US S3_SPIN_US \
     MOCK_SHARDS LOADGEN_SHARDS MOCK_PLAIN_PORT MOCK_TLS_PORT FLOOR_P_PORT FLOOR_T_PORT SC_PORT \
     SC_CONCURRENCY SC_WARMUP_S SC_MEASURE_S SC_MOCK_SHARDS SC_LOADGEN_SHARDS \
     S1_CONCURRENCY S1_TTFT_US S1_CHUNK_BYTES S1_WARMUP_S S1_MEASURE_S \
@@ -241,6 +259,46 @@ has_scenario() {
 has_config() {
     [[ " $CONFIGS " == *" $1 "* ]]
 }
+
+# Prints the metrics a scenario compares; its gate metrics must be among
+# them.
+compared_metrics() {
+    case "$1" in
+        s1) echo ttft,chunk_latency,chunk_wire ;;
+        s2) echo request_latency ;;
+        s3) echo ttft,chunk_latency ;;
+    esac
+}
+
+# Prints the gate metrics of a scenario.
+gate_metrics() {
+    case "$1" in
+        s1) echo "$GATE_METRICS" ;;
+        s2) echo "$S2_GATE_METRICS" ;;
+        s3) echo "$S3_GATE_METRICS" ;;
+    esac
+}
+
+# A gate metric the scenario does not compare would make the gate vacuous
+# or refuse the comparison only at the end of an hours-long session.
+for s in s1 s2 s3; do
+    has_scenario "$s" || continue
+    gate_var=GATE_METRICS
+    [[ "$s" == s1 ]] || gate_var="${s^^}_GATE_METRICS"
+    compared="$(compared_metrics "$s")"
+    [[ "${!gate_var}" =~ ^[a-z_]+(,[a-z_]+)*$ ]] ||
+        die "$gate_var must be a comma-separated list of metrics, got '${!gate_var}'"
+    IFS=, read -r -a gate_list <<<"${!gate_var}"
+    seen=","
+    for metric in "${gate_list[@]}"; do
+        [[ ",$compared," == *",$metric,"* ]] ||
+            die "$gate_var names $metric, which $s does not compare (it compares $compared)"
+        # A repeated metric would fail the post-compare consistency check,
+        # hours into the session.
+        [[ "$seen" != *",$metric,"* ]] || die "$gate_var names $metric twice"
+        seen+="$metric,"
+    done
+done
 
 # Prints the CPUs of a list such as 0-3,6 one per word.
 expand_cpus() {
@@ -368,6 +426,8 @@ declare -A foreign_pids=()
 lg_args=()
 lg_out=""
 lg_cpus=""
+# Pairing id of the run in progress; empty for the selfcheck.
+lg_pair_id=""
 sampler_pid=""
 certs_dir=""
 sc_tls=0
@@ -664,6 +724,10 @@ write_manifest() {
           selfcheck: $selfcheck, selfcheck_detail: $selfcheck_detail,
           invalid_runs: $invalid, retries: $retries, failed_runs: $failed,
           failed_compares: $failed_compares, baseline_ci_failures: $baseline_ci_failures,
+          gate: [$compares[] | select(.gate_pass != null)
+                 | {name, gate_pass, reps_used, within_run_fallback,
+                    metrics: [.metrics[] | {metric, gate, pass, baseline_p99_ci_half_width_ratio,
+                                            per_pair_delta_us: [.quantiles[] | {q, per_pair_delta_us}]}]}],
           runs: $runs, compares: $compares,
           processes: "processes.jsonl", session_log: "session.log"}' \
         >"$run_dir/manifest.json" 2>/dev/null || log "writing manifest.json failed"
@@ -731,18 +795,40 @@ for port in "${reserved_ports[@]}"; do
     fi
 done
 
-# Planned duration, for the log only; process start and stop add a few
-# seconds per run, and reruns of invalid repetitions add more.
+# Planned duration, for the log only. Reruns of invalid repetitions and the
+# comparisons at the end come on top.
+run_overhead_s=10 # floor start, readiness polls, statistics and stop per run
 planned_s=0
+planned_detail=""
 n_configs=$(wc -w <<<"$CONFIGS")
 n_sizes=$(tr ',' ' ' <<<"$S3_SIZES" | wc -w)
 n_selfchecks=1
 has_config T && n_selfchecks=2
-has_scenario sc && planned_s=$((planned_s + n_selfchecks * (SC_WARMUP_S + SC_MEASURE_S)))
-has_scenario s1 && planned_s=$((planned_s + n_configs * S1_REPS * 2 * (S1_WARMUP_S + S1_MEASURE_S)))
-has_scenario s2 && planned_s=$((planned_s + n_configs * S2_REPS * 2 * (S2_WARMUP_S + S2_MEASURE_S)))
-has_scenario s3 && planned_s=$((planned_s + n_configs * S3_REPS * 2 * n_sizes * (S3_WARMUP_S + S3_MEASURE_S)))
-log "planned measurement time about $((planned_s / 60)) min"
+# Adds runs x (warmup + measure + overhead) seconds under a label.
+plan() {
+    local label="$1" runs="$2" run_s="$3" s
+    s=$((runs * (run_s + run_overhead_s)))
+    planned_s=$((planned_s + s))
+    planned_detail+="${planned_detail:+, }$label $runs run(s) $((s / 60)) min"
+}
+has_scenario sc && plan sc "$n_selfchecks" $((SC_WARMUP_S + SC_MEASURE_S))
+has_scenario s1 && plan s1 $((n_configs * S1_REPS * 2)) $((S1_WARMUP_S + S1_MEASURE_S))
+has_scenario s2 && plan s2 $((n_configs * S2_REPS * 2)) $((S2_WARMUP_S + S2_MEASURE_S))
+has_scenario s3 && plan s3 $((n_configs * S3_REPS * 2 * n_sizes)) $((S3_WARMUP_S + S3_MEASURE_S))
+log "planned session time about $((planned_s / 3600)) h $((planned_s % 3600 / 60)) min (${planned_detail:-nothing to run}), plus reruns and comparisons"
+log "repetitions: S1 $S1_REPS, S2 $S2_REPS, S3 $S3_REPS; gate metrics: S1 $GATE_METRICS, S2 $S2_GATE_METRICS, S3 $S3_GATE_METRICS"
+for s in s1 s2 s3; do
+    reps_var="${s^^}_REPS"
+    has_scenario "$s" || continue
+    if ((${!reps_var} < 2)); then
+        log "WARNING: $reps_var=${!reps_var}; with one repetition the comparison falls back to the within-run bootstrap, which leaves out the run-to-run spread and understates the CI"
+    elif ((${!reps_var} < 5)); then
+        # Calibration of the paired percentile bootstrap on the pilot data:
+        # at 3 pairs the nominal 95% CIs covered about 81% (baseline) and
+        # 75-91% (delta), so a narrow baseline CI passes the gate too easily.
+        log "WARNING: $reps_var=${!reps_var}; below 5 repetitions the percentile CIs undercover (about 81% for the baseline at 3), so the baseline gate is lenient"
+    fi
+done
 if has_scenario s3 && ((s3_samples < 1000)); then
     log "WARNING: S3 pools $s3_samples requests per arm and size (S3_RATE x S3_MEASURE_S x S3_REPS); its p99 rests on a handful of samples"
 fi
@@ -777,8 +863,10 @@ record_run() {
         jq -nc --arg scen "$scen" --arg config "$config" --arg arm "$arm" --argjson rep "$rep" \
             --argjson attempt "$attempt" --arg order "$order" \
             --arg tag "$tag" --arg size "$size" --argjson rc "$rc" --arg started "$started" \
+            --arg pair "$lg_pair_id" \
             '{scen: $scen, config: $config, arm: $arm, rep: $rep, attempt: $attempt, order: $order,
-              tag: $tag, size: $size, file: null, valid: false,
+              tag: $tag, size: $size, pair_id: (if $pair == "" then null else $pair end),
+              file: null, valid: false,
               reasons: ["no result file (load generator exit status \($rc))"],
               loadgen_rc: $rc, started: $started}' >>"$run_dir/runs.jsonl"
         invalid_runs=$((invalid_runs + 1))
@@ -790,10 +878,10 @@ record_run() {
         --argjson attempt "$attempt" --arg order "$order" \
         --arg tag "$tag" --arg size "$size" --argjson rc "$rc" --arg started "$started" \
         --arg file "results/${file##*/}" --argjson cpu "$cpu" --argjson net "$net" \
-        --argjson mock "$mockstats" '
+        --argjson mock "$mockstats" --arg pair "$lg_pair_id" '
         .warmup_intervals as $w
         | {scen: $scen, config: $config, arm: $arm, rep: $rep, attempt: $attempt, order: $order,
-           tag: $tag, size: $size,
+           tag: $tag, size: $size, pair_id: (if $pair == "" then null else $pair end),
            file: $file, label, scenario, valid: .validity.valid, reasons: .validity.reasons,
            loadgen_rc: $rc, started: $started, seed: .params.common.seed,
            duration_s: .loadgen.duration_s, counters: .loadgen.counters,
@@ -913,6 +1001,9 @@ target_url() {
 run_arm() {
     local scen="$1" config="$2" arm="$3" rep="$4" attempt="$5" order="$6" size="$7"
     local base="$scen-$config-$arm-r$rep" tls=0 rep_seed=$((SEED + rep - 1)) spin="$SPIN_US"
+    # Shared by both arms and by every attempt of the repetition: the
+    # comparison pairs the arms' runs by it.
+    lg_pair_id="$scen-$config${size:+-$size}-r$rep"
     ((attempt == 0)) || base+="-a$attempt"
     local tag="$base${size:+-$size}"
     [[ "$config" == T ]] && tls=1
@@ -945,6 +1036,7 @@ run_arm() {
             ;;
     esac
     loadgen_common "$arm-$config" "$lg_out" "$rep_seed" "$LOADGEN_CPUS" "$LOADGEN_SHARDS" "$tls" "$spin"
+    lg_args+=(--pair-id "$lg_pair_id")
     execute_run "$scen" "$config" "$arm" "$rep" "$attempt" "$order" "$size" "$tag" "$warmup" "$measure" \
         "$result" mock-plain mock-tls floor loadgen
 }
@@ -988,6 +1080,7 @@ selfcheck_one() {
         curl_ca=(--cacert "$ca")
     fi
     sc_tls="$tls"
+    lg_pair_id=""
     log "selfcheck $config: $SC_CONCURRENCY x 2 streams, mock $SC_MOCK_SHARDS shard(s) on CPUs $SC_MOCK_CPUS, loadgen $SC_LOADGEN_SHARDS shard(s) on $SC_LOADGEN_CPUS"
     start_proc mock-sc "$SC_MOCK_CPUS" "$run_dir/logs/$tag.mock.log" "$mock" serve \
         --listen "127.0.0.1:$SC_PORT" --shards "$SC_MOCK_SHARDS" --cpu-list "$SC_MOCK_CPUS" --spin-us "$SPIN_US" \
@@ -1025,57 +1118,101 @@ run_selfcheck() {
     log "selfcheck: $selfcheck_status ($selfcheck_detail)"
 }
 
-# Metrics whose direct-baseline p99 CI half width must stay below 5% (M0
-# exit condition); chunk_wire is reported but not gated.
-gated_metrics() {
-    case "$1" in
-        s1) echo ttft,chunk_latency ;;
-        s2) echo request_latency ;;
-        s3) echo ttft ;;
-    esac
-}
+# jq helpers for reading a compare document. pair_deltas collects the
+# per-pair deltas (ns) of quantile $i of comparison $c, from either
+# comparison.per_pair[] (each pair with quantiles[].delta_ns, or deltas_ns
+# in the order of comparison.quantiles) or comparison.quantiles[$i].per_pair
+# (numbers or objects with delta_ns).
+# shellcheck disable=SC2016
+jq_compare_defs='
+def signed: if . == null then "n/a"
+            else (. * 100 | round / 100) as $v | (if $v >= 0 then "+" else "" end) + ($v | tostring)
+            end;
+def us: if . == null then "n/a" else . / 1000 | signed end;
+def pct: if . == null then "n/a" else (. * 1000 | round / 10 | tostring) + "%" end;
+def qlabel: "p" + (. * 100 * 1e6 | round / 1e6 | tostring);
+def median: sort | length as $n
+    | if $n == 0 then null
+      elif $n % 2 == 1 then .[($n - 1) / 2]
+      else (.[$n / 2 - 1] + .[$n / 2]) / 2
+      end;
+def pair_deltas($c; $i):
+    $c.quantiles[$i] as $q
+    | [if ($q.per_pair | type) == "array" then
+           $q.per_pair[] | if type == "object" then .delta_ns else . end
+       elif ($c.per_pair | type) == "array" then
+           $c.per_pair[]
+           | if (.quantiles | type) == "array" then .quantiles[] | select(.quantile == $q.quantile) | .delta_ns
+             elif (.deltas_ns | type) == "array" then .deltas_ns[$i]
+             else .delta_ns
+             end
+       else empty
+       end
+       | numbers];
+def pair_summary($c; $i):
+    pair_deltas($c; $i) as $d
+    | if ($d | length) == 0 then null
+      else {pairs: ($d | length), min_us: ($d | min / 1000), median_us: ($d | median / 1000),
+            max_us: ($d | max / 1000)}
+      end;
+'
 
 compare_one() {
     local scen="$1" config="$2" size="$3" metrics="$4" quantiles="$5"
     local name="$scen-$config${size:+-$size}" reps_var="${scen^^}_REPS"
     local expected="${!reps_var}" gated
-    gated="$(gated_metrics "$scen")"
-    # Per repetition, the latest attempt whose two arms are both valid; a
-    # repetition without one is left out on both arms, so the arms stay
-    # paired by seed.
+    gated="$(gate_metrics "$scen")"
+    # Per repetition, the latest attempt whose two arms are both valid (the
+    # compared pairs) and, for diagnosis, the latest attempt whose two arms
+    # both left a result file and that holds an invalid run, else the latest
+    # such attempt: taking the latest alone would pick the valid rerun of an
+    # invalid repetition and reduce the diagnostic comparison to the formal
+    # one. A repetition without one is left out on both arms, so the A and B
+    # lists stay aligned repetition by repetition, which is the order in
+    # which compare pairs them.
     local selection
     selection="$(jq -sc --arg s "$scen" --arg c "$config" --arg z "$size" '
+        def rep_pairs(ok; rank):
+            group_by(.rep)
+            | map(group_by(.attempt)
+                  | map(select(length == 2
+                               and all(.[]; ok and .file != null)
+                               and (map(.arm) | sort) == ["direct", "floor"]))
+                  | sort_by(rank)
+                  | last)
+            | map(select(. != null));
         [.[] | select(.scen == $s and .config == $c and .size == $z)] as $all
-        | ($all | group_by(.rep)
-           | map(group_by(.attempt)
-                 | map(select(length == 2
-                              and all(.[]; .valid == true and .file != null)
-                              and (map(.arm) | sort) == ["direct", "floor"]))
-                 | last)
-           | map(select(. != null))) as $pairs
+        | ($all | rep_pairs(.valid == true; .[0].attempt)) as $pairs
+        | ($all | rep_pairs(true; [any(.[]; .valid != true), .[0].attempt])) as $with_files
         | {reps: ($pairs | length),
+           pair_ids: [$pairs[] | .[0].pair_id],
            a: [$pairs[][] | select(.arm == "direct") | .file],
            b: [$pairs[][] | select(.arm == "floor") | .file],
            has_invalid: any($all[]; .valid != true),
-           all_a: [$all[] | select(.arm == "direct" and .file != null) | .file],
-           all_b: [$all[] | select(.arm == "floor" and .file != null) | .file]}' \
+           diag_has_invalid: any($with_files[][]; .valid != true),
+           all_a: [$with_files[][] | select(.arm == "direct") | .file],
+           all_b: [$with_files[][] | select(.arm == "floor") | .file]}' \
         "$run_dir/runs.jsonl")"
-    local reps has_invalid
+    local reps has_invalid diag_has_invalid
     reps="$(jq -r '.reps' <<<"$selection")"
     has_invalid="$(jq -r '.has_invalid' <<<"$selection")"
+    diag_has_invalid="$(jq -r '.diag_has_invalid' <<<"$selection")"
     local -a a_files b_files
     mapfile -t a_files < <(jq -r '.a[]' <<<"$selection")
     mapfile -t b_files < <(jq -r '.b[]' <<<"$selection")
 
     # Numbers that include invalid runs are kept apart, for diagnosis only.
     local diagnostic=null
-    if [[ "$has_invalid" == true ]]; then
+    if [[ "$has_invalid" == true && "$diag_has_invalid" != true ]]; then
+        log "compare $name: no diagnostic comparison; no invalid run left a result file in an attempt with both arms"
+    elif [[ "$has_invalid" == true ]]; then
         local -a all_a all_b
         mapfile -t all_a < <(jq -r '.all_a[]' <<<"$selection")
         mapfile -t all_b < <(jq -r '.all_b[]' <<<"$selection")
         if ((${#all_a[@]} > 0 && ${#all_b[@]} > 0)); then
             if "$loadgen" compare --a "${all_a[@]/#/$run_dir/}" --b "${all_b[@]/#/$run_dir/}" \
-                --metric "$metrics" --quantiles "$quantiles" --resamples "$COMPARE_RESAMPLES" \
+                --metric "$metrics" --gate-metrics "$gated" --quantiles "$quantiles" \
+                --resamples "$COMPARE_RESAMPLES" \
                 --allow-invalid --out "$run_dir/compare/$name.with-invalid.json" \
                 >"$run_dir/compare/$name.with-invalid.txt" 2>&1; then
                 diagnostic="\"compare/$name.with-invalid.json\""
@@ -1100,45 +1237,82 @@ compare_one() {
         failed_compares=$((failed_compares + 1))
         log "compare $name: only $reps of $expected repetitions have two valid arms"
     fi
+    if ((reps == 1)); then
+        log "compare $name: one repetition only; the CIs come from the within-run bootstrap and leave out the run-to-run spread"
+    fi
+    local json="$run_dir/compare/$name.json"
     local -a args=(compare --a "${a_files[@]/#/$run_dir/}" --b "${b_files[@]/#/$run_dir/}"
-        --metric "$metrics" --quantiles "$quantiles" --resamples "$COMPARE_RESAMPLES"
-        --out "$run_dir/compare/$name.json")
-    local rc=0
+        --metric "$metrics" --gate-metrics "$gated" --quantiles "$quantiles"
+        --resamples "$COMPARE_RESAMPLES" --out "$json")
+    local rc=0 reason=""
     "$loadgen" "${args[@]}" >"$run_dir/compare/$name.txt" 2>&1 || rc=$?
     sed 's/^/    /' "$run_dir/compare/$name.txt"
-    if ((rc != 0)) || [[ ! -f "$run_dir/compare/$name.json" ]]; then
+    if ((rc != 0)) || [[ ! -f "$json" ]]; then
+        reason="brisk-loadgen compare exited with status $rc"
+    elif ! jq -e '(.gate_pass | type) == "boolean"
+                  and all(.comparisons[]; (.gate | type) == "boolean" and (.pass | type) == "boolean")' \
+        "$json" >/dev/null; then
+        reason="compare/$name.json lacks gate_pass or a per-metric gate or pass field"
+    elif ! jq -e --arg g "$gated" \
+        '([.comparisons[] | select(.gate) | .metric] | unique) == ($g | split(",") | unique)' \
+        "$json" >/dev/null; then
+        reason="compare/$name.json gates $(jq -r '[.comparisons[] | select(.gate) | .metric] | join(",")' "$json"), expected $gated"
+    fi
+    if [[ -n "$reason" ]]; then
+        log "compare $name: FAILED: $reason"
         # A partial comparison is already counted.
         [[ "$status" == partial ]] || failed_compares=$((failed_compares + 1))
-        jq -nc --arg name "$name" --argjson rc "$rc" --argjson diag "$diagnostic" \
-            '{name: $name, status: "failed", reason: "brisk-loadgen compare exited with status \($rc)",
-              diagnostic: $diag}' >>"$run_dir/compares.jsonl"
+        jq -nc --arg name "$name" --arg reason "$reason" --argjson diag "$diagnostic" \
+            '{name: $name, status: "failed", reason: $reason, diagnostic: $diag}' \
+            >>"$run_dir/compares.jsonl"
         return 0
     fi
+
+    local gate_pass
+    gate_pass="$(jq -r '.gate_pass' "$json")"
+    [[ "$gate_pass" == true ]] || baseline_ci_failures=$((baseline_ci_failures + 1))
+    log "compare $name: gate $([[ "$gate_pass" == true ]] && echo PASS || echo FAIL) (gate metrics $gated, $reps pair(s))"
+    # Per metric the baseline criterion, then per quantile the delta and the
+    # spread of the per-pair deltas, which shows the run-to-run variation
+    # the CI has to cover.
+    jq -r "$jq_compare_defs"'
+        .comparisons[] as $c
+        | "  \($c.metric): baseline p99 CI half width \($c.baseline_p99_ci_half_width_ratio | pct) (limit 5%): \(if $c.pass then "PASS" else "FAIL" end)\(if $c.gate then "" else " (reported, not gated)" end)",
+          (range(0; $c.quantiles | length) as $i
+           | $c.quantiles[$i] as $q
+           | pair_summary($c; $i) as $p
+           | "    \($q.quantile | qlabel): delta \($q.delta_ns | us) us, 95% CI [\($q.delta_ci_low_ns | us), \($q.delta_ci_high_ns | us)] us; per pair "
+             + (if $p == null then "n/a"
+                else "\($p.min_us | signed) .. \($p.max_us | signed) us, median \($p.median_us | signed) us over \($p.pairs) pair(s)"
+                end))' \
+        "$json" | while IFS= read -r line; do log "$line"; done ||
+        log "compare $name: printing the per-metric summary failed; see compare/$name.json"
+
     local ci_fail
-    ci_fail="$(jq -c --arg g "$gated" '
-        ($g | split(",")) as $gated
-        | [.comparisons[] | select(.metric as $m | $gated | any(.[]; . == $m))
-           | select((.baseline_p99_ci_half_width_ratio // 1) >= 0.05)
-           | {metric, ratio: .baseline_p99_ci_half_width_ratio}]' "$run_dir/compare/$name.json")"
-    if [[ "$ci_fail" != "[]" ]]; then
-        baseline_ci_failures=$((baseline_ci_failures + 1))
-        log "compare $name: direct baseline p99 CI half width >= 5% on $(jq -r 'map("\(.metric) \(.ratio * 1000 | round / 10)%") | join(", ")' <<<"$ci_fail")"
-    fi
+    ci_fail="$(jq -c '[.comparisons[] | select(.gate and (.pass | not))
+                       | {metric, ratio: .baseline_p99_ci_half_width_ratio}]' "$json")"
     jq -c --arg name "$name" --arg status "$status" --arg scen "$scen" --arg config "$config" \
         --arg size "$size" --argjson reps "$reps" --argjson expected "$expected" \
-        --argjson ci_fail "$ci_fail" --argjson diag "$diagnostic" --arg gated "$gated" '
+        --argjson ci_fail "$ci_fail" --argjson diag "$diagnostic" --arg gated "$gated" \
+        --argjson pair_ids "$(jq -c '.pair_ids' <<<"$selection")" "$jq_compare_defs"'
         {name: $name, status: $status, scen: $scen, config: $config, size: $size,
          json: "compare/\($name).json", text: "compare/\($name).txt",
          reps_used: $reps, reps_expected: $expected, diagnostic: $diag,
-         invalid_runs, baseline_p99_ci_ok,
+         pair_ids: $pair_ids, within_run_fallback: ($reps == 1),
+         invalid_runs, baseline_p99_ci_ok, gate_pass,
          gated_metrics: ($gated | split(",")), baseline_ci_fail: $ci_fail,
-         metrics: [.comparisons[] | {metric, a_intervals, b_intervals, a_count, b_count,
-                   baseline_p99_ci_half_width_ratio,
-                   quantiles: [.quantiles[] | {q: .quantile, a_us: (.a_ns / 1000), b_us: (.b_ns / 1000),
-                               delta_us: (.delta_ns / 1000),
-                               delta_ci_us: [(.delta_ci_low_ns / 1000), (.delta_ci_high_ns / 1000)],
-                               a_ci_half_width_ratio}]}]}' \
-        "$run_dir/compare/$name.json" >>"$run_dir/compares.jsonl"
+         compare_meta: del(.comparisons, .a_files, .b_files, .a_labels, .b_labels,
+                           .invalid_runs, .baseline_p99_ci_ok, .gate_pass),
+         metrics: [.comparisons[] as $c
+                   | $c | {metric, gate, pass, a_intervals, b_intervals, a_count, b_count,
+                           baseline_p99_ci_half_width_ratio, per_pair,
+                           quantiles: [range(0; $c.quantiles | length) as $i | $c.quantiles[$i]
+                                       | {q: .quantile, a_us: (.a_ns / 1000), b_us: (.b_ns / 1000),
+                                          delta_us: (.delta_ns / 1000),
+                                          delta_ci_us: [(.delta_ci_low_ns / 1000), (.delta_ci_high_ns / 1000)],
+                                          a_ci_half_width_ratio,
+                                          per_pair_delta_us: pair_summary($c; $i)}]}]}' \
+        "$json" >>"$run_dir/compares.jsonl"
 }
 
 if has_scenario sc; then
@@ -1186,11 +1360,11 @@ if ((${#scenario_list[@]} > 0)); then
     for config in $CONFIGS; do
         for scen in "${scenario_list[@]}"; do
             case "$scen" in
-                s1) compare_one s1 "$config" "" ttft,chunk_latency,chunk_wire "$COMPARE_QUANTILES" ;;
-                s2) compare_one s2 "$config" "" request_latency "$COMPARE_QUANTILES" ;;
+                s1) compare_one s1 "$config" "" "$(compared_metrics s1)" "$COMPARE_QUANTILES" ;;
+                s2) compare_one s2 "$config" "" "$(compared_metrics s2)" "$COMPARE_QUANTILES" ;;
                 s3)
                     for size in "${s3_sizes[@]}"; do
-                        compare_one s3 "$config" "$size" ttft,chunk_latency "$S3_COMPARE_QUANTILES"
+                        compare_one s3 "$config" "$size" "$(compared_metrics s3)" "$S3_COMPARE_QUANTILES"
                     done
                     ;;
             esac
@@ -1199,7 +1373,13 @@ if ((${#scenario_list[@]} > 0)); then
 fi
 
 write_manifest complete
-log "session $RUN_ID done: selfcheck $selfcheck_status, $invalid_runs invalid run(s) ($retries repetition rerun(s)), $failed_runs failed run(s), $failed_compares missing or partial comparison(s), $baseline_ci_failures comparison(s) over the baseline CI limit"
+log "session $RUN_ID done: selfcheck $selfcheck_status, $invalid_runs invalid run(s) ($retries repetition rerun(s)), $failed_runs failed run(s), $failed_compares missing or partial comparison(s), $baseline_ci_failures comparison(s) failing the baseline CI gate"
+# One line per compared metric, so the verdicts sit together at the end of
+# the log.
+jq -rs '.[] | select(.gate_pass != null) | .name as $n
+        | .metrics[] | "  \($n) \(.metric): \(if .pass then "PASS" else "FAIL" end)\(if .gate then "" else " (not gated)" end)"' \
+    "$run_dir/compares.jsonl" | while IFS= read -r line; do log "$line"; done ||
+    log "printing the per-metric verdicts failed; see compares.jsonl"
 log "results in $run_dir"
 if [[ "$selfcheck_status" == FAIL ]] || ((failed_runs + failed_compares + baseline_ci_failures > 0)); then
     exit 1
