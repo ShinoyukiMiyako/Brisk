@@ -1,0 +1,88 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "bench/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+license = "AGPL-3.0-only"
+repository = "https://github.com/ShinoyukiMiyako/Brisk"
+publish = false
+
+[workspace.dependencies]
+brisk-bench-core = { path = "bench/brisk-bench-core" }
+brisk-gateway = { path = "crates/brisk-gateway" }
+
+anyhow = "1.0.104"
+base64 = "0.23.1"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+fastrand = "2.5.0"
+futures-util = { version = "0.3.34", default-features = false }
+h2 = "0.4.19"
+hdrhistogram = { version = "7.6.0", default-features = false }
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+httparse = "1.10.1"
+hyper = { version = "1.11.1", default-features = false }
+hyper-util = { version = "0.1.20", default-features = false }
+libc = "0.2.189"
+memchr = "2.8.3"
+mimalloc = { version = "0.1.52", default-features = false }
+mio = { version = "1.2.3", default-features = false }
+pin-project-lite = "0.2.17"
+proptest = "1.11.0"
+rcgen = { version = "0.14.10", default-features = false }
+reqwest = { version = "0.13.5", default-features = false }
+rustix = { version = "1.1.5", default-features = false }
+rustls = { version = "0.23.45", default-features = false }
+rustls-pki-types = "1.15.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", default-features = false }
+tokio-rustls = { version = "0.26.5", default-features = false }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = false
+strip = "debuginfo"
+incremental = false
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
+[profile.fast-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# aws-lc-sys needs NASM on x86 Windows unless it links the prebuilt objects.
+AWS_LC_SYS_PREBUILT_NASM = "1"
