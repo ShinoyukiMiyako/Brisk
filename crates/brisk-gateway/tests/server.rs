@@ -283,6 +283,9 @@ async fn tls_inbound_with_extra_root_cert() {
 
     let client = build_client(&UpstreamClientConfig {
         extra_root_certs: vec![pki.ca_der.clone()],
+        // The test server is reached as `localhost` (TLS needs a name for
+        // SNI), which resolves to loopback.
+        allow_private: true,
         ..UpstreamClientConfig::default()
     })
     .unwrap();
@@ -291,8 +294,13 @@ async fn tls_inbound_with_extra_root_cert() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.text().await.unwrap(), "over tls");
 
-    // Without the extra root the self-signed chain must be rejected.
-    let untrusting = build_client(&UpstreamClientConfig::default()).unwrap();
+    // Without the extra root the self-signed chain must be rejected; loopback
+    // stays allowed so that the certificate is what fails.
+    let untrusting = build_client(&UpstreamClientConfig {
+        allow_private: true,
+        ..UpstreamClientConfig::default()
+    })
+    .unwrap();
     assert!(untrusting.get(&url).send().await.is_err());
 
     server.trigger_shutdown();
@@ -324,6 +332,9 @@ async fn tls_handshake_timeout_releases_connection_permit() {
 
     let client = build_client(&UpstreamClientConfig {
         extra_root_certs: vec![pki.ca_der.clone()],
+        // The test server is reached as `localhost` (TLS needs a name for
+        // SNI), which resolves to loopback.
+        allow_private: true,
         ..UpstreamClientConfig::default()
     })
     .unwrap();
@@ -594,6 +605,9 @@ async fn conn_info_reaches_service_factory() {
 
     let client = build_client(&UpstreamClientConfig {
         extra_root_certs: vec![pki.ca_der.clone()],
+        // The test server is reached as `localhost` (TLS needs a name for
+        // SNI), which resolves to loopback.
+        allow_private: true,
         ..UpstreamClientConfig::default()
     })
     .unwrap();

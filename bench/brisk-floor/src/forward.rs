@@ -293,9 +293,12 @@ mod tests {
     use super::*;
 
     fn client() -> Client {
-        brisk_gateway::upstream::build_client(
-            &brisk_gateway::upstream::UpstreamClientConfig::default(),
-        )
+        brisk_gateway::upstream::build_client(&brisk_gateway::upstream::UpstreamClientConfig {
+            // Same profile as the binary, whose upstreams are on loopback or
+            // the internal network.
+            allow_private: true,
+            ..brisk_gateway::upstream::UpstreamClientConfig::default()
+        })
         .unwrap()
     }
 

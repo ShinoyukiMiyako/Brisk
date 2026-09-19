@@ -91,7 +91,12 @@ fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
-    let mut upstream_config = UpstreamClientConfig::default();
+    let mut upstream_config = UpstreamClientConfig {
+        // Every benchmark topology puts the upstream on loopback or the
+        // internal network, and a host name there must resolve.
+        allow_private: true,
+        ..UpstreamClientConfig::default()
+    };
     if let Some(ca) = &cli.upstream_ca {
         upstream_config.extra_root_certs = tls::load_ca_certs(ca)
             .with_context(|| format!("loading upstream CA {}", ca.display()))?;

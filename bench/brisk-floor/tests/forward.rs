@@ -98,7 +98,13 @@ struct Floor {
 
 fn spawn_floor(upstream: &str, tls: Option<tokio_rustls::TlsAcceptor>) -> Floor {
     let config = ServerConfig::default();
-    let client = build_client(&UpstreamClientConfig::default()).unwrap();
+    let client = build_client(&UpstreamClientConfig {
+        // The test upstreams listen on loopback, as in the benchmark
+        // topologies the binary allows them for.
+        allow_private: true,
+        ..UpstreamClientConfig::default()
+    })
+    .unwrap();
     let forwarder = Forwarder::new(client, upstream).unwrap();
     let listener = server::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
     let addr = listener.local_addr().unwrap();
@@ -117,6 +123,9 @@ fn inbound_client(
 ) -> reqwest::Client {
     build_client(&UpstreamClientConfig {
         extra_root_certs,
+        // The floor under test listens on loopback; the TLS tests reach it
+        // as `localhost` for SNI.
+        allow_private: true,
         ..UpstreamClientConfig::default()
     })
     .unwrap()

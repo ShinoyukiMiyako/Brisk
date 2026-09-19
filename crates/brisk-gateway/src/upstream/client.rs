@@ -18,7 +18,10 @@ use crate::net;
 /// Settings for [`build_client`].
 ///
 /// [`Default`] yields the values from the data-plane design document.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Also the key of the client registry: channels with equal configurations
+/// share one client and therefore one connection pool.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UpstreamClientConfig {
     /// Upper bound for establishing a TCP connection (and TLS handshake).
     pub connect_timeout: Duration,
@@ -33,6 +36,8 @@ pub struct UpstreamClientConfig {
     /// Additional trust anchors, merged with the platform roots. Used for the
     /// benchmark mock's self-signed CA.
     pub extra_root_certs: Vec<CertificateDer<'static>>,
+    /// Private and loopback upstream addresses are allowed (04, 8.1).
+    pub allow_private: bool,
 }
 
 impl Default for UpstreamClientConfig {
@@ -43,6 +48,7 @@ impl Default for UpstreamClientConfig {
             tcp_keepalive: Duration::from_secs(30),
             tcp_user_timeout: Duration::from_secs(60),
             extra_root_certs: Vec::new(),
+            allow_private: false,
         }
     }
 }
@@ -125,6 +131,7 @@ mod tests {
         assert_eq!(config.tcp_keepalive, Duration::from_secs(30));
         assert_eq!(config.tcp_user_timeout, Duration::from_secs(60));
         assert!(config.extra_root_certs.is_empty());
+        assert!(!config.allow_private);
     }
 
     #[test]
