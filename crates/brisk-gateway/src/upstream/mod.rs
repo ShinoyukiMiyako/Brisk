@@ -7,3 +7,4 @@ pub mod resolver;
 pub mod warmup;
 
 pub use client::{UpstreamClientConfig, UpstreamError, build_client};
+pub use registry::chat_url;
