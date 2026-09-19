@@ -475,6 +475,12 @@ fn http_builder(config: &ServerConfig) -> auto::Builder<TokioExecutor> {
         .http1()
         .timer(TokioTimer::new())
         .keep_alive(true)
+        // Explicit although it is hyper's default: only without half-close
+        // does hyper watch the read side for EOF while a request is handled
+        // and its response written (`mid_message_detect_eof`), which is how a
+        // client disconnect drops the upstream request in time. hyper skips
+        // that probe when the client pipelined more bytes after the request.
+        .half_close(false)
         .header_read_timeout(config.header_read_timeout);
     builder
         .http2()
