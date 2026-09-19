@@ -25,7 +25,9 @@ for name in "${forbidden[@]}"; do
     # crates that merely contain the name as a substring.
     if matches="$(grep -E "^${name}(-[a-z0-9_-]+)? v" <<<"$tree" | sort -u)"; then
         echo "check-deps: forbidden dependency '${name}' found in brisk-gateway:" >&2
-        echo "$matches" | sed 's/^/  /' >&2
+        while IFS= read -r line; do
+            echo "  $line" >&2
+        done <<<"$matches"
         status=1
     fi
 done
