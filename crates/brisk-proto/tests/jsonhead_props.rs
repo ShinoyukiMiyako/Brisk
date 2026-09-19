@@ -224,3 +224,35 @@ fn compact_bracketed_model_round_trips() {
     assert_eq!(head.model_name, common::TEST_MODEL);
     verify_head(&body).unwrap();
 }
+
+/// The fuzz seeds are meaningful starting points only if the oracle and
+/// `ChatHead` already agree on them.
+#[test]
+fn fuzz_seeds_agree_with_the_oracle() {
+    macro_rules! seed {
+        ($name:literal) => {
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/fuzz/seeds/head/",
+                $name
+            ))
+            .as_slice()
+        };
+    }
+    for body in [
+        seed!("basic.json"),
+        seed!("escaped.json"),
+        seed!("spaced.json"),
+        seed!("folded.json"),
+    ] {
+        verify_head(body).unwrap();
+    }
+    assert!(matches!(
+        ChatHead::parse(seed!("folded.json")),
+        Err(HeadError::AmbiguousKey("stream"))
+    ));
+    assert_eq!(
+        ChatHead::parse(seed!("escaped.json")).unwrap().model_name,
+        common::TEST_MODEL
+    );
+}

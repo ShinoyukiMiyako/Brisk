@@ -1,0 +1,4 @@
+# Clippy reads the nearest clippy.toml, which would otherwise be brisk-proto's:
+# its R1 list forbids std::fs::File::create, which libfuzzer-sys's
+# fuzz_target! macro expands to. The fuzz targets are test harnesses, not data
+# plane code, so they use clippy's defaults.

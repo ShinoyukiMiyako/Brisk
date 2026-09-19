@@ -473,10 +473,14 @@ pub(crate) fn verify_splice(
         return Err(format!("output parses to {got}\n  want {expected}"));
     }
 
-    let reparsed = ChatHead::parse(&output)
-        .map_err(|error| format!("ChatHead rejects the output: {error}"))?;
-    if inject && !reparsed.requests_usage() {
-        return Err("output does not request usage after injection".to_owned());
+    // An empty replacement model is the caller's error, not plan_chat's, and
+    // makes the output a request ChatHead rightly refuses.
+    if model != Some("") {
+        let reparsed = ChatHead::parse(&output)
+            .map_err(|error| format!("ChatHead rejects the output: {error}"))?;
+        if inject && !reparsed.requests_usage() {
+            return Err("output does not request usage after injection".to_owned());
+        }
     }
     Ok(())
 }
