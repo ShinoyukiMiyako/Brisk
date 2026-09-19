@@ -214,6 +214,27 @@ fn nesting_is_limited_to_128_levels() {
     assert_json(&nested(200));
 }
 
+/// `serde_json` allows 127 nested arrays and objects, the top-level object
+/// included. `stream_options` is captured without a depth limit and then
+/// parsed on its own, so the limit there is checked separately and must land
+/// on the same boundary.
+#[test]
+fn nesting_limit_is_exact_inside_stream_options() {
+    let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+    // Top-level object, then the member value: 1 + depth levels.
+    ok(&format!(r#"{{"model":"m","x":{}}}"#, nested(126)));
+    assert_json(&format!(r#"{{"model":"m","x":{}}}"#, nested(127)));
+    // Top-level object, `stream_options`, then the member value.
+    ok(&format!(
+        r#"{{"model":"m","stream_options":{{"x":{}}}}}"#,
+        nested(125)
+    ));
+    assert_json(&format!(
+        r#"{{"model":"m","stream_options":{{"x":{}}}}}"#,
+        nested(126)
+    ));
+}
+
 #[test]
 fn spans_are_exact_among_whitespace() {
     let body = "\r\n\t { \n \"stream\" :\ttrue , \"model\"\r\n:\n  \"grok-4.6(xhigh)\"  ,\
