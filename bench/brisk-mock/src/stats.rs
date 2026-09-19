@@ -21,6 +21,8 @@ use brisk_bench_core::stats::{encode_histogram, new_histogram};
 use hdrhistogram::Histogram;
 use serde::Serialize;
 
+use crate::emit::{EmitPolicy, EmitSettings};
+
 /// A monotonic counter that one shard increments and any shard may read or
 /// reset.
 #[derive(Debug, Default)]
@@ -244,13 +246,16 @@ impl ShardCounters {
 #[derive(Debug)]
 pub struct Stats {
     shards: Box<[ShardCounters]>,
+    emit: EmitSettings,
 }
 
 impl Stats {
-    /// Creates zeroed counters for `shards` shards.
-    pub fn new(shards: usize) -> Arc<Self> {
+    /// Creates zeroed counters for `shards` shards of a server with the
+    /// given emission settings.
+    pub fn new(shards: usize, emit: EmitSettings) -> Arc<Self> {
         Arc::new(Self {
             shards: (0..shards).map(|_| ShardCounters::default()).collect(),
+            emit,
         })
     }
 
@@ -286,6 +291,11 @@ impl Stats {
             chunks: sum(|s| &s.chunks),
             write_blocked: sum(|s| &s.write_blocked),
             read_lag: ReadLagSnapshot::new(&read_lag, sum(|s| &s.clock_steps)),
+            emit: EmitSnapshot {
+                policy: self.emit.policy,
+                spin_window_ns: self.emit.spin_window_ns(),
+                commit_window_ns: self.emit.commit_window_ns(),
+            },
             shards: self
                 .shards
                 .iter()
@@ -345,6 +355,8 @@ pub struct Snapshot {
     pub write_blocked: u64,
     /// Delay from the kernel receiving a request to the mock parsing it.
     pub read_lag: ReadLagSnapshot,
+    /// Emission policy every shard runs.
+    pub emit: EmitSnapshot,
     /// Per-shard breakdown, in shard order. `SO_REUSEPORT` spreads
     /// connections by a hash of their addresses, so with few long-lived
     /// connections the load of the shards can differ a lot.
@@ -391,6 +403,19 @@ impl ReadLagSnapshot {
             histogram: encode_histogram(hist),
         }
     }
+}
+
+/// Emission policy inside a [`Snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct EmitSnapshot {
+    /// The policy every shard runs.
+    pub policy: EmitPolicy,
+    /// Busy-wait window before each emission, in nanoseconds.
+    pub spin_window_ns: u64,
+    /// Commit window in effect, in nanoseconds: the spin window for
+    /// `full-spin`, the configured commit window capped at the spin window
+    /// for `fixed`.
+    pub commit_window_ns: u64,
 }
 
 /// Counters of one shard inside a [`Snapshot`].
@@ -441,11 +466,24 @@ pub struct ErrorSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    fn stats(shards: usize) -> Arc<Stats> {
+        Stats::new(
+            shards,
+            EmitSettings {
+                policy: EmitPolicy::Fixed,
+                spin_window: Duration::from_micros(50),
+                commit_window: Duration::from_micros(20),
+            },
+        )
+    }
 
     #[test]
     fn snapshot_sums_shards_and_reset_keeps_active_streams() {
-        let stats = Stats::new(2);
+        let stats = stats(2);
         stats.shard(0).accepted();
         stats.shard(1).accepted();
         stats.shard(0).request();
@@ -476,7 +514,7 @@ mod tests {
 
     #[test]
     fn snapshot_lists_shards_and_merges_read_lag() {
-        let stats = Stats::new(2);
+        let stats = stats(2);
         stats.shard(0).accepted();
         stats.shard(1).accepted();
         stats.shard(1).accepted();
@@ -530,11 +568,29 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_reports_the_emission_policy() {
+        let snap = stats(1).snapshot();
+        assert_eq!(
+            snap.emit,
+            EmitSnapshot {
+                policy: EmitPolicy::Fixed,
+                spin_window_ns: 50_000,
+                commit_window_ns: 20_000,
+            }
+        );
+        // The field names are what the benchmark scripts look for.
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["emit"]["policy"], "fixed");
+        assert_eq!(json["emit"]["spin_window_ns"], 50_000);
+        assert_eq!(json["emit"]["commit_window_ns"], 20_000);
+    }
+
+    #[test]
     fn reset_racing_with_increments_loses_nothing() {
         // The owner keeps counting while another thread resets; every
         // increment after the last reset must still be visible, and the
         // gauge must balance.
-        let stats = Stats::new(1);
+        let stats = stats(1);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for _ in 0..10_000 {

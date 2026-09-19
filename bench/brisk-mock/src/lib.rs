@@ -15,14 +15,21 @@
 //! through a `bench:v1;` directive in the first system message; requests
 //! without one use the server defaults.
 //!
+//! A shard serves sockets while it waits for its next emission; how close to
+//! the emission it keeps doing so is its emission policy ([`EmitPolicy`]).
+//! The default, [`EmitPolicy::Fixed`], keeps serving them until the emission
+//! is within a fixed commit window.
+//!
 //! Endpoints: `POST /v1/chat/completions`, `GET /v1/models`,
 //! `GET /__bench/stats` and `POST /__bench/reset`.
 
+mod emit;
 mod request;
 mod response;
 pub mod server;
 mod shard;
 pub mod stats;
 
+pub use emit::{DEFAULT_COMMIT_WINDOW, EmitPolicy, EmitSettings};
 pub use server::{MockConfig, ParamsError, ServerError, ServerHandle};
 pub use stats::Snapshot;

@@ -9,13 +9,13 @@
 //! between `t_sched` and `t_write` is only the spin exit.
 //!
 //! Inside the spin window the loop keeps polling sockets with a zero timeout
-//! and only commits to spinning for the last [`COMMIT_WINDOW`] before an
-//! entry. Spinning through the whole window instead would, at tens of
-//! thousands of chunks per second, chain one spin into the next and leave
-//! new requests unread for as long as the chain lasts; t0 is taken when a
-//! request is parsed, so that wait would reach the client's TTFT without
-//! appearing in any marker. The read lag that remains is exported by the
-//! stats endpoint.
+//! and commits to spinning only when the next entry is within the commit
+//! window of the emission policy (see [`crate::emit`]). Spinning through the
+//! whole window instead would, at tens of thousands of chunks per second,
+//! chain one spin into the next and leave new requests unread for as long
+//! as the chain lasts; t0 is taken when a request is parsed, so that wait
+//! would reach the client's TTFT without appearing in any marker. The read
+//! lag that remains is exported by the stats endpoint.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -31,6 +31,7 @@ use brisk_bench_core::wire::{self, BenchParams, Marker};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Poll, Token};
 
+use crate::emit::EmitSettings;
 use crate::request::{
     ChatRequest, Head, Inspector, MAX_BODY_BYTES, MAX_HEAD_BYTES, Method, Progress, RequestError,
     RequestReader, Route,
@@ -63,12 +64,6 @@ const MAX_BUFFERED_INPUT: usize = MAX_HEAD_BYTES + MAX_BODY_BYTES;
 const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 /// Readiness events fetched per poll.
 const EVENT_CAPACITY: usize = 1024;
-/// How close the next emission must be before the loop stops serving
-/// sockets and spins to it (capped at the spin window). It has to cover one
-/// pass of the loop, a zero-timeout poll plus the bookkeeping around it, or
-/// the emission would be overshot while polling; any longer only keeps
-/// requests waiting.
-const COMMIT_WINDOW: Duration = Duration::from_micros(5);
 /// How often the realtime-to-monotonic offset for kernel receive timestamps
 /// is re-estimated.
 const OFFSET_REFRESH_NS: u64 = 1_000_000_000;
@@ -82,6 +77,8 @@ pub(crate) struct Settings {
     pub(crate) model: String,
     /// TLS configuration; plaintext when `None`.
     pub(crate) tls: Option<Arc<rustls::ServerConfig>>,
+    /// Emission policy and windows.
+    pub(crate) emit: EmitSettings,
 }
 
 /// One planned emission. Ordered by `(t_sched, stream, seq)`; `slot` is
@@ -213,7 +210,7 @@ pub(crate) struct Shard {
     /// recursion.
     inspecting: bool,
     next_response_id: u64,
-    /// [`COMMIT_WINDOW`] capped at the spin window, in nanoseconds.
+    /// Commit window of the emission policy, in nanoseconds.
     commit_ns: u64,
     /// Converts kernel receive timestamps to the monotonic timeline.
     offset: RealtimeOffset,
@@ -233,12 +230,11 @@ impl Shard {
         index: usize,
         poll: Poll,
         mut listener: TcpListener,
-        spin_window: Duration,
         settings: Arc<Settings>,
         stats: Arc<Stats>,
         stop: Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        let timer = DeadlineTimer::new(spin_window)?;
+        let timer = DeadlineTimer::new(settings.emit.spin_window)?;
         timer.register(poll.registry(), TIMER)?;
         poll.registry()
             .register(&mut listener, LISTENER, mio::Interest::READABLE)?;
@@ -254,7 +250,7 @@ impl Shard {
             accept_retry_at: None,
             inspecting: false,
             next_response_id: 0,
-            commit_ns: u64::try_from(COMMIT_WINDOW.min(spin_window).as_nanos()).expect("fits u64"),
+            commit_ns: settings.emit.commit_window_ns(),
             offset: RealtimeOffset::new(),
             offset_refresh_at: now_ns().saturating_add(OFFSET_REFRESH_NS),
             out: Vec::with_capacity(64 * 1024),

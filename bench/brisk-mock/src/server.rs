@@ -12,6 +12,7 @@ use brisk_bench_core::precise::DEFAULT_SPIN_WINDOW;
 use brisk_bench_core::transport::{ListenOptions, bind_listener};
 use brisk_bench_core::wire::{BenchParams, WireError};
 
+use crate::emit::{DEFAULT_COMMIT_WINDOW, EmitPolicy, EmitSettings};
 use crate::shard::{Settings, Shard, WAKER};
 use crate::stats::Stats;
 
@@ -25,6 +26,12 @@ pub struct MockConfig {
     pub shards: usize,
     /// Busy-wait window before each emission.
     pub spin_window: Duration,
+    /// How close to an emission a shard keeps serving sockets.
+    pub emit_policy: EmitPolicy,
+    /// Commit window of the fixed policy: how close the next emission may
+    /// come before a shard stops serving sockets and spins to it. Capped at
+    /// the spin window.
+    pub commit_window: Duration,
     /// CPUs to pin shards to; shard `i` gets `cpus[i % cpus.len()]`.
     /// Unpinned when `None`.
     pub cpus: Option<Vec<usize>>,
@@ -40,12 +47,15 @@ pub struct MockConfig {
 }
 
 impl MockConfig {
-    /// A plaintext single-shard configuration with the given defaults.
+    /// A plaintext single-shard configuration with the given defaults and
+    /// the fixed emission policy.
     pub fn new(listen: SocketAddr, defaults: BenchParams) -> Self {
         Self {
             listen,
             shards: 1,
             spin_window: DEFAULT_SPIN_WINDOW,
+            emit_policy: EmitPolicy::default(),
+            commit_window: DEFAULT_COMMIT_WINDOW,
             cpus: None,
             tls: None,
             defaults,
@@ -206,6 +216,8 @@ impl ServerHandle {
             listen,
             shards,
             spin_window,
+            emit_policy,
+            commit_window,
             cpus,
             tls,
             defaults,
@@ -242,12 +254,18 @@ impl ServerHandle {
             listeners.push(bind(addr)?);
         }
 
+        let emit = EmitSettings {
+            policy: emit_policy,
+            spin_window,
+            commit_window,
+        };
         let settings = Arc::new(Settings {
             defaults,
             model,
             tls,
+            emit,
         });
-        let stats = Stats::new(shards);
+        let stats = Stats::new(shards, emit);
         let stop = Arc::new(AtomicBool::new(false));
         let (exit_tx, exited) = mpsc::channel();
         let mut handle = Self {
@@ -273,7 +291,6 @@ impl ServerHandle {
                 index,
                 poll,
                 listener,
-                spin_window,
                 Arc::clone(&settings),
                 Arc::clone(&stats),
                 Arc::clone(&stop),

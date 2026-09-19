@@ -8,8 +8,8 @@ use anyhow::Context as _;
 use brisk_bench_core::transport::{certs, tls};
 use brisk_bench_core::wire::BenchParams;
 use brisk_bench_core::{cpu, rlimit};
-use brisk_mock::{MockConfig, ServerHandle};
-use clap::{Args, Parser, Subcommand};
+use brisk_mock::{EmitPolicy, MockConfig, ServerHandle};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 /// Paced OpenAI-compatible SSE upstream with in-band timestamps.
@@ -45,6 +45,14 @@ struct ServeArgs {
     /// Busy-wait window before each emission, in microseconds.
     #[arg(long, default_value_t = 50)]
     spin_us: u64,
+    /// How close to an emission a shard keeps serving sockets.
+    #[arg(long, value_enum, default_value_t = PolicyArg::Fixed)]
+    emit_policy: PolicyArg,
+    /// Commit window of the fixed policy, in microseconds: how close the
+    /// next emission may come before a shard stops serving sockets and spins
+    /// to it. Capped at --spin-us.
+    #[arg(long, default_value_t = DEFAULT_COMMIT_US)]
+    commit_us: u64,
     /// CPUs to pin shards to (Linux list syntax, e.g. 2 or 2-3); shard i uses
     /// the (i mod n)-th CPU of the list. Pinning is supported on Linux only.
     #[arg(long, value_parser = parse_cpu_list)]
@@ -57,6 +65,27 @@ struct ServeArgs {
     backlog: i32,
     #[command(flatten)]
     defaults: DefaultParams,
+}
+
+/// Default of `--commit-us`, [`brisk_mock::DEFAULT_COMMIT_WINDOW`].
+const DEFAULT_COMMIT_US: u64 = 10;
+
+/// `--emit-policy` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PolicyArg {
+    /// Stop serving sockets once an emission is within the spin window.
+    FullSpin,
+    /// Serve sockets until an emission is within the commit window.
+    Fixed,
+}
+
+impl From<PolicyArg> for EmitPolicy {
+    fn from(arg: PolicyArg) -> Self {
+        match arg {
+            PolicyArg::FullSpin => Self::FullSpin,
+            PolicyArg::Fixed => Self::Fixed,
+        }
+    }
 }
 
 /// Parameters for requests that carry no bench:v1 directive.
@@ -141,6 +170,8 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         listen: args.listen,
         shards: usize::from(args.shards),
         spin_window: Duration::from_micros(args.spin_us),
+        emit_policy: args.emit_policy.into(),
+        commit_window: Duration::from_micros(args.commit_us),
         cpus: args.cpu_list.map(|CpuList(cpus)| cpus),
         tls,
         defaults: args.defaults.to_params(),
@@ -148,11 +179,15 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
         backlog: args.backlog,
     };
     let tls_enabled = config.tls.is_some();
+    let emit_policy = config.emit_policy;
     let handle = ServerHandle::start(config).context("starting the mock server")?;
     tracing::info!(
         addr = %handle.local_addr(),
         shards = args.shards,
         tls = tls_enabled,
+        %emit_policy,
+        spin_us = args.spin_us,
+        commit_us = args.commit_us,
         "brisk-mock listening"
     );
     handle.wait().context("mock server stopped")
@@ -191,6 +226,33 @@ mod tests {
         assert_eq!(args.cpu_list.unwrap().0, [2, 3]);
         assert_eq!(args.defaults.to_params().chunks, 3);
         assert_eq!(args.spin_us, 50);
+        assert_eq!(args.emit_policy, PolicyArg::Fixed);
+        assert_eq!(args.commit_us, 10);
+        assert_eq!(
+            Duration::from_micros(args.commit_us),
+            brisk_mock::DEFAULT_COMMIT_WINDOW
+        );
+    }
+
+    #[test]
+    fn emit_policy_and_commit_window_parse() {
+        let serve = ["brisk-mock", "serve", "--listen", "127.0.0.1:0"];
+        let with = |extra: &[&'static str]| Cli::try_parse_from(serve.iter().chain(extra));
+        for (name, policy) in [
+            ("full-spin", EmitPolicy::FullSpin),
+            ("fixed", EmitPolicy::Fixed),
+        ] {
+            let cli = with(&["--emit-policy", name, "--commit-us", "3"]).unwrap();
+            let Command::Serve(args) = cli.command else {
+                panic!("expected serve");
+            };
+            assert_eq!(EmitPolicy::from(args.emit_policy), policy);
+            assert_eq!(policy.as_str(), name);
+            assert_eq!(args.commit_us, 3);
+        }
+        assert!(with(&["--emit-policy", "spin"]).is_err());
+        assert!(with(&["--emit-policy", "adaptive"]).is_err());
+        assert!(with(&["--commit-us", "-1"]).is_err());
     }
 
     #[test]

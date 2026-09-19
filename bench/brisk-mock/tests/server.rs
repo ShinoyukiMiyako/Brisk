@@ -10,7 +10,7 @@ use brisk_bench_core::http1::{self, BodyFraming, ChunkedDecoder};
 use brisk_bench_core::transport::certs::CertBundle;
 use brisk_bench_core::transport::tls;
 use brisk_bench_core::wire::{self, BenchParams, BodyShape, MARKER_LEN, Marker};
-use brisk_mock::{MockConfig, ServerHandle, Snapshot};
+use brisk_mock::{EmitPolicy, MockConfig, ServerHandle, Snapshot};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -269,8 +269,8 @@ fn streams_plaintext_with_markers_and_usage() {
     server.shutdown().unwrap();
 }
 
-#[test]
-fn streams_over_tls() {
+/// A server and a client configuration that trusts it.
+fn tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
     let bundle = CertBundle::generate(&["localhost".to_owned(), "127.0.0.1".to_owned()]).unwrap();
     let server_config = tls::server_config_from_pem(
         bundle.server_cert_pem.as_bytes(),
@@ -278,6 +278,12 @@ fn streams_over_tls() {
     )
     .unwrap();
     let client_config = tls::client_config_from_pem(bundle.ca_cert_pem.as_bytes()).unwrap();
+    (server_config, client_config)
+}
+
+#[test]
+fn streams_over_tls() {
+    let (server_config, client_config) = tls_configs();
     let server = start(Some(server_config));
     let mut client = Client::tls(server.local_addr(), client_config);
 
@@ -673,4 +679,75 @@ fn several_shards_need_linux() {
         ServerHandle::start(config),
         Err(brisk_mock::ServerError::ShardsUnsupported(2))
     ));
+}
+
+#[test]
+fn every_emission_policy_streams_and_reports_itself() {
+    for (policy, commit_window_ns) in [(EmitPolicy::FullSpin, 50_000), (EmitPolicy::Fixed, 3_000)] {
+        let mut config = MockConfig::new("127.0.0.1:0".parse().unwrap(), defaults());
+        config.emit_policy = policy;
+        config.commit_window = Duration::from_micros(3);
+        let server = ServerHandle::start(config).unwrap();
+        let mut client = Client::plain(server.local_addr());
+        let params = stream_params(141);
+        let body = wire::chat_request_body("m", true, true, &params, BodyShape::Text { bytes: 64 });
+        check_stream(
+            &client.request("POST", "/v1/chat/completions", &body),
+            &params,
+            true,
+        );
+
+        let raw = client.request("GET", "/__bench/stats", b"").json();
+        assert_eq!(raw["emit"]["policy"], policy.as_str());
+        let stats: Snapshot = serde_json::from_value(raw).unwrap();
+        assert_eq!(stats.emit.policy, policy);
+        assert_eq!(stats.emit.spin_window_ns, 50_000);
+        assert_eq!(stats.emit.commit_window_ns, commit_window_ns, "{policy}");
+        server.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn tls_handshakes_complete_while_a_dense_stream_runs() {
+    let (server_config, client_config) = tls_configs();
+    let server = start(Some(server_config));
+    let addr = server.local_addr();
+    // An emission every 200 us for 0.6 s: the next one is always closer than
+    // a TLS key exchange takes, so every handshake overlaps the schedule.
+    let params = BenchParams {
+        ttft_us: 0,
+        interval_us: 200,
+        chunks: 3_000,
+        chunk_bytes: 90,
+        sid: 151,
+        resp_bytes: 0,
+    };
+    let mut observer = Client::tls(addr, Arc::clone(&client_config));
+    std::thread::scope(|scope| {
+        let stream = scope.spawn(|| {
+            let mut client = Client::tls(addr, Arc::clone(&client_config));
+            let body =
+                wire::chat_request_body("m", true, false, &params, BodyShape::Text { bytes: 8 });
+            let response = client.request("POST", "/v1/chat/completions", &body);
+            check_stream(&response, &params, false);
+        });
+        let deadline = Instant::now() + IO_TIMEOUT;
+        while observer.stats().active_streams == 0 {
+            assert!(Instant::now() < deadline, "the stream never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..4 {
+            let mut client = Client::tls(addr, Arc::clone(&client_config));
+            let response = client.request("GET", "/v1/models", b"");
+            assert_eq!(response.json()["object"], "list");
+        }
+        let during = observer.stats();
+        assert_eq!(during.active_streams, 1, "the stream ended too early");
+        stream.join().unwrap();
+    });
+    let stats = observer.stats();
+    assert_eq!(stats.emit.policy, EmitPolicy::Fixed);
+    assert_eq!(stats.chunks, u64::from(params.chunks));
+    assert_eq!(stats.errors.tls, 0);
+    server.shutdown().unwrap();
 }
