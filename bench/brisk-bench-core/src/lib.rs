@@ -15,7 +15,8 @@
 //! - [`dist`]: truncated log-normal stream lifetimes and Poisson arrivals;
 //! - [`stats`]: per-interval HDR histograms and block-bootstrap comparison;
 //! - [`result`] and [`fingerprint`]: the JSON result document;
-//! - [`cpu`]: CPU lists and thread pinning.
+//! - [`cpu`]: CPU lists and thread pinning;
+//! - [`rlimit`]: raising the open-file limit.
 //!
 //! Precise timing and kernel timestamps exist only on Linux. Other platforms
 //! compile and behave correctly for functional tests, without precision
@@ -28,6 +29,7 @@ pub mod fingerprint;
 pub mod http1;
 pub mod precise;
 pub mod result;
+pub mod rlimit;
 pub mod stats;
 pub mod transport;
 pub mod wire;

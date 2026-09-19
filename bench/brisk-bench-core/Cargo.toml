@@ -25,6 +25,9 @@ serde_json = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["std", "process"] }
+
 [dev-dependencies]
 proptest = { workspace = true }
 
