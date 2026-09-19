@@ -1,10 +1,12 @@
 //! Response bodies of the data plane: the streamed pass-through that frames
 //! SSE events and extracts usage without copying chunks, the tap that parses
 //! usage from non-streaming responses, and the settlement that runs when a
-//! committed response ends, fails or is dropped (R6, R7, R9, R14, R15).
+//! committed response ends, fails or is dropped (R6, R7, R9, R14, R15). Also
+//! the rewritten upstream request body.
 
 mod idle;
 mod settle;
+mod splice;
 
 use std::pin::Pin;
 use std::time::Duration;
@@ -12,6 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 pub use settle::{DrainLimits, SettleCtx, SettleShared};
+pub use splice::SpliceBody;
 
 /// Timing handed from `forward` to the committed body.
 #[derive(Debug)]
