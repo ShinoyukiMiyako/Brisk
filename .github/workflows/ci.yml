@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+
+# A newer push to the same branch or PR supersedes the running pipeline.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are never reused across CI runs and only bloat the cache.
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: short
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: lint (fmt, clippy, deps)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # No arguments: rustup installs the channel and components pinned in rust-toolchain.toml.
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Dependency rules (R1)
+        run: bash scripts/check-deps.sh
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is arm64 (aarch64-apple-darwin).
+        # Windows needs no NASM: .cargo/config.toml sets AWS_LC_SYS_PREBUILT_NASM=1.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustc --version && cargo --version
+
+      # The nextest version is tied to this pinned install-action release; fallback
+      # to cargo-binstall is disabled so only checksummed prebuilt binaries are used.
+      - uses: taiki-e/install-action@4076c08d76dba979c11a7285295b0716c1d67908 # v2.87.15
+        with:
+          tool: nextest
+          fallback: none
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: nextest
+        run: cargo nextest run --workspace --locked
+
+      # nextest does not run doctests.
+      - name: doctests
+        run: cargo test --doc --workspace --locked
+
+  build-macos-x86_64:
+    name: build-check (x86_64-apple-darwin, cross)
+    # x86_64 macOS is cross-compiled on the arm64 runner and only build-checked.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain and x86_64-apple-darwin target
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-apple-darwin
+          rustc --version
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-apple-darwin
+
+      - name: cargo build
+        run: cargo build --workspace --locked --target x86_64-apple-darwin
