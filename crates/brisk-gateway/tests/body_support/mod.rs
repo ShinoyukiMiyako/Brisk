@@ -468,3 +468,119 @@ pub(crate) const fn tokens(input: u64, output: u64) -> UsageTokens {
         reasoning_output: None,
     }
 }
+
+/// A content chunk in the CPA shape of `chat-stream-grok46-xhigh`.
+pub(crate) const CPA_CONTENT_EVENT: &[u8] = b"data: {\"id\":\"00000000-0000-0000-0000-000000000001\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"grok-4.6-build\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"pong\"},\"finish_reason\":null,\"native_finish_reason\":null}],\"service_tier\":\"default\"}\n\n";
+
+/// The final chunk of `chat-stream-grok46-xhigh`: `finish_reason` and usage.
+pub(crate) fn cpa_final_event() -> &'static [u8] {
+    let events = without_done(GROK46_XHIGH);
+    let start = events[..events.len() - 2]
+        .windows(2)
+        .rposition(|pair| pair == b"\n\n")
+        .expect("several events")
+        + 2;
+    &events[start..]
+}
+
+/// Allocations counted by [`drive_counting`].
+#[derive(Debug)]
+pub(crate) struct DriveReport {
+    /// Allocations of the polls made while `i` upstream data frames had been
+    /// returned, at index `i`: work on frame `i - 1` and on its output.
+    pub(crate) per_frame: Vec<u64>,
+    /// Advances of the paused clock by more than one idle period while the
+    /// upstream was pending and data frames were still to come.
+    pub(crate) advances_mid_stream: usize,
+    /// The error that ended the stream.
+    pub(crate) error: String,
+}
+
+impl DriveReport {
+    /// Allocations while the frames in `range` (by count returned) were
+    /// being processed.
+    pub(crate) fn sum(&self, range: std::ops::RangeInclusive<usize>) -> u64 {
+        self.per_frame[range].iter().sum()
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.per_frame.iter().sum()
+    }
+}
+
+/// Drives a body the way the allocation gates of section 4.7 prescribe and
+/// counts heap blocks allocated inside each `poll_frame` call, and nothing
+/// else. The upstream must return `Pending` before each of its `frames`
+/// data frames, count them in `progress`, and hang after the last one.
+///
+/// Runs inside `runtime.enter()` with a no-op waker. While frames remain,
+/// the paused clock is advanced by just over one idle period at each count
+/// in `advance_at` (the upstream is pending then), so period expiry and
+/// timer reset happen inside the counted polls; after the last frame it
+/// advances one period at a time until the idle timeout ends the stream.
+///
+/// # Panics
+///
+/// When a dhat profiler in testing mode is not running, or the stream ends
+/// without the idle timeout.
+pub(crate) fn drive_counting<B>(
+    runtime: &tokio::runtime::Runtime,
+    body: &mut B,
+    progress: &AtomicUsize,
+    frames: usize,
+    idle: Duration,
+    advance_at: &[usize],
+) -> DriveReport
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let _entered = runtime.enter();
+    let period = idle / 4;
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let mut per_frame = vec![0u64; frames + 1];
+    let mut next_advance = advance_at.iter().copied().peekable();
+    let mut advances_mid_stream = 0;
+    let mut silent_periods = 0;
+    loop {
+        let before = dhat::HeapStats::get().total_blocks;
+        let polled = Pin::new(&mut *body).poll_frame(&mut cx);
+        let allocated = dhat::HeapStats::get().total_blocks - before;
+        let returned = progress.load(Ordering::Relaxed);
+        per_frame[returned] += allocated;
+        match polled {
+            Poll::Ready(Some(Ok(_))) => {}
+            Poll::Ready(Some(Err(error))) => {
+                return DriveReport {
+                    per_frame,
+                    advances_mid_stream,
+                    error: error.to_string(),
+                };
+            }
+            Poll::Ready(None) => panic!("the upstream hangs, so only the idle timeout ends it"),
+            Poll::Pending if returned == frames => {
+                silent_periods += 1;
+                assert!(
+                    silent_periods <= 6,
+                    "no idle timeout after {silent_periods} periods"
+                );
+                runtime.block_on(tokio::time::advance(period));
+            }
+            Poll::Pending => {
+                if next_advance.next_if_eq(&returned).is_some() {
+                    advances_mid_stream += 1;
+                    runtime.block_on(tokio::time::advance(period + Duration::from_millis(1)));
+                }
+            }
+        }
+    }
+}
+
+/// A current-thread runtime on a paused clock, as the gates require.
+pub(crate) fn paused_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .expect("a runtime")
+}
