@@ -576,6 +576,80 @@ pub(crate) fn frames_of(bytes: &[u8], split: Split) -> Vec<Bytes> {
     }
 }
 
+/// A reply replaying a recorded response: status and headers from a
+/// `.headers` fixture (parsed with httparse, which accepts both CRLF and LF;
+/// `Transfer-Encoding`, `Content-Length` and `Date` are dropped because the
+/// scripted server writes its own framing), body from the matching fixture.
+/// By status and content-type: SSE becomes `Reply::Sse` with zero delays and
+/// frames cut by `split`, other 2xx `Reply::Json`, non-2xx `Reply::Status`;
+/// `split` only applies to SSE.
+///
+/// # Panics
+///
+/// If `headers` is not a complete response head, a header value is not
+/// UTF-8, or the status is a 2xx other than 200 (`Reply::Json` and
+/// `Reply::Sse` always answer 200, so replaying it would change the status).
+pub(crate) fn fixture_reply(headers: &[u8], body: &[u8], split: Split) -> Reply {
+    let mut storage = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut response = httparse::Response::new(&mut storage);
+    let status = response
+        .parse(headers)
+        .expect("fixture response head must parse");
+    assert!(status.is_complete(), "fixture response head is incomplete");
+    let code = response.code.expect("complete head has a status code");
+
+    let mut is_sse = false;
+    let mut replayed = Vec::with_capacity(response.headers.len());
+    for header in response.headers.iter() {
+        let name = header.name;
+        if ["transfer-encoding", "content-length", "date"]
+            .iter()
+            .any(|dropped| name.eq_ignore_ascii_case(dropped))
+        {
+            continue;
+        }
+        let value = std::str::from_utf8(header.value)
+            .unwrap_or_else(|_| panic!("fixture header {name} is not UTF-8"));
+        if name.eq_ignore_ascii_case("content-type") {
+            is_sse = value
+                .trim_start()
+                .get(.."text/event-stream".len())
+                .is_some_and(|media| media.eq_ignore_ascii_case("text/event-stream"));
+        }
+        // `Reply` names are `&'static str` so that hand-written scripts stay
+        // literal; a fixture's handful of names leaked once per call is
+        // negligible in a test process.
+        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+        replayed.push((name, value.to_owned()));
+    }
+
+    if !(200..300).contains(&code) {
+        return Reply::Status {
+            status: code,
+            headers: replayed,
+            body: Bytes::copy_from_slice(body),
+        };
+    }
+    assert_eq!(code, 200, "fixture 2xx status {code} cannot be replayed");
+    if is_sse {
+        Reply::Sse {
+            head_delay: Duration::ZERO,
+            headers: replayed,
+            frames: frames_of(body, split)
+                .into_iter()
+                .map(|frame| (Duration::ZERO, frame))
+                .collect(),
+            end: SseEnd::Finish,
+        }
+    } else {
+        Reply::Json {
+            head_delay: Duration::ZERO,
+            headers: replayed,
+            body: Bytes::copy_from_slice(body),
+        }
+    }
+}
+
 /// Offsets just past each blank line that ends a non-empty event. Line ends
 /// are `\r\n`, `\n` or `\r`, as in the SSE specification.
 fn event_ends(bytes: &[u8]) -> Vec<usize> {

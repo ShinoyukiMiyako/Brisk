@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::{Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
-use scripted::{Reply, ScriptConfig, ScriptedUpstream, Split, SseEnd, frames_of};
+use scripted::{Reply, ScriptConfig, ScriptedUpstream, Split, SseEnd, fixture_reply, frames_of};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redirect_is_returned_not_followed() {
@@ -433,4 +433,181 @@ async fn scripted_idle_close_and_hang() {
         .expect("the hung connection was closed by the client");
     // The first connection was closed by the upstream, not by the peer.
     assert_eq!(upstream.closed_at(0), None);
+}
+
+macro_rules! fixture {
+    ($name:literal) => {
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/cpa/",
+            $name
+        ))
+        .as_slice()
+    };
+}
+
+const STREAM_HEAD: &[u8] = fixture!("chat-stream-grok46-xhigh.headers");
+const STREAM_BODY: &[u8] = fixture!("chat-stream-grok46-xhigh.sse");
+const JSON_HEAD: &[u8] = fixture!("chat-nonstream-grok46-xhigh.headers");
+const JSON_BODY: &[u8] = fixture!("chat-nonstream-grok46-xhigh.json");
+const BAD_KEY_HEAD: &[u8] = fixture!("error-bad-key.headers");
+const BAD_KEY_BODY: &[u8] = fixture!("error-bad-key.json");
+const BOGUS_EFFORT_HEAD: &[u8] = fixture!("error-bogus-effort.headers");
+const BOGUS_EFFORT_BODY: &[u8] = fixture!("error-bogus-effort.json");
+
+fn header<'a>(headers: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// The scripted server writes its own framing and date, so none of these
+/// may survive from a recorded head.
+fn assert_no_framing(headers: &[(&'static str, String)]) {
+    for name in ["transfer-encoding", "content-length", "date"] {
+        assert_eq!(header(headers, name), None, "{name} was replayed");
+    }
+}
+
+#[test]
+fn fixture_reply_classifies_by_status_and_content_type() {
+    let split = Split::Random {
+        seed: 7,
+        min_piece: 1,
+        max_piece: 64,
+    };
+    match fixture_reply(STREAM_HEAD, STREAM_BODY, split) {
+        Reply::Sse {
+            head_delay,
+            headers,
+            frames,
+            end,
+        } => {
+            assert_eq!(head_delay, Duration::ZERO);
+            assert_eq!(end, SseEnd::Finish);
+            assert!(frames.iter().all(|(delay, _)| delay.is_zero()));
+            let frames: Vec<Bytes> = frames.into_iter().map(|(_, f)| f).collect();
+            assert_eq!(frames, frames_of(STREAM_BODY, split));
+            assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+            assert_eq!(
+                header(&headers, "x-cpa-trace-id"),
+                Some("20260919011838-0000000000000000-00000000")
+            );
+            assert_eq!(header(&headers, "connection"), Some("keep-alive"));
+            assert_no_framing(&headers);
+        }
+        other => panic!("stream fixture became {other:?}"),
+    }
+
+    match fixture_reply(JSON_HEAD, JSON_BODY, Split::Whole) {
+        Reply::Json {
+            head_delay,
+            headers,
+            body,
+        } => {
+            assert_eq!(head_delay, Duration::ZERO);
+            assert_eq!(body, JSON_BODY);
+            assert_eq!(header(&headers, "content-type"), Some("application/json"));
+            assert_no_framing(&headers);
+        }
+        other => panic!("non-streaming fixture became {other:?}"),
+    }
+
+    for (head, body, code, content_type) in [
+        (
+            BAD_KEY_HEAD,
+            BAD_KEY_BODY,
+            401,
+            "application/json; charset=utf-8",
+        ),
+        (
+            BOGUS_EFFORT_HEAD,
+            BOGUS_EFFORT_BODY,
+            400,
+            "application/json",
+        ),
+    ] {
+        match fixture_reply(head, body, Split::PerEvent) {
+            Reply::Status {
+                status,
+                headers,
+                body: replayed,
+            } => {
+                assert_eq!(status, code);
+                assert_eq!(replayed, body);
+                assert_eq!(header(&headers, "content-type"), Some(content_type));
+                assert_no_framing(&headers);
+            }
+            other => panic!("error fixture became {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn fixture_reply_accepts_lf_only_heads() {
+    let lf: Vec<u8> = STREAM_HEAD
+        .iter()
+        .copied()
+        .filter(|&b| b != b'\r')
+        .collect();
+    let (Reply::Sse { headers: crlf, .. }, Reply::Sse { headers: bare, .. }) = (
+        fixture_reply(STREAM_HEAD, STREAM_BODY, Split::Whole),
+        fixture_reply(&lf, STREAM_BODY, Split::Whole),
+    ) else {
+        panic!("both heads describe a stream");
+    };
+    assert_eq!(crlf, bare);
+}
+
+#[test]
+#[should_panic(expected = "fixture 2xx status 201 cannot be replayed")]
+fn fixture_reply_refuses_a_non_200_success() {
+    fixture_reply(
+        b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n",
+        b"{}",
+        Split::Whole,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixture_replies_arrive_byte_for_byte() {
+    let upstream = ScriptedUpstream::start(|index, _| match index {
+        0 => fixture_reply(
+            STREAM_HEAD,
+            STREAM_BODY,
+            Split::Random {
+                seed: 3,
+                min_piece: 1,
+                max_piece: 97,
+            },
+        ),
+        1 => fixture_reply(JSON_HEAD, JSON_BODY, Split::Whole),
+        2 => fixture_reply(BAD_KEY_HEAD, BAD_KEY_BODY, Split::Whole),
+        _ => fixture_reply(BOGUS_EFFORT_HEAD, BOGUS_EFFORT_BODY, Split::Whole),
+    })
+    .await;
+    let client = build_client(&loopback_profile()).unwrap();
+    let url = format!("{}/chat/completions", upstream.base_url());
+    let expected: [(u16, &str, &[u8]); 4] = [
+        (200, "text/event-stream", STREAM_BODY),
+        (200, "application/json", JSON_BODY),
+        (401, "application/json; charset=utf-8", BAD_KEY_BODY),
+        (400, "application/json", BOGUS_EFFORT_BODY),
+    ];
+    for (status, content_type, body) in expected {
+        let resp = client
+            .post(&url)
+            .body(r#"{"model":"grok-4.6(xhigh)"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), status);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], content_type);
+        // The recorded `Date` is dropped and the scripted server adds none.
+        assert!(resp.headers().get(header::DATE).is_none());
+        assert_eq!(resp.bytes().await.unwrap(), body);
+    }
+    assert_eq!(upstream.requests().len(), 4);
+    assert_eq!(upstream.accepts(), 1);
 }
