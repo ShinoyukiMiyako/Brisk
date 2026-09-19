@@ -284,6 +284,7 @@ dependencies = [
  "anyhow",
  "brisk-bench-core",
  "clap",
+ "hdrhistogram",
  "httparse",
  "memchr",
  "mio",

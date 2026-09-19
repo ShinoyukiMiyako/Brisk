@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 brisk-bench-core = { workspace = true }
 clap = { workspace = true }
+hdrhistogram = { workspace = true }
 httparse = { workspace = true }
 memchr = { workspace = true }
 mio = { workspace = true, features = ["os-poll", "os-ext", "net"] }

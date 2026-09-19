@@ -3,10 +3,19 @@
 //!
 //! The loop follows the shape prescribed by
 //! [`brisk_bench_core::precise`]: arm the deadline timer for the earliest
-//! schedule entry, poll, handle socket events, and fire every entry that has
-//! come within the spin window. Firing an entry builds the event bytes first,
-//! then spins to the planned time, patches `t_write` and issues exactly one
-//! write, so the gap between `t_sched` and `t_write` is only the spin exit.
+//! schedule entry, poll, handle socket events, and fire every entry that is
+//! due. Firing an entry builds the event bytes first, then spins to the
+//! planned time, patches `t_write` and issues exactly one write, so the gap
+//! between `t_sched` and `t_write` is only the spin exit.
+//!
+//! Inside the spin window the loop keeps polling sockets with a zero timeout
+//! and only commits to spinning for the last [`COMMIT_WINDOW`] before an
+//! entry. Spinning through the whole window instead would, at tens of
+//! thousands of chunks per second, chain one spin into the next and leave
+//! new requests unread for as long as the chain lasts; t0 is taken when a
+//! request is parsed, so that wait would reach the client's TTFT without
+//! appearing in any marker. The read lag that remains is exported by the
+//! stats endpoint.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -15,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use brisk_bench_core::clock::{now_ns, realtime_ns};
+use brisk_bench_core::clock::{RealtimeOffset, now_ns, realtime_ns};
 use brisk_bench_core::precise::DeadlineTimer;
 use brisk_bench_core::transport::Conn;
 use brisk_bench_core::wire::{self, BenchParams, Marker};
@@ -54,6 +63,15 @@ const MAX_BUFFERED_INPUT: usize = MAX_HEAD_BYTES + MAX_BODY_BYTES;
 const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 /// Readiness events fetched per poll.
 const EVENT_CAPACITY: usize = 1024;
+/// How close the next emission must be before the loop stops serving
+/// sockets and spins to it (capped at the spin window). It has to cover one
+/// pass of the loop, a zero-timeout poll plus the bookkeeping around it, or
+/// the emission would be overshot while polling; any longer only keeps
+/// requests waiting.
+const COMMIT_WINDOW: Duration = Duration::from_micros(5);
+/// How often the realtime-to-monotonic offset for kernel receive timestamps
+/// is re-estimated.
+const OFFSET_REFRESH_NS: u64 = 1_000_000_000;
 
 /// Settings shared by every shard of a server.
 #[derive(Debug)]
@@ -128,6 +146,31 @@ struct Connection {
     closing: bool,
     /// The peer closed its sending side.
     eof: bool,
+    /// Kernel receive time (`CLOCK_REALTIME`) of the latest input not yet
+    /// accounted to a request; taken by the request it completes.
+    rx_at: Option<u64>,
+}
+
+/// Whether `deadline` is at most `window_ns` after `now` (or already past).
+fn within(now: u64, deadline: u64, window_ns: u64) -> bool {
+    deadline.saturating_sub(now) <= window_ns
+}
+
+/// Whether the earliest entry of `schedule` is within the spin window of
+/// `timer`.
+fn imminent(schedule: &BinaryHeap<Reverse<Entry>>, timer: &DeadlineTimer) -> bool {
+    schedule
+        .peek()
+        .is_some_and(|Reverse(top)| timer.is_due(now_ns(), top.t_sched))
+}
+
+/// Queues `slot` for another read unless it already is. A slot can be
+/// deferred for many passes while readiness events for it keep arriving, so
+/// pushing blindly would grow the queue.
+fn queue_read(queue: &mut Vec<usize>, slot: usize) {
+    if !queue.contains(&slot) {
+        queue.push(slot);
+    }
 }
 
 /// Writes `data` as one write call and counts it when the socket could not
@@ -170,6 +213,12 @@ pub(crate) struct Shard {
     /// recursion.
     inspecting: bool,
     next_response_id: u64,
+    /// [`COMMIT_WINDOW`] capped at the spin window, in nanoseconds.
+    commit_ns: u64,
+    /// Converts kernel receive timestamps to the monotonic timeline.
+    offset: RealtimeOffset,
+    /// When `offset` is next re-estimated.
+    offset_refresh_at: u64,
     /// Scratch buffer for building every write.
     out: Vec<u8>,
     settings: Arc<Settings>,
@@ -205,6 +254,9 @@ impl Shard {
             accept_retry_at: None,
             inspecting: false,
             next_response_id: 0,
+            commit_ns: u64::try_from(COMMIT_WINDOW.min(spin_window).as_nanos()).expect("fits u64"),
+            offset: RealtimeOffset::new(),
+            offset_refresh_at: now_ns().saturating_add(OFFSET_REFRESH_NS),
             out: Vec::with_capacity(64 * 1024),
             settings,
             stats,
@@ -222,11 +274,17 @@ impl Shard {
         let mut again = Vec::new();
         while !self.stop.load(Ordering::Acquire) {
             let next = self.schedule.peek().map(|Reverse(e)| e.t_sched);
+            let now = now_ns();
+            let imminent = next.is_some_and(|deadline| self.timer.is_due(now, deadline));
             match next {
+                // The poll below does not block inside the spin window, so a
+                // timer armed now would only expire at once and cost two
+                // more syscalls on every pass.
+                Some(_) if imminent => {}
                 Some(deadline) => self.timer.arm(deadline)?,
                 None => self.timer.disarm()?,
             }
-            let now = now_ns();
+            self.refresh_offset(now, imminent);
             let mut timeout = if self.read_again.is_empty() {
                 self.timer.poll_timeout(now, next)
             } else {
@@ -264,12 +322,34 @@ impl Shard {
             }
             std::mem::swap(&mut again, &mut self.read_again);
             for slot in again.drain(..) {
+                // These connections are mid-upload; their next receive waits
+                // until no emission is within the spin window, as the
+                // receives after the first of an event do.
+                if self.emission_imminent() {
+                    queue_read(&mut self.read_again, slot);
+                    continue;
+                }
                 self.on_readable(slot);
                 self.fire_due();
             }
             self.fire_due();
         }
         Ok(())
+    }
+
+    /// Re-estimates the clock offset once per period. An estimate takes a few
+    /// microseconds of clock reads, so it waits for a moment with no emission
+    /// imminent unless it is a whole period overdue.
+    fn refresh_offset(&mut self, now: u64, imminent: bool) {
+        if now < self.offset_refresh_at
+            || (imminent && now < self.offset_refresh_at.saturating_add(OFFSET_REFRESH_NS))
+        {
+            return;
+        }
+        if self.offset.refresh() {
+            self.counters().clock_step();
+        }
+        self.offset_refresh_at = now.saturating_add(OFFSET_REFRESH_NS);
     }
 
     /// Accepts until the backlog is empty, firing due emissions after every
@@ -312,6 +392,7 @@ impl Shard {
             Some(config) => Conn::accept_tls(stream, Arc::clone(config))?,
             None => Conn::accept_plain(stream)?,
         };
+        io.enable_rx_timestamps()?;
         let mut conn = Connection {
             io,
             rx: Vec::new(),
@@ -319,6 +400,7 @@ impl Shard {
             response: None,
             closing: false,
             eof: false,
+            rx_at: None,
         };
         let slot = self.free.pop().unwrap_or(self.conns.len());
         conn.io
@@ -420,14 +502,24 @@ impl Shard {
                         overflow = true;
                         break;
                     }
+                    if batch.plaintext_bytes > 0 {
+                        // A pipelined request completed by this input waits
+                        // for the response ahead of it, not for the shard,
+                        // so it is not given a receive time.
+                        conn.rx_at = if conn.response.is_none() {
+                            batch.kernel_rx_ns
+                        } else {
+                            None
+                        };
+                    }
                     receives -= 1;
                     bytes = bytes.saturating_sub(batch.plaintext_bytes);
-                    let due = self
-                        .schedule
-                        .peek()
-                        .is_some_and(|Reverse(top)| self.timer.is_due(now_ns(), top.t_sched));
+                    // A receive cannot be interrupted and a large one takes
+                    // tens of microseconds, so a bulk upload stops for the
+                    // whole spin window rather than the commit window.
+                    let due = imminent(&self.schedule, &self.timer);
                     if receives == 0 || bytes == 0 || due {
-                        self.read_again.push(slot);
+                        queue_read(&mut self.read_again, slot);
                         break;
                     }
                 }
@@ -476,7 +568,10 @@ impl Shard {
                 }
                 // t0 is when the request became complete, before any of the
                 // work of answering it.
-                Ok(Progress::Request(head)) => self.dispatch(slot, head, now_ns()),
+                Ok(Progress::Request(head)) => {
+                    let rx_at = conn.rx_at.take();
+                    self.dispatch(slot, head, now_ns(), rx_at);
+                }
                 Err(err) => {
                     self.reject(slot, &err);
                     return;
@@ -549,12 +644,17 @@ impl Shard {
         }
     }
 
-    /// Answers a complete request that arrived at `t0`.
-    fn dispatch(&mut self, slot: usize, head: Head, t0: u64) {
+    /// Answers a complete request that was parsed at `t0` and whose last
+    /// input the kernel received at `rx_at` (`CLOCK_REALTIME`), if known.
+    fn dispatch(&mut self, slot: usize, head: Head, t0: u64, rx_at: Option<u64>) {
         let keep_alive = head.keep_alive;
         let bench_endpoint = matches!(head.route, Route::Stats | Route::Reset);
         if !bench_endpoint {
-            self.counters().request();
+            let counters = self.stats.shard(self.index);
+            counters.request();
+            if let Some(rx_at) = rx_at {
+                counters.read_lag(t0.saturating_sub(self.offset.to_mono(rx_at)));
+            }
         }
         let chat = if (head.route, head.method) == (Route::ChatCompletions, Method::Post) {
             let Some(chat) = self.inspect_body(slot) else {
@@ -634,8 +734,11 @@ impl Shard {
             if let Some(result) = inspector.step(conn.reader.body(&conn.rx)) {
                 break result;
             }
+            // The next window may take longer than the commit window, and
+            // the loop cannot poll in between, so everything within the
+            // spin window goes now.
             if !nested {
-                self.fire_due();
+                self.fire_within(self.timer.spin_window_ns());
             }
         };
         self.inspecting = nested;
@@ -700,10 +803,21 @@ impl Shard {
         }));
     }
 
-    /// Fires every schedule entry whose time is within the spin window.
+    /// Whether the next emission is within the spin window.
+    fn emission_imminent(&self) -> bool {
+        imminent(&self.schedule, &self.timer)
+    }
+
+    /// Fires every schedule entry within the commit window, leaving the rest
+    /// of the spin window to socket polling.
     fn fire_due(&mut self) {
+        self.fire_within(self.commit_ns);
+    }
+
+    /// Fires every schedule entry due within `window_ns`.
+    fn fire_within(&mut self, window_ns: u64) {
         while let Some(Reverse(top)) = self.schedule.peek() {
-            if !self.timer.is_due(now_ns(), top.t_sched) {
+            if !within(now_ns(), top.t_sched, window_ns) {
                 return;
             }
             let Some(Reverse(entry)) = self.schedule.pop() else {
@@ -856,6 +970,13 @@ mod tests {
             std::iter::from_fn(|| heap.pop().map(|Reverse(e)| (e.t_sched, e.stream, e.seq)))
                 .collect();
         assert_eq!(order, [(10, 1, 9), (10, 2, 4), (10, 2, 5), (20, 1, 0)]);
+    }
+
+    #[test]
+    fn within_counts_past_and_near_deadlines_only() {
+        assert!(within(1_000, 900, 0));
+        assert!(within(1_000, 6_000, 5_000));
+        assert!(!within(1_000, 6_001, 5_000));
     }
 
     #[test]

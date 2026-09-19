@@ -427,11 +427,25 @@ fn stats_count_requests_and_reset() {
     assert_eq!(stats.errors.not_found, 1);
     assert_eq!(stats.errors.method_not_allowed, 1);
     assert_eq!(stats.errors.bad_directive, 1);
+    assert_eq!(stats.shards.len(), 1);
+    assert_eq!(stats.shards[0].requests, 5);
+    assert_eq!(stats.shards[0].chunks, u64::from(params.chunks));
+    // Kernel receive timestamps exist on Linux only; there every API request
+    // arrived on a timestamped receive and is sampled, bench requests not.
+    let expected_samples = if cfg!(target_os = "linux") { 5 } else { 0 };
+    assert_eq!(stats.read_lag.samples, expected_samples);
+    assert_eq!(stats.shards[0].read_lag_samples, expected_samples);
+    assert!(
+        stats.read_lag.max_ns < 1_000_000_000,
+        "{:?}",
+        stats.read_lag
+    );
 
     assert_eq!(client.request("POST", "/__bench/reset", b"").status, 204);
     let stats = client.stats();
     assert_eq!(stats.requests, 0);
     assert_eq!(stats.chunks, 0);
+    assert_eq!(stats.read_lag.samples, 0);
     server.shutdown().unwrap();
 }
 
@@ -643,6 +657,10 @@ fn sharded_pinned_server_serves_every_connection() {
     let stats = Client::plain(server.local_addr()).stats();
     assert_eq!(stats.requests, 8);
     assert_eq!(stats.streams_started, 8);
+    assert_eq!(stats.shards.len(), 2);
+    assert_eq!(stats.shards.iter().map(|s| s.requests).sum::<u64>(), 8);
+    assert_eq!(stats.shards.iter().map(|s| s.accepts).sum::<u64>(), 9);
+    assert_eq!(stats.read_lag.samples, 8);
     server.shutdown().unwrap();
 }
 
