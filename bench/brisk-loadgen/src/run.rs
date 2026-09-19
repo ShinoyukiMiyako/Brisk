@@ -616,6 +616,7 @@ fn run_streams(
         counters: &outcome.counters,
         diagnostics: &extension.diagnostics,
         markers_expected: true,
+        mock_lag_limit_ns: common.mock_write_lag_limit_ns(),
     });
     extension.stream_plan = Some(plan);
     extension.load_check = Some(load);
@@ -685,6 +686,7 @@ pub(crate) fn selfcheck(cmd: &SelfcheckCmd) -> anyhow::Result<()> {
         load,
         diagnostics: &extension.diagnostics,
         slip_limit_ns: cmd.max_slip_us.saturating_mul(1_000),
+        mock_lag_limit_ns: cmd.common.mock_write_lag_limit_ns(),
         validity: &run.validity,
     });
     extension.selfcheck = Some(verdict.clone());
@@ -866,6 +868,7 @@ pub(crate) fn nonstream(cmd: &NonstreamCmd) -> anyhow::Result<()> {
         counters: &outcome.counters,
         diagnostics: &extension.diagnostics,
         markers_expected,
+        mock_lag_limit_ns: common.mock_write_lag_limit_ns(),
     });
     extension.ramp.clone_from(&outcome.ramp);
     finish_run(common, &run, &extension)
@@ -957,6 +960,7 @@ pub(crate) fn bigbody(cmd: &BigbodyCmd) -> anyhow::Result<()> {
             counters: &outcome.counters,
             diagnostics: &extension.diagnostics,
             markers_expected: true,
+            mock_lag_limit_ns: sized.mock_write_lag_limit_ns(),
         });
         extension.body_size = Some(size.clone());
         finish_run(&sized, &run, &extension)?;

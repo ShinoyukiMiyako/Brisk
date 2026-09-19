@@ -6,8 +6,8 @@
 //!   with the target; more than 1% of the measured intervals deviating by
 //!   more than 5% invalidates the run;
 //! - a clock step detected by the realtime offset invalidates the run;
-//! - a mock write lag p99 of 10 µs or more invalidates the run. So does the
-//!   absence of mock write lag samples where the responses carry markers
+//! - a mock write lag p99 at or above `--max-mock-write-lag-us` (the
+//!   contract's 10 µs by default) invalidates the run. So does the absence of mock write lag samples where the responses carry markers
 //!   (S1, S3, and S2 with room for a marker in the content): the rule must
 //!   not pass for lack of evidence.
 //!
@@ -66,8 +66,9 @@ use crate::shard::{Counters, STALE_RETRY};
 pub(crate) const LOAD_TOLERANCE: f64 = 0.05;
 /// Largest tolerated share of deviating intervals.
 pub(crate) const MAX_DEVIATING_SHARE: f64 = 0.01;
-/// Mock write lag p99 limit and emit lag p99 limit.
-pub(crate) const LAG_P99_LIMIT_NS: u64 = 10_000;
+/// Emit lag p99 limit. The mock write lag limit is a command-line option,
+/// [`crate::cli::CommonArgs::max_mock_write_lag_us`].
+pub(crate) const EMIT_LAG_P99_LIMIT_NS: u64 = 10_000;
 /// Emit lag p99.9 limit.
 pub(crate) const EMIT_LAG_P999_LIMIT_NS: u64 = 1_000_000;
 /// Largest tolerated share of failed requests.
@@ -242,6 +243,8 @@ pub(crate) struct Evidence<'a> {
     pub(crate) diagnostics: &'a Diagnostics,
     /// Successful responses carry mock timestamp markers.
     pub(crate) markers_expected: bool,
+    /// Mock write lag p99 limit.
+    pub(crate) mock_lag_limit_ns: u64,
 }
 
 /// Applies every validity rule.
@@ -262,10 +265,10 @@ pub(crate) fn evaluate(evidence: &Evidence<'_>) -> Validity {
         ));
     }
     match evidence.summary.get(&Metric::MockWriteLag) {
-        Some(lag) if lag.p99_ns >= LAG_P99_LIMIT_NS => validity.invalidate(format!(
+        Some(lag) if lag.p99_ns >= evidence.mock_lag_limit_ns => validity.invalidate(format!(
             "mock write lag p99 {:.1} us is not below {:.1} us",
             micros(lag.p99_ns),
-            micros(LAG_P99_LIMIT_NS)
+            micros(evidence.mock_lag_limit_ns)
         )),
         None if evidence.markers_expected => {
             validity.invalidate("no mock write lag samples after the warmup");
@@ -274,13 +277,13 @@ pub(crate) fn evaluate(evidence: &Evidence<'_>) -> Validity {
     }
     if let Some(lag) = evidence.summary.get(&Metric::EmitLag) {
         let cause = || emit_lag_cause(evidence.diagnostics, lag.count);
-        if lag.p99_ns >= LAG_P99_LIMIT_NS {
+        if lag.p99_ns >= EMIT_LAG_P99_LIMIT_NS {
             validity.invalidate(format!(
                 "emit lag p99 {:.1} us over {} sends is not below {:.1} us: \
                  the load generator fell behind its schedule; {}",
                 micros(lag.p99_ns),
                 lag.count,
-                micros(LAG_P99_LIMIT_NS),
+                micros(EMIT_LAG_P99_LIMIT_NS),
                 cause()
             ));
         }
@@ -415,12 +418,14 @@ pub(crate) struct SelfcheckEvidence<'a> {
     pub(crate) diagnostics: &'a Diagnostics,
     /// Request slip p99 limit.
     pub(crate) slip_limit_ns: u64,
+    /// Mock write lag p99 limit.
+    pub(crate) mock_lag_limit_ns: u64,
     /// Validity of the run.
     pub(crate) validity: &'a Validity,
 }
 
-/// Judges a selfcheck run: emit lag p99 and mock write lag p99 below
-/// 10 µs, request slip p99 below its limit (a mock that keeps its write
+/// Judges a selfcheck run: emit lag p99 below 10 µs, mock write lag p99
+/// below its limit, request slip p99 below its limit (a mock that keeps its write
 /// schedule can still queue arriving requests for milliseconds), every
 /// measured interval's concurrency within 5% of the offered
 /// load, the mean concurrency of the run within 5% of the nominal target
@@ -440,9 +445,10 @@ pub(crate) fn selfcheck(evidence: &SelfcheckEvidence<'_>) -> SelfcheckVerdict {
         load,
         diagnostics,
         slip_limit_ns,
+        mock_lag_limit_ns,
         validity,
     } = *evidence;
-    let lag = |metric: Metric, name: &'static str| {
+    let lag = |metric: Metric, name: &'static str, limit_ns: u64| {
         let p99 = summary.get(&metric).map(|s| s.p99_ns);
         Criterion {
             name,
@@ -450,13 +456,17 @@ pub(crate) fn selfcheck(evidence: &SelfcheckEvidence<'_>) -> SelfcheckVerdict {
                 || "no samples".to_owned(),
                 |ns| format!("{:.2} us", micros(ns)),
             ),
-            limit: format!("< {:.0} us", micros(LAG_P99_LIMIT_NS)),
-            pass: p99.is_some_and(|ns| ns < LAG_P99_LIMIT_NS),
+            limit: format!("< {} us", micros(limit_ns)),
+            pass: p99.is_some_and(|ns| ns < limit_ns),
         }
     };
     let criteria = vec![
-        lag(Metric::EmitLag, "emit_lag_p99"),
-        lag(Metric::MockWriteLag, "mock_write_lag_p99"),
+        lag(Metric::EmitLag, "emit_lag_p99", EMIT_LAG_P99_LIMIT_NS),
+        lag(
+            Metric::MockWriteLag,
+            "mock_write_lag_p99",
+            mock_lag_limit_ns,
+        ),
         Criterion {
             name: "request_slip_p99",
             observed: diagnostics.request_slip.as_ref().map_or_else(
@@ -658,6 +668,7 @@ mod tests {
             counters: &NO_COUNTERS,
             diagnostics: &NO_DIAGNOSTICS,
             markers_expected: true,
+            mock_lag_limit_ns: 10_000,
         };
         assert_eq!(evaluate(&evidence), Validity::default());
 
@@ -710,6 +721,58 @@ mod tests {
     }
 
     #[test]
+    fn mock_write_lag_rule_follows_the_configured_limit() {
+        let intervals: Vec<_> = (0..4).map(|i| interval(i, 1.0, 0, 100)).collect();
+        let judge = |mock_p99_ns, mock_lag_limit_ns| {
+            let mut summary = good_summary();
+            summary.extend(summary_with(Metric::MockWriteLag, mock_p99_ns));
+            evaluate(&Evidence {
+                intervals: &intervals,
+                warmup_intervals: 1,
+                summary: &summary,
+                clock_steps: 0,
+                load: None,
+                counters: &NO_COUNTERS,
+                diagnostics: &NO_DIAGNOSTICS,
+                markers_expected: true,
+                mock_lag_limit_ns,
+            })
+        };
+        // 12 us fails the contract's 10 us but passes a 25 us limit.
+        assert_eq!(
+            judge(12_000, 10_000).reasons,
+            ["mock write lag p99 12.0 us is not below 10.0 us"]
+        );
+        assert!(judge(12_000, 25_000).valid);
+        assert!(judge(24_999, 25_000).valid);
+        assert_eq!(
+            judge(25_000, 25_000).reasons,
+            ["mock write lag p99 25.0 us is not below 25.0 us"]
+        );
+        // A stricter limit applies as well.
+        assert_eq!(
+            judge(6_000, 5_000).reasons,
+            ["mock write lag p99 6.0 us is not below 5.0 us"]
+        );
+        // The emit lag limit stays at 10 us whatever the mock limit.
+        let mut summary = good_summary();
+        summary.extend(summary_tail(Metric::EmitLag, 12_000, 12_000));
+        let v = evaluate(&Evidence {
+            intervals: &intervals,
+            warmup_intervals: 1,
+            summary: &summary,
+            clock_steps: 0,
+            load: None,
+            counters: &NO_COUNTERS,
+            diagnostics: &NO_DIAGNOSTICS,
+            markers_expected: true,
+            mock_lag_limit_ns: 25_000,
+        });
+        assert_eq!(v.reasons.len(), 1, "{v:?}");
+        assert!(v.reasons[0].starts_with("emit lag p99 12.0 us"), "{v:?}");
+    }
+
+    #[test]
     fn missing_marker_evidence_invalidates_marked_scenarios_only() {
         let intervals: Vec<_> = (0..4).map(|i| interval(i, 1.0, 0, 100)).collect();
         let summary = summary_with(Metric::EmitLag, 1_000);
@@ -722,6 +785,7 @@ mod tests {
             counters: &NO_COUNTERS,
             diagnostics: &NO_DIAGNOSTICS,
             markers_expected: true,
+            mock_lag_limit_ns: 10_000,
         };
         let v = evaluate(&evidence);
         assert_eq!(
@@ -753,6 +817,7 @@ mod tests {
                 counters: &NO_COUNTERS,
                 diagnostics,
                 markers_expected: true,
+                mock_lag_limit_ns: 10_000,
             })
         };
         assert!(judge(9_999, 999_999, &NO_DIAGNOSTICS).valid);
@@ -832,6 +897,7 @@ mod tests {
                 counters,
                 diagnostics: &NO_DIAGNOSTICS,
                 markers_expected: true,
+                mock_lag_limit_ns: 10_000,
             })
         };
         let mut intervals: Vec<_> = (0..4).map(|i| interval(i, 1.0, 0, 100)).collect();
@@ -899,6 +965,7 @@ mod tests {
                 load,
                 diagnostics,
                 slip_limit_ns: 200_000,
+                mock_lag_limit_ns: 10_000,
                 validity: &valid,
             })
         };
@@ -947,5 +1014,49 @@ mod tests {
         assert!(verdict.criteria[3].pass);
         assert!(!verdict.criteria[4].pass, "{verdict:?}");
         assert!(!verdict.pass);
+    }
+
+    #[test]
+    fn selfcheck_mock_write_lag_criterion_follows_the_configured_limit() {
+        let intervals: Vec<_> = (0..10).map(|i| interval(i, 100.0, 3000, 30)).collect();
+        let plan: Vec<_> = (0..10).map(|i| planned(i, 100.0, 3000)).collect();
+        let load = check_load(&intervals, &plan, 0, 100);
+        let diagnostics = Diagnostics {
+            request_slip: Some(summary_with(Metric::Ttft, 80_000)[&Metric::Ttft]),
+            ..NO_DIAGNOSTICS
+        };
+        let valid = Validity::default();
+        let mut summary = summary_with(Metric::EmitLag, 4_000);
+        summary.extend(summary_with(Metric::MockWriteLag, 14_000));
+        let judge = |mock_lag_limit_ns| {
+            selfcheck(&SelfcheckEvidence {
+                summary: &summary,
+                load: &load,
+                diagnostics: &diagnostics,
+                slip_limit_ns: 200_000,
+                mock_lag_limit_ns,
+                validity: &valid,
+            })
+        };
+
+        let verdict = judge(25_000);
+        assert!(verdict.pass, "{verdict:?}");
+        let mock = &verdict.criteria[1];
+        assert_eq!(mock.name, "mock_write_lag_p99");
+        assert_eq!(mock.observed, "14.00 us");
+        assert_eq!(mock.limit, "< 25 us");
+        assert!(mock.pass);
+        // The emit lag criterion keeps the contract's bound.
+        assert_eq!(verdict.criteria[0].limit, "< 10 us");
+
+        let verdict = judge(10_000);
+        assert!(!verdict.pass);
+        assert_eq!(verdict.criteria[1].limit, "< 10 us");
+        assert!(!verdict.criteria[1].pass);
+
+        let verdict = judge(12_500);
+        assert_eq!(verdict.criteria[1].limit, "< 12.5 us");
+        assert!(!verdict.criteria[1].pass);
+        assert!(judge(14_001).criteria[1].pass);
     }
 }

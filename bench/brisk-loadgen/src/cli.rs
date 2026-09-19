@@ -89,6 +89,22 @@ pub(crate) struct CommonArgs {
     /// scheduled start, seconds.
     #[arg(long, default_value_t = 300.0, value_parser = parse_positive)]
     pub(crate) request_timeout_s: f64,
+    /// Invalidate the run (and fail the `selfcheck` criterion) when the mock
+    /// write lag p99 reaches this, microseconds. The contract's 10 µs
+    /// assumes an isolated core; on a shared host a laxer bound still
+    /// catches an overloaded mock.
+    #[arg(long, default_value_t = DEFAULT_MOCK_WRITE_LAG_US, value_parser = parse_lag_limit)]
+    pub(crate) max_mock_write_lag_us: f64,
+}
+
+/// Default mock write lag p99 limit, microseconds (the contract's bound).
+pub(crate) const DEFAULT_MOCK_WRITE_LAG_US: f64 = 10.0;
+
+impl CommonArgs {
+    /// `--max-mock-write-lag-us` in nanoseconds.
+    pub(crate) fn mock_write_lag_limit_ns(&self) -> u64 {
+        brisk_bench_core::dist::seconds_to_ns(self.max_mock_write_lag_us / 1e6)
+    }
 }
 
 /// Stream shape shared by `stream` and `selfcheck`.
@@ -342,6 +358,17 @@ fn parse_positive(s: &str) -> Result<f64, String> {
     }
 }
 
+/// A lag limit must be at least one nanosecond: a smaller one rounds to zero
+/// and would invalidate every run.
+fn parse_lag_limit(s: &str) -> Result<f64, String> {
+    let v = parse_positive(s)?;
+    if v >= 1e-3 {
+        Ok(v)
+    } else {
+        Err(format!("{s:?} is below 0.001 us"))
+    }
+}
+
 /// Chunk rates above 1 MHz would round the chunk interval to zero.
 fn parse_chunk_rate(s: &str) -> Result<f64, String> {
     let v = parse_positive(s)?;
@@ -472,6 +499,37 @@ mod tests {
         assert_eq!(cmd.common.label, "run");
         assert_eq!(cmd.common.pair_id, None);
         assert!(cmd.common.cpu_list.is_none());
+        assert_eq!(cmd.common.mock_write_lag_limit_ns(), 10_000);
+    }
+
+    #[test]
+    fn every_run_subcommand_takes_a_mock_write_lag_limit() {
+        for scenario in [
+            &["stream", "http://h:1", "--concurrency", "1"][..],
+            &["selfcheck", "http://h:1", "--concurrency", "1"],
+            &["nonstream", "http://h:1", "--rate", "1"],
+            &["bigbody", "http://h:1", "--sizes", "1k", "--rate", "1"],
+        ] {
+            let with = |limit: &str| {
+                let mut args = scenario.to_vec();
+                args.extend_from_slice(&["--max-mock-write-lag-us", limit, "--out", "o.json"]);
+                parse(&args).map(|cli| match cli.command {
+                    Command::Stream(cmd) => cmd.common,
+                    Command::Selfcheck(cmd) => cmd.common,
+                    Command::Nonstream(cmd) => cmd.common,
+                    Command::Bigbody(cmd) => cmd.common,
+                    Command::Compare(_) => panic!("unexpected compare"),
+                })
+            };
+            let common = with("25").unwrap();
+            assert!((common.max_mock_write_lag_us - 25.0).abs() < f64::EPSILON);
+            assert_eq!(common.mock_write_lag_limit_ns(), 25_000);
+            assert_eq!(with("12.5").unwrap().mock_write_lag_limit_ns(), 12_500);
+            assert_eq!(with("0.001").unwrap().mock_write_lag_limit_ns(), 1);
+            for bad in ["0", "-1", "0.0004", "inf", "x"] {
+                assert!(with(bad).is_err(), "{bad} accepted");
+            }
+        }
     }
 
     #[test]

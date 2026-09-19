@@ -37,9 +37,11 @@ const DEFAULT_GATE_METRICS: [Metric; 2] = [Metric::Ttft, Metric::ChunkLatency];
 const TAIL_FAILURE_FRACTION: f64 = 0.1;
 /// Parameters that may differ between compared runs: the shared options
 /// (target, label, output file, CPU placement, seed, pairing id, timeout),
-/// the length of the measurement, and the `bigbody` size list (each result
-/// file holds one size, which its scenario names).
-const NON_LOAD_PARAMS: [&str; 3] = ["common", "measure_s", "sizes"];
+/// the length of the measurement, the `bigbody` size list (each result
+/// file holds one size, which its scenario names), and the `stream` request
+/// slip limit, a validity criterion the M0 session sets on the direct arm
+/// only because the floor arm's slip includes the forwarding.
+const NON_LOAD_PARAMS: [&str; 4] = ["common", "measure_s", "sizes", "max_slip_us"];
 
 /// The comparison document.
 #[derive(Debug, Serialize)]
@@ -723,18 +725,20 @@ mod tests {
     }
 
     #[test]
-    fn load_params_ignore_target_placement_and_length() {
+    fn load_params_ignore_target_placement_length_and_slip_limit() {
         let a = serde_json::json!({
             "common": {"url": "http://direct:1", "label": "direct-P", "seed": 1},
             "shape": {"concurrency": 1000, "chunk_rate": 30.0},
             "warmup_s": 150,
-            "measure_s": 300
+            "measure_s": 300,
+            "max_slip_us": 200
         });
         let b = serde_json::json!({
             "common": {"url": "http://floor:2", "label": "floor-P", "seed": 2},
             "shape": {"concurrency": 1000, "chunk_rate": 30.0},
             "warmup_s": 150,
-            "measure_s": 600
+            "measure_s": 600,
+            "max_slip_us": null
         });
         let (a, b) = (load_params(&a).unwrap(), load_params(&b).unwrap());
         assert!(differing_keys(&a, &b).is_empty());
