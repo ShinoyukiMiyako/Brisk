@@ -17,18 +17,75 @@ mod idle;
 mod passthrough;
 mod settle;
 mod splice;
+mod tap;
 
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use brisk_proto::sse::SseError;
 use bytes::Bytes;
+use http_body::{Frame, SizeHint};
+use http_body_util::Full;
 
 use crate::BoxError;
 
 pub use passthrough::{PassthroughBody, StreamPlan};
 pub use settle::{DrainLimits, SettleCtx, SettleShared};
 pub use splice::SpliceBody;
+pub use tap::{MAX_TAP_BYTES, ResponseTap, TapPlan};
+
+/// Body of every data-plane response.
+#[derive(Debug)]
+pub enum ResponseBody {
+    /// A committed SSE response.
+    Stream(PassthroughBody<reqwest::Body>),
+    /// A committed response that is not SSE, 2xx or forwarded error.
+    Tap(ResponseTap<reqwest::Body>),
+    /// A response Brisk generated itself.
+    Full(Full<Bytes>),
+}
+
+impl http_body::Body for ResponseBody {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        match self.get_mut() {
+            Self::Stream(body) => Pin::new(body).poll_frame(cx),
+            Self::Tap(body) => Pin::new(body).poll_frame(cx),
+            Self::Full(body) => Pin::new(body)
+                .poll_frame(cx)
+                .map_err(|never| match never {}),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Self::Stream(body) => body.is_end_stream(),
+            Self::Tap(body) => body.is_end_stream(),
+            Self::Full(body) => body.is_end_stream(),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match self {
+            Self::Stream(body) => body.size_hint(),
+            Self::Tap(body) => body.size_hint(),
+            Self::Full(body) => body.size_hint(),
+        }
+    }
+}
+
+/// Lets `reply` stay independent of this module (1.4.8).
+impl From<Full<Bytes>> for ResponseBody {
+    fn from(body: Full<Bytes>) -> Self {
+        Self::Full(body)
+    }
+}
 
 /// Why a committed response body ended early. The response has already
 /// been committed, so the error ends the downstream stream: h1 closes the
@@ -110,11 +167,50 @@ impl HeldFrames {
         self.bytes -= frame.len();
         Some(frame)
     }
+
+    /// The held frames, oldest first, without removing them.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Bytes> {
+        // `first` is only filled while `rest` has nothing left to hand out,
+        // so it always precedes the frames still in `rest`.
+        self.first.iter().chain(&self.rest[self.next..])
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use http_body::Body;
+
     use super::*;
+
+    /// axum boxes response bodies as `Send + 'static` and hyper needs the
+    /// error convertible to `BoxError`.
+    #[test]
+    fn response_body_is_a_boxable_body() {
+        fn boxable<B>()
+        where
+            B: Body<Data = Bytes> + Send + Unpin + 'static,
+            B::Error: Into<BoxError>,
+        {
+        }
+        boxable::<ResponseBody>();
+        boxable::<SpliceBody>();
+    }
+
+    #[tokio::test]
+    async fn full_body_converts_and_passes_through() {
+        use http_body_util::BodyExt;
+
+        let mut body = ResponseBody::from(Full::new(Bytes::from_static(b"{\"status\":\"ok\"}")));
+        assert_eq!(body.size_hint().exact(), Some(15));
+        assert!(!body.is_end_stream());
+        let frame = body.frame().await.expect("a frame").expect("infallible");
+        assert_eq!(
+            frame.into_data().ok(),
+            Some(Bytes::from_static(b"{\"status\":\"ok\"}"))
+        );
+        assert!(body.is_end_stream());
+        assert!(body.frame().await.is_none());
+    }
 
     fn drain(held: &mut HeldFrames) -> Vec<Bytes> {
         std::iter::from_fn(|| held.pop_front()).collect()
@@ -191,6 +287,22 @@ mod tests {
         assert!(held.first.is_some());
         assert_eq!(held.len_bytes(), 1);
         assert_eq!(drain(&mut held), [Bytes::from_static(b"3")]);
+    }
+
+    #[test]
+    fn iter_sees_the_frames_still_held_in_order() {
+        let mut held = HeldFrames::default();
+        assert_eq!(held.iter().count(), 0);
+        held.push(Bytes::from_static(b"1"));
+        held.push(Bytes::from_static(b"2"));
+        held.push(Bytes::from_static(b"3"));
+        assert_eq!(held.pop_front(), Some(Bytes::from_static(b"1")));
+        let seen: Vec<&Bytes> = held.iter().collect();
+        assert_eq!(seen, [&Bytes::from_static(b"2"), &Bytes::from_static(b"3")]);
+        assert_eq!(drain(&mut held).len(), 2);
+        held.push(Bytes::from_static(b"4"));
+        let seen: Vec<&Bytes> = held.iter().collect();
+        assert_eq!(seen, [&Bytes::from_static(b"4")]);
     }
 
     #[test]
