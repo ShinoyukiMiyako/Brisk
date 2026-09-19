@@ -1,0 +1,32 @@
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"The"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":" user"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":" says"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":":"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":" \""},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Reply"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":" with"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":" exactly"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":":"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":" p"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"ong"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"\"\n"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"\n\n"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{"role":"assistant","content":"pong"},"finish_reason":null,"native_finish_reason":null}],"service_tier":"default"}
+
+data: {"id":"00000000-0000-0000-0000-000000000001","object":"chat.completion.chunk","created":0,"model":"grok-4.6-build","choices":[{"index":0,"delta":{},"finish_reason":"stop","native_finish_reason":"stop"}],"service_tier":"default","usage":{"completion_tokens":71,"total_tokens":284,"prompt_tokens":213,"prompt_tokens_details":{"cached_tokens":0},"completion_tokens_details":{"reasoning_tokens":70}}}
+
+data: [DONE]
+
