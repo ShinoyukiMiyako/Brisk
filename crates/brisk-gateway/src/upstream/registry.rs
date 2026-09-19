@@ -6,6 +6,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use brisk_proto::splice::json_string;
 use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
 use http::HeaderValue;
@@ -248,40 +249,13 @@ fn model_map(spec: &ChannelSpec) -> Result<HashMap<Box<str>, Bytes>, &'static st
             return Err("model_map maps a model that is not listed in models");
         }
         if map
-            .insert(client.as_str().into(), json_string_literal(upstream))
+            .insert(client.as_str().into(), json_string(upstream))
             .is_some()
         {
             return Err("model_map maps the same client model name twice");
         }
     }
     Ok(map)
-}
-
-/// `value` as a JSON string literal, quotes included, escaped exactly like
-/// `serde_json` does: `"`, `\` and control characters only.
-fn json_string_literal(value: &str) -> Bytes {
-    let mut out = Vec::with_capacity(value.len() + 2);
-    out.push(b'"');
-    for &byte in value.as_bytes() {
-        match byte {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\x08' => out.extend_from_slice(b"\\b"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\x0c' => out.extend_from_slice(b"\\f"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            0..=0x1f => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.extend_from_slice(b"\\u00");
-                out.push(HEX[usize::from(byte >> 4)]);
-                out.push(HEX[usize::from(byte & 0xf)]);
-            }
-            _ => out.push(byte),
-        }
-    }
-    out.push(b'"');
-    Bytes::from(out)
 }
 
 /// Builds the warm-up URL on the channel's origin.
@@ -576,8 +550,11 @@ mod tests {
         first.weight = 3;
         first.stream_usage = StreamUsage::Passthrough;
         first.expose_ratelimit_headers = true;
-        first.models = vec!["grok-4.6(xhigh)".to_owned()];
-        first.model_map = vec![("grok-4.6(xhigh)".to_owned(), "grok \"4\"\n".to_owned())];
+        first.models = vec!["grok-4.6(xhigh)".to_owned(), "gpt-5.5".to_owned()];
+        first.model_map = vec![
+            ("grok-4.6(xhigh)".to_owned(), "grok \"4\"\n".to_owned()),
+            ("gpt-5.5".to_owned(), "grok-4.6(xhigh)".to_owned()),
+        ];
         let set = ChannelSet::build(&[first, spec("b", "http://127.0.0.1:2/v1")]).unwrap();
 
         assert_eq!(set.len(), 2);
@@ -602,21 +579,12 @@ mod tests {
             a.model_map.get("grok-4.6(xhigh)").map(Bytes::as_ref),
             Some(&b"\"grok \\\"4\\\"\\n\""[..])
         );
+        // Bracketed upstream names go out verbatim; only JSON escaping applies.
+        assert_eq!(
+            a.model_map.get("gpt-5.5").map(Bytes::as_ref),
+            Some(&b"\"grok-4.6(xhigh)\""[..])
+        );
         assert!(!format!("{a:?}").contains(SECRET));
-    }
-
-    #[test]
-    fn json_string_literal_matches_serde_json() {
-        for value in [
-            "grok-4.6(xhigh)",
-            "quote\" backslash\\ slash/",
-            "\u{0}\u{1}\u{8}\t\n\u{b}\u{c}\r\u{1f}\u{7f}",
-            "模型-é-\u{2028}",
-            "",
-        ] {
-            let expected = serde_json::to_vec(value).unwrap();
-            assert_eq!(json_string_literal(value).as_ref(), expected, "{value:?}");
-        }
     }
 
     #[test]
