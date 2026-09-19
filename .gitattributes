@@ -1,1 +1,4 @@
 * text=auto eol=lf
+# Sanitised upstream captures are compared byte for byte, CRLF framing
+# included; line-ending normalisation would corrupt them (D18).
+fixtures/** -text

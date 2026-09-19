@@ -1,6 +1,16 @@
-# Crate-local clippy configuration for brisk-gateway (R1: no file I/O, blocking
-# calls or synchronous DNS on the request path). Clippy reads this file because
-# it looks for clippy.toml in CARGO_MANIFEST_DIR before walking up to parents.
+# Crate-local clippy configuration for brisk-proto. Clippy reads this file
+# because it looks for clippy.toml in CARGO_MANIFEST_DIR before walking up to
+# parents.
+#
+# disallowed-methods is the R1 list of brisk-gateway, kept identical. The
+# tokio entries never match here because brisk-proto has no tokio dependency;
+# they are kept so that both files carry the same list.
+#
+# disallowed-types and disallowed-macros enforce R2: the protocol layer never
+# builds a `serde_json::Value` tree. Property tests and fuzz targets that need
+# `Value` as a differential oracle opt out with a file-level
+# `#![allow(clippy::disallowed_types, clippy::disallowed_macros, reason = "...")]`;
+# nothing under src/ may do so, `#[cfg(test)]` modules included.
 
 disallowed-methods = [
     { path = "std::fs::read", reason = "R1: no file I/O in the data plane" },
@@ -18,11 +28,6 @@ disallowed-methods = [
     { path = "std::thread::sleep", reason = "R1: blocks a runtime worker; use tokio::time::sleep" },
 ]
 
-# R2: no `serde_json::Value` tree in the gateway either. serde_json is only a
-# dev-dependency today, so this applies to the unit and integration tests, and
-# to src/ as soon as it depends on serde_json.
-# Tests that need `Value` opt out with a file-level
-# `#![allow(clippy::disallowed_types, clippy::disallowed_macros, reason = "...")]`.
 disallowed-types = [
     { path = "serde_json::Value", reason = "R2: parse into borrowed structs, never into a Value tree" },
 ]

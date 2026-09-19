@@ -1,0 +1,44 @@
+[package]
+name = "brisk"
+description = "Brisk gateway binary: configuration loading, runtime assembly and the command line."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+# Only the system random number generator for `brisk keygen`; rustls selects
+# the same crate version for TLS.
+aws-lc-rs = { workspace = true, features = ["aws-lc-sys"] }
+brisk-gateway = { workspace = true }
+clap = { workspace = true }
+# The PEM readers of rustls-pki-types are always compiled; `std` adds the file
+# readers used for the inbound certificate and key.
+rustls-pki-types = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "net", "time"] }
+tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
+toml = { workspace = true }
+# Unifies across the whole dependency graph: debug and trace events of the
+# data plane do not exist in release builds (D27).
+tracing = { workspace = true, features = ["release_max_level_info"] }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+mimalloc = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+reqwest = { workspace = true, features = ["rustls", "stream"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+
+[lints]
+workspace = true
