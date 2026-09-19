@@ -3,9 +3,9 @@
 # shellcheck disable=SC2153
 # M0 measurement session on the Linux benchmark host: the direct baseline
 # (arm A) against floor-A (arm B) in alternating order, under config P and
-# config T, for the selfcheck (sc) and the scenarios S1 (streams), S2
-# (non-streaming) and S3 (large request bodies, one run per size), followed
-# by the bootstrap comparisons.
+# config T (and config N on request), for the selfcheck (sc) and the
+# scenarios S1 (streams), S2 (non-streaming) and S3 (large request bodies,
+# one run per size), followed by the bootstrap comparisons.
 #
 # Usage: scripts/bench/run-m0.sh [--<knob> <value> | --<knob>=<value>]...
 #        scripts/bench/run-m0.sh --print-config [--<knob> <value>]...
@@ -19,6 +19,15 @@
 #
 #   config P  A: loadgen -http->  mock          B: loadgen -http->  floor -https-> mock
 #   config T  A: loadgen -https-> mock          B: loadgen -https-> floor -https-> mock
+#   config N  A: loadgen -http->  mock          B: loadgen -http->  floor -http->  mock
+#
+# CONFIGS defaults to "P T"; N is opt-in (CONFIGS="N P T" or CONFIGS=N). N
+# isolates the pure proxy cost and matches Brisk in front of the CPA on the
+# LAN, which speaks plain HTTP. Config P's delta includes the upstream TLS
+# hop (encryption in the mock, decryption in floor), since its direct arm
+# reaches the plaintext mock and its floor arm the TLS one. So the mock
+# serves both arms alike only in T and N, and only there is the
+# mock_write_lag delta meaningful as a symmetry check.
 #
 # Core plan: LAYOUT=8vcpu (default) puts floor on CPUs 4-7, the mocks on 2-3
 # (2 shards) and loadgen on 0-1 (2 shards); LAYOUT=4vcpu is the earlier plan
@@ -44,7 +53,14 @@
 # judged per metric; only the gate metrics (GATE_METRICS for S1,
 # S2_GATE_METRICS, S3_GATE_METRICS) decide the gate, the others are
 # reported. chunk_wire, the preferred per-chunk overhead metric, is reported
-# but not gated by default.
+# but not gated by default; so is mock_write_lag, whose delta shows whether
+# the mock serves both arms alike (in T and N, see above).
+#
+# Every mock runs with --emit-policy MOCK_EMIT_POLICY and --commit-us
+# MOCK_COMMIT_US, and every load generator run with --max-mock-write-lag-us
+# MOCK_WRITE_LAG_LIMIT_US. The direct arm of S1 also runs with --max-slip-us
+# S1_MAX_SLIP_US, so an overloaded mock invalidates it; the floor arm does
+# not, as its request slip includes the forwarding.
 #
 # The session refuses to start unless setup-host.sh --check passes
 # (ALLOW_UNPREPARED_HOST=1 overrides), holds $RESULTS_ROOT/.run-m0.lock for
@@ -53,7 +69,10 @@
 #
 # Output in $RESULTS_ROOT/$RUN_ID/: manifest.json, runs.jsonl,
 # compares.jsonl, processes.jsonl, session.log, results/ (RunResult files),
-# compare/ (JSON and text), logs/, host/, bin/. Every process started here
+# compare/ (JSON and text), logs/, host/, bin/. Each runs.jsonl record
+# carries the CPU steal over its measurement window (steal) and the load
+# balance of the shards of the mock that served it (mock_balance, max over
+# mean of the per-shard requests and chunks). Every process started here
 # is stopped on exit, failures included. The exit status is 1 if the
 # selfcheck fails, a load generator or floor run fails, a comparison is
 # missing or has fewer valid repetitions than planned, or a comparison's
@@ -78,20 +97,33 @@ usage() {
 # means "not passed" or a fallback named in the meaning. Two exceptions give
 # the mock a TTFT above 0, because the mock takes t0 when the request is
 # complete, before it handles it, so at TTFT 0 its handling time lands in the
-# mock write lag: in S3 the scan of a 100 KiB to 10 MiB body fails the 10 us
-# validity limit outright, and in S2 the parsing and response set-up (about
+# mock write lag: in S3 the scan of a 100 KiB to 10 MiB body fails a 10 us
+# write lag limit outright, and in S2 the parsing and response set-up (about
 # 2.5 us at p50) leaves too little room for one scheduler tick. The offset
 # is the same in both arms and cancels in the delta.
+#
+# MOCK_WRITE_LAG_LIMIT_US: the 10 us bound of the M0 contract was set for an
+# isolated bare-metal CCD. 20 us comes from the commit-window sweep on the
+# 8-vCPU VM (mock-emit-matrix.sh): at a 10 us commit window the worst p99
+# over 12 repetitions was 14.4 us, and one real host disturbance reached
+# 22.1 us. It needs MOCK_COMMIT_US >= 10; at 5 us TLS reached 19.7 us. The
+# write lag hardly reacts to overload on the request side, which the request
+# slip limit of the direct S1 arm (S1_MAX_SLIP_US) catches instead. Whether
+# the mock treats both arms alike is checked through the mock_write_lag
+# delta that the S1 comparison reports (in T and N).
 knob_table=(
     "RUN_ID|m0-$(date -u +%Y%m%dT%H%M%SZ)|session directory name"
     "RESULTS_ROOT|$HOME/bench-results|parent of the session directory"
     "BIN_DIR|$HOME/brisk-target/release|directory of the three binaries"
-    "CONFIGS|P T|configs to run, in order (P, T)"
+    "CONFIGS|P T|configs to run, in order (N, P, T; N is opt-in, see above)"
     "SCENARIOS|sc s1 s2 s3|scenarios to run (sc, s1, s2, s3)"
     "REPS||repetitions of every scenario (default: S1 5, S2 3, S3 3)"
     "RETRY_INVALID|1|reruns of a repetition that has an invalid run"
     "SEED|1|schedule seed of repetition 1; repetition r uses SEED+r-1"
     "SPIN_US|50|busy-wait window of mock and loadgen, microseconds"
+    "MOCK_EMIT_POLICY|fixed|emission policy of every mock (full-spin, fixed)"
+    "MOCK_COMMIT_US|10|commit window of the fixed emission policy, microseconds"
+    "MOCK_WRITE_LAG_LIMIT_US|20|mock write lag p99 limit of every loadgen run's validity and selfcheck, microseconds (see above)"
     "LAYOUT|8vcpu|core plan preset: 8vcpu or 4vcpu (see above)"
     "FLOOR_CPUS||CPUs of brisk-floor (default: from LAYOUT)"
     "FLOOR_WORKERS||floor worker threads (default: one per FLOOR_CPUS entry)"
@@ -100,9 +132,9 @@ knob_table=(
     "LOADGEN_CPUS||CPUs of brisk-loadgen (default: from LAYOUT)"
     "LOADGEN_SHARDS||loadgen shard threads (default: from LAYOUT)"
     "HARNESS_CPUS||CPUs of this script and its helpers (default: first LOADGEN_CPUS entry)"
-    "MOCK_PLAIN_PORT|19080|plaintext mock (direct-P)"
-    "MOCK_TLS_PORT|19443|TLS mock (direct-T and floor upstream)"
-    "FLOOR_P_PORT|19180|floor, plaintext inbound"
+    "MOCK_PLAIN_PORT|19080|plaintext mock (direct-P, direct-N, floor upstream in N)"
+    "MOCK_TLS_PORT|19443|TLS mock (direct-T, floor upstream in P and T)"
+    "FLOOR_P_PORT|19180|floor, plaintext inbound (P, N)"
     "FLOOR_T_PORT|19543|floor, TLS inbound"
     "SC_PORT|19090|selfcheck mock"
     "RESERVED_PORTS|8317|ports of other services on the host, never used and sampled for CPU"
@@ -123,6 +155,7 @@ knob_table=(
     "S1_DUR_MAX|120|S1 stream duration cap, seconds"
     "S1_TTFT_US|0|S1 mock TTFT, microseconds"
     "S1_CHUNK_BYTES|128|S1 content bytes per chunk"
+    "S1_MAX_SLIP_US|200|request slip p99 limit of the direct S1 arm, microseconds; an overloaded mock queues requests and invalidates the run"
     "S1_WARMUP_S|150|S1 warmup, seconds"
     "S1_MEASURE_S|300|S1 measurement, seconds"
     "S2_REPS||S2 repetitions (default: REPS, else 3)"
@@ -138,12 +171,13 @@ knob_table=(
     "S3_TTFT_US|2000|S3 mock TTFT, microseconds (see above)"
     "S3_CHUNKS|1|S3 content chunks per response"
     "S3_SPIN_US|500|S3 loadgen busy-wait window, microseconds; at 5 req/s the wake-up from idle can exceed SPIN_US"
+    "S3_MOCK_WRITE_LAG_LIMIT_US|5000|S3 mock write lag p99 limit, microseconds; the mock shard that emits also reads and decrypts multi-megabyte bodies, which delays other emissions by up to milliseconds in both arms alike, so here the limit only catches a stalled mock"
     "S3_WARMUP_S|30|S3 warmup per size, seconds"
     "S3_MEASURE_S|300|S3 measurement per size, seconds"
     "COMPARE_QUANTILES|50,99,99.9|compared quantiles of S1 and S2, percent"
     "S3_COMPARE_QUANTILES|50,99|compared quantiles of S3; its sample count leaves p99.9 at a handful of samples"
     "COMPARE_RESAMPLES|2000|bootstrap resamples"
-    "GATE_METRICS|chunk_latency|S1 metrics whose baseline p99 CI decides the gate (of ttft, chunk_latency, chunk_wire); ttft is left out because its tail varies with the seed-driven schedule itself and would need about 25 repetitions to reach the 5% bound"
+    "GATE_METRICS|chunk_latency|S1 metrics whose baseline p99 CI decides the gate (of ttft, chunk_latency, chunk_wire, mock_write_lag); ttft is left out because its tail varies with the seed-driven schedule itself and would need about 25 repetitions to reach the 5% bound"
     "S2_GATE_METRICS|request_latency|S2 gate metrics (of request_latency)"
     "S3_GATE_METRICS|ttft|S3 gate metrics (of ttft, chunk_latency)"
 )
@@ -236,13 +270,23 @@ for name in S1_REPS S2_REPS S3_REPS RETRY_INVALID SEED SPIN_US S3_SPIN_US \
     S3_TTFT_US S3_CHUNKS S3_WARMUP_S S3_MEASURE_S COMPARE_RESAMPLES; do
     [[ "${!name}" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer, got '${!name}'"
 done
+[[ "$MOCK_EMIT_POLICY" == full-spin || "$MOCK_EMIT_POLICY" == fixed ]] ||
+    die "MOCK_EMIT_POLICY must be full-spin or fixed, got '$MOCK_EMIT_POLICY'"
+[[ "$MOCK_COMMIT_US" =~ ^[0-9]+$ ]] || die "MOCK_COMMIT_US must be a non-negative integer, got '$MOCK_COMMIT_US'"
+for name in MOCK_WRITE_LAG_LIMIT_US S3_MOCK_WRITE_LAG_LIMIT_US; do
+    if [[ ! "${!name}" =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
+        ! awk -v v="${!name}" 'BEGIN { exit !(v > 0) }'; then
+        die "$name must be a positive number, got '${!name}'"
+    fi
+done
 for name in SC_GATE ALLOW_UNPREPARED_HOST; do
     [[ "${!name}" == 0 || "${!name}" == 1 ]] || die "$name must be 0 or 1, got '${!name}'"
 done
 [[ -z "$FLOOR_WORKERS" || "$FLOOR_WORKERS" =~ ^[1-9][0-9]*$ ]] ||
     die "FLOOR_WORKERS must be a positive integer, got '$FLOOR_WORKERS'"
+[[ "$S1_MAX_SLIP_US" =~ ^[1-9][0-9]*$ ]] || die "S1_MAX_SLIP_US must be a positive integer, got '$S1_MAX_SLIP_US'"
 for c in $CONFIGS; do
-    [[ "$c" == P || "$c" == T ]] || die "CONFIGS may contain P and T only, got '$c'"
+    [[ "$c" == N || "$c" == P || "$c" == T ]] || die "CONFIGS may contain N, P and T only, got '$c'"
 done
 for s in $SCENARIOS; do
     [[ "$s" =~ ^(sc|s1|s2|s3)$ ]] || die "SCENARIOS may contain sc, s1, s2 and s3 only, got '$s'"
@@ -264,7 +308,7 @@ has_config() {
 # them.
 compared_metrics() {
     case "$1" in
-        s1) echo ttft,chunk_latency,chunk_wire ;;
+        s1) echo ttft,chunk_latency,chunk_wire,mock_write_lag ;;
         s2) echo request_latency ;;
         s3) echo ttft,chunk_latency ;;
     esac
@@ -720,7 +764,7 @@ write_manifest() {
           source: (($sync | kv) + {patch: $patch}), knobs: ($knobs | kv),
           binaries: ($binaries | split("\n") | map(select(length > 0) | split("  ")
                      | {sha256: .[0], version: .[1], path: .[2]})),
-          cpu_method: "per CPU: busy = 1 - (idle + iowait) / wall clock, softirq as /proc/softirqs events; per process: utime + stime",
+          cpu_method: "per CPU: busy = 1 - (idle + iowait) / wall clock, steal = /proc/stat steal ticks / wall clock, softirq as /proc/softirqs events; per process: utime + stime",
           selfcheck: $selfcheck, selfcheck_detail: $selfcheck_detail,
           invalid_runs: $invalid, retries: $retries, failed_runs: $failed,
           failed_compares: $failed_compares, baseline_ci_failures: $baseline_ci_failures,
@@ -738,6 +782,7 @@ write_manifest() {
 
 log "session $RUN_ID in $run_dir"
 log "core plan: floor $FLOOR_CPUS, mocks $MOCK_CPUS ($MOCK_SHARDS shard(s)), loadgen $LOADGEN_CPUS ($LOADGEN_SHARDS shard(s)), harness $HARNESS_CPUS"
+log "mock emission policy $MOCK_EMIT_POLICY (commit window $MOCK_COMMIT_US us); mock write lag p99 limit $MOCK_WRITE_LAG_LIMIT_US us (S3 $S3_MOCK_WRITE_LAG_LIMIT_US us); direct S1 request slip p99 limit $S1_MAX_SLIP_US us"
 if [[ -f "$repo_root/.sync-info" ]]; then
     cp "$repo_root/.sync-info" "$run_dir/host/sync-info"
     if [[ -f "$repo_root/.sync-diff.patch" ]]; then
@@ -763,6 +808,23 @@ loadgen="$run_dir/bin/brisk-loadgen"
 for bin in "$mock" "$floor" "$loadgen"; do
     printf '%s  %s  %s\n' "$(sha256sum "$bin" | cut -d' ' -f1)" "$("$bin" --version)" "$bin"
 done >"$run_dir/host/binaries.txt"
+# An older build would reject the flag only at the first mock or loadgen
+# start, after the host checks.
+mock_help="$("$mock" serve --help)"
+for flag in --emit-policy --commit-us; do
+    [[ "$mock_help" == *"$flag"* ]] || die "$BIN_DIR/brisk-mock serve has no $flag; sync a build that has it"
+done
+for sub in selfcheck stream nonstream bigbody; do
+    [[ "$("$loadgen" "$sub" --help)" == *--max-mock-write-lag-us* ]] ||
+        die "$BIN_DIR/brisk-loadgen $sub has no --max-mock-write-lag-us; sync a build that has it"
+done
+[[ "$("$loadgen" stream --help)" == *--max-slip-us* ]] ||
+    die "$BIN_DIR/brisk-loadgen stream has no --max-slip-us; sync a build that has it"
+if [[ "$MOCK_EMIT_POLICY" == fixed ]] && ((MOCK_COMMIT_US < 10)); then
+    log "WARNING: MOCK_COMMIT_US=$MOCK_COMMIT_US; the default write lag limit of 20 us assumes a commit window of at least 10 us (TLS reached 19.7 us at 5 us in the sweep)"
+fi
+# Every mock of the session, selfcheck and scenarios alike.
+mock_emit_args=(--emit-policy "$MOCK_EMIT_POLICY" --commit-us "$MOCK_COMMIT_US")
 
 host_rc=0
 bash "$repo_root/scripts/bench/setup-host.sh" --check >"$run_dir/host/setup-host.txt" 2>&1 || host_rc=$?
@@ -841,8 +903,9 @@ ca="$certs_dir/ca.pem"
 # Common loadgen options of one run.
 loadgen_common() {
     local label="$1" out="$2" run_seed="$3" cpus="$4" shards="$5" tls="$6" spin="$7"
+    local lag_limit="${8:-$MOCK_WRITE_LAG_LIMIT_US}"
     lg_args+=(--label "$label" --out "$out" --seed "$run_seed" --shards "$shards"
-        --cpu-list "$cpus" --spin-us "$spin")
+        --cpu-list "$cpus" --spin-us "$spin" --max-mock-write-lag-us "$lag_limit")
     if ((tls)); then
         lg_args+=(--tls-ca "$ca")
     fi
@@ -854,21 +917,80 @@ stream_shape() {
         --chunk-bytes "$S1_CHUNK_BYTES")
 }
 
+# The CPUs of each role as JSON arrays, for the steal summary of a run. The
+# selfcheck has its own mock and loadgen sets and no floor.
+cpu_array() {
+    jq -nc --arg c "$(expand_cpus "$1")" '$c | split(" ") | map(tonumber)'
+}
+roles_scenario="$(jq -nc --argjson f "$(cpu_array "$FLOOR_CPUS")" --argjson m "$(cpu_array "$MOCK_CPUS")" \
+    --argjson l "$(cpu_array "$LOADGEN_CPUS")" '{floor: $f, mock: $m, loadgen: $l}')"
+roles_sc="$(jq -nc --argjson m "$(cpu_array "$SC_MOCK_CPUS")" --argjson l "$(cpu_array "$SC_LOADGEN_CPUS")" \
+    '{mock: $m, loadgen: $l}')"
+
+# Steal over a run's measurement window, from its cpu_usage JSON (or null):
+# the highest and mean per-CPU percent, and the highest per role. On a VM a
+# tail that coincides with steal points at the host, not at the arm.
+steal_summary() {
+    jq -nc --argjson cpu "$1" --argjson roles "$2" '
+        if $cpu == null then null
+        else [$cpu.cpus[].steal_pct | numbers] as $all
+             | if ($all | length) == 0 then null
+               else {max_pct: ($all | max), mean_pct: ($all | add / length * 10 | round / 10),
+                     by_role_max_pct: ($roles | map_values([.[] as $c | $cpu.cpus["cpu\($c)"].steal_pct
+                                                            | numbers] | max))}
+               end
+        end'
+}
+
+# Prints the mock that serves an arm: config P's direct arm reaches the
+# plaintext mock and its floor arm the TLS one.
+arm_mock() {
+    local scen="$1" config="$2" arm="$3"
+    if [[ "$scen" == sc ]]; then
+        echo mock-sc
+    elif [[ "$config" == N || ("$config" == P && "$arm" == direct) ]]; then
+        echo mock-plain
+    else
+        echo mock-tls
+    fi
+}
+
+# Shard balance of one mock from the statistics saved with a run (or null):
+# max over mean of the per-shard requests and chunks. The shards accept
+# connections independently, so one shard can carry most of the streams and
+# saturate while the mean looks fine.
+mock_balance() {
+    jq -nc --argjson m "$1" --arg n "$2" '
+        def ratio(f): [.[] | f | numbers] as $v
+            | if ($v | length) == 0 then null
+              else ($v | add / length) as $mean
+                   | if $mean > 0 then ($v | max) / $mean * 1000 | round / 1000 else null end
+              end;
+        $m[$n].shards as $s
+        | if ($s | type) != "array" then null
+          else {mock: $n, shards: ($s | length),
+                requests_max_over_mean: ($s | ratio(.requests)),
+                chunks_max_over_mean: ($s | ratio(.chunks))}
+          end'
+}
+
 # Appends the runs.jsonl record of one result file and clears run_ok unless
 # the run is valid.
 record_run() {
     local scen="$1" config="$2" arm="$3" rep="$4" attempt="$5" order="$6" size="$7" tag="$8"
     local rc="$9" started="${10}" cpu="${11}" net="${12}" mockstats="${13}" file="${14}"
+    local steal="${15}" balance="${16}"
     if [[ ! -f "$file" ]]; then
         jq -nc --arg scen "$scen" --arg config "$config" --arg arm "$arm" --argjson rep "$rep" \
             --argjson attempt "$attempt" --arg order "$order" \
             --arg tag "$tag" --arg size "$size" --argjson rc "$rc" --arg started "$started" \
-            --arg pair "$lg_pair_id" \
+            --arg pair "$lg_pair_id" --argjson steal "$steal" --argjson balance "$balance" \
             '{scen: $scen, config: $config, arm: $arm, rep: $rep, attempt: $attempt, order: $order,
               tag: $tag, size: $size, pair_id: (if $pair == "" then null else $pair end),
               file: null, valid: false,
               reasons: ["no result file (load generator exit status \($rc))"],
-              loadgen_rc: $rc, started: $started}' >>"$run_dir/runs.jsonl"
+              loadgen_rc: $rc, started: $started, steal: $steal, mock_balance: $balance}' \
+            >>"$run_dir/runs.jsonl"
         invalid_runs=$((invalid_runs + 1))
         run_ok=0
         log "  $tag: NO RESULT"
@@ -878,7 +1000,8 @@ record_run() {
         --argjson attempt "$attempt" --arg order "$order" \
         --arg tag "$tag" --arg size "$size" --argjson rc "$rc" --arg started "$started" \
         --arg file "results/${file##*/}" --argjson cpu "$cpu" --argjson net "$net" \
-        --argjson mock "$mockstats" --arg pair "$lg_pair_id" '
+        --argjson mock "$mockstats" --arg pair "$lg_pair_id" \
+        --argjson steal "$steal" --argjson balance "$balance" '
         .warmup_intervals as $w
         | {scen: $scen, config: $config, arm: $arm, rep: $rep, attempt: $attempt, order: $order,
            tag: $tag, size: $size, pair_id: (if $pair == "" then null else $pair end),
@@ -891,7 +1014,8 @@ record_run() {
            load_check: .loadgen.load_check, selfcheck: .loadgen.selfcheck,
            summary_us: (.summary | map_values({count, p50: (.p50_ns / 1000),
                         p99: (.p99_ns / 1000), p999: (.p999_ns / 1000), max: (.max_ns / 1000)})),
-           cpu: $cpu, net: $net, mock_stats: $mock}' "$file" >>"$run_dir/runs.jsonl"
+           cpu: $cpu, steal: $steal, net: $net, mock_stats: $mock, mock_balance: $balance}' \
+        "$file" >>"$run_dir/runs.jsonl"
     if jq -e '.validity.valid' "$file" >/dev/null; then
         log "  $tag: VALID"
     else
@@ -960,8 +1084,17 @@ execute_run() {
         ok=0
     fi
     ((!floor_died)) || ok=0
+    local roles="$roles_scenario" steal balance
+    [[ "$scen" == sc ]] && roles="$roles_sc"
+    steal="$(steal_summary "${cpu:-null}" "$roles")"
+    balance="$(mock_balance "$mockstats" "$(arm_mock "$scen" "$config" "$arm")")"
+    log "  $tag: steal $(jq -r 'if . == null then "n/a"
+                                else "max \(.max_pct)%, mean \(.mean_pct)% (\(.by_role_max_pct | to_entries
+                                     | map("\(.key) \(.value // "n/a")%") | join(", ")))" end' <<<"$steal");" \
+        "mock shard max/mean $(jq -r 'if . == null then "n/a"
+                                      else "requests \(.requests_max_over_mean // "n/a"), chunks \(.chunks_max_over_mean // "n/a") (\(.mock), \(.shards) shard(s))" end' <<<"$balance")"
     record_run "$scen" "$config" "$arm" "$rep" "$attempt" "$order" "$size" "$tag" "$rc" "$started" \
-        "${cpu:-null}" "$net" "$mockstats" "$result"
+        "${cpu:-null}" "$net" "$mockstats" "$result" "$steal" "$balance"
     ((ok)) || run_ok=0
 }
 
@@ -971,8 +1104,12 @@ floor_port() {
 
 start_floor() {
     local config="$1" tag="$2"
-    local -a args=(--listen "127.0.0.1:$(floor_port "$config")"
-        --upstream "https://127.0.0.1:$MOCK_TLS_PORT" --upstream-ca "$ca" --cpu-list "$FLOOR_CPUS")
+    local -a args=(--listen "127.0.0.1:$(floor_port "$config")" --cpu-list "$FLOOR_CPUS")
+    if [[ "$config" == N ]]; then
+        args+=(--upstream "http://127.0.0.1:$MOCK_PLAIN_PORT")
+    else
+        args+=(--upstream "https://127.0.0.1:$MOCK_TLS_PORT" --upstream-ca "$ca")
+    fi
     [[ -n "$FLOOR_WORKERS" ]] && args+=(--workers "$FLOOR_WORKERS")
     [[ "$config" == T ]] && args+=(--tls-cert "$certs_dir/server.pem" --tls-key "$certs_dir/server.key")
     start_proc floor "$FLOOR_CPUS" "$run_dir/logs/$tag.floor.log" "$floor" "${args[@]}"
@@ -1011,13 +1148,14 @@ run_arm() {
     mock_reset mock-plain mock-tls
     lg_out="$run_dir/results/$base.json"
     lg_cpus="$LOADGEN_CPUS"
-    local url warmup measure result="$lg_out"
+    local url warmup measure result="$lg_out" lag_limit="$MOCK_WRITE_LAG_LIMIT_US"
     url="$(target_url "$config" "$arm")"
     case "$scen" in
         s1)
             lg_args=(stream "$url" --concurrency "$S1_CONCURRENCY")
             stream_shape
             lg_args+=(--warmup-s "$S1_WARMUP_S" --measure-s "$S1_MEASURE_S")
+            [[ "$arm" == direct ]] && lg_args+=(--max-slip-us "$S1_MAX_SLIP_US")
             warmup="$S1_WARMUP_S" measure="$S1_MEASURE_S"
             ;;
         s2)
@@ -1032,10 +1170,11 @@ run_arm() {
             lg_args=(bigbody "$url" --sizes "$size" --rate "$S3_RATE" --ttft-us "$S3_TTFT_US"
                 --chunks "$S3_CHUNKS" --warmup-s "$S3_WARMUP_S" --measure-s "$S3_MEASURE_S")
             warmup="$S3_WARMUP_S" measure="$S3_MEASURE_S" spin="$S3_SPIN_US"
+            lag_limit="$S3_MOCK_WRITE_LAG_LIMIT_US"
             result="${lg_out%.json}-$size.json"
             ;;
     esac
-    loadgen_common "$arm-$config" "$lg_out" "$rep_seed" "$LOADGEN_CPUS" "$LOADGEN_SHARDS" "$tls" "$spin"
+    loadgen_common "$arm-$config" "$lg_out" "$rep_seed" "$LOADGEN_CPUS" "$LOADGEN_SHARDS" "$tls" "$spin" "$lag_limit"
     lg_args+=(--pair-id "$lg_pair_id")
     execute_run "$scen" "$config" "$arm" "$rep" "$attempt" "$order" "$size" "$tag" "$warmup" "$measure" \
         "$result" mock-plain mock-tls floor loadgen
@@ -1084,7 +1223,7 @@ selfcheck_one() {
     log "selfcheck $config: $SC_CONCURRENCY x 2 streams, mock $SC_MOCK_SHARDS shard(s) on CPUs $SC_MOCK_CPUS, loadgen $SC_LOADGEN_SHARDS shard(s) on $SC_LOADGEN_CPUS"
     start_proc mock-sc "$SC_MOCK_CPUS" "$run_dir/logs/$tag.mock.log" "$mock" serve \
         --listen "127.0.0.1:$SC_PORT" --shards "$SC_MOCK_SHARDS" --cpu-list "$SC_MOCK_CPUS" --spin-us "$SPIN_US" \
-        "${mock_tls[@]}"
+        "${mock_emit_args[@]}" "${mock_tls[@]}"
     wait_ready mock-sc "$scheme://127.0.0.1:$SC_PORT/v1/models" "${curl_ca[@]}"
     fingerprint_proc mock-sc "$tag"
     mock_reset mock-sc
@@ -1332,10 +1471,11 @@ mapfile -t s3_sizes < <(tr ',' '\n' <<<"${S3_SIZES,,}" | sed '/^$/d')
 
 if ((${#scenario_list[@]} > 0)); then
     start_proc mock-plain "$MOCK_CPUS" "$run_dir/logs/mock-plain.log" "$mock" serve \
-        --listen "127.0.0.1:$MOCK_PLAIN_PORT" --shards "$MOCK_SHARDS" --cpu-list "$MOCK_CPUS" --spin-us "$SPIN_US"
+        --listen "127.0.0.1:$MOCK_PLAIN_PORT" --shards "$MOCK_SHARDS" --cpu-list "$MOCK_CPUS" --spin-us "$SPIN_US" \
+        "${mock_emit_args[@]}"
     start_proc mock-tls "$MOCK_CPUS" "$run_dir/logs/mock-tls.log" "$mock" serve \
         --listen "127.0.0.1:$MOCK_TLS_PORT" --shards "$MOCK_SHARDS" --cpu-list "$MOCK_CPUS" --spin-us "$SPIN_US" \
-        --tls-cert "$certs_dir/server.pem" --tls-key "$certs_dir/server.key"
+        "${mock_emit_args[@]}" --tls-cert "$certs_dir/server.pem" --tls-key "$certs_dir/server.key"
     wait_ready mock-plain "http://127.0.0.1:$MOCK_PLAIN_PORT/v1/models"
     wait_ready mock-tls "https://127.0.0.1:$MOCK_TLS_PORT/v1/models" --cacert "$ca"
     fingerprint_proc mock-plain session
