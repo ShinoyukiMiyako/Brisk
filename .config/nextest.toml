@@ -1,0 +1,7 @@
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+# Written to target/nextest/ci/junit.xml; CI turns failures into annotations,
+# which stay readable without signing in to GitHub.
+path = "junit.xml"

@@ -78,7 +78,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: nextest
-        run: cargo nextest run --workspace --locked
+        run: cargo nextest run --workspace --locked --profile ci
+
+      - name: Annotate failed tests
+        if: failure()
+        # Windows runners ship `python`, the others `python3`.
+        run: '"$(command -v python3 || command -v python)" scripts/ci/junit-annotations.py target/nextest/ci/junit.xml'
 
       # nextest does not run doctests.
       - name: doctests
