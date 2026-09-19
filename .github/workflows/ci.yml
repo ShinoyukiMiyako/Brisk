@@ -47,8 +47,11 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Dependency rules (R1)
+      - name: Dependency rules (R1, synchronous brisk-proto)
         run: bash scripts/check-deps.sh
+
+      - name: Hot-path rules (R3, R9, R17, Cow borrow)
+        run: bash scripts/check-hotpath.sh
 
   test:
     name: test (${{ matrix.os }})
