@@ -1,0 +1,30 @@
+[package]
+name = "brisk-loadgen"
+description = "Open-loop HTTP/1.1 load generator for the Brisk benchmarks: streaming SSE, non-streaming and large-body scenarios."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+brisk-bench-core = { workspace = true }
+clap = { workspace = true }
+fastrand = { workspace = true }
+hdrhistogram = { workspace = true }
+httparse = { workspace = true }
+memchr = { workspace = true }
+mio = { workspace = true, features = ["os-poll", "net"] }
+rustls = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
