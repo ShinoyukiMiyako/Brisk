@@ -3,14 +3,8 @@
 //! keeps them for 0.9 s, so a request after 1.0 s or 1.5 s of silence must
 //! never pick a connection the upstream is closing.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::time::Duration;
 

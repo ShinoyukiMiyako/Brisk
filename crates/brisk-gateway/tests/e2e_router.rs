@@ -3,14 +3,8 @@
 //! `/readyz` before and after warm-up, unknown paths, wrong methods and a
 //! Gemini-style path whose `key` query parameter must never be logged.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::time::Duration;
 
@@ -74,8 +68,7 @@ async fn answers(router: RouterKind) -> Vec<Answer> {
         spec.warmup.ready_timeout = Duration::from_secs(30);
         spec.channels
             .push(channel("a", &base_url, StreamUsage::Passthrough));
-    })
-    .await;
+    });
 
     let mut answers = Vec::new();
     let (status, body) = probe(&gateway, "/readyz").await;
@@ -156,11 +149,11 @@ async fn both_routers_answer_identically() {
     ] {
         let (_, actual_status, actual_body) = answer(&axum, label);
         assert_eq!(actual_status.as_u16(), status, "{label}");
-        assert!(actual_body == body, "{label}: {actual_body:?}");
+        assert_eq!(actual_body, body, "{label}");
     }
     let (_, status, body) = answer(&axum, "POST /v1/chat/completions");
     assert_eq!(*status, StatusCode::OK);
-    assert!(*body == stream_ok());
+    assert_eq!(*body, stream_ok());
 
     for label in [
         "GET /v1/chat/completions",

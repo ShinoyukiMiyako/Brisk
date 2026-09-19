@@ -155,13 +155,14 @@ pub(crate) struct TestGateway {
 
 /// Starts a gateway and waits until `/readyz` answers 200.
 pub(crate) async fn start_gateway(customize: impl FnOnce(&mut GatewaySpec)) -> TestGateway {
-    let gateway = start_gateway_unready(customize).await;
+    let gateway = start_gateway_unready(customize);
     gateway.wait_ready(Duration::from_secs(10)).await;
     gateway
 }
 
-/// Starts a gateway without waiting for its first warm-up round.
-pub(crate) async fn start_gateway_unready(customize: impl FnOnce(&mut GatewaySpec)) -> TestGateway {
+/// Starts a gateway without waiting for its first warm-up round. Must run
+/// inside a Tokio runtime, which serves it.
+pub(crate) fn start_gateway_unready(customize: impl FnOnce(&mut GatewaySpec)) -> TestGateway {
     let mut random = [0_u8; KEY_RANDOM_BYTES];
     fastrand::fill(&mut random);
     let key = format_key(&random).into_inner();

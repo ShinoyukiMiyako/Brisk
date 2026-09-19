@@ -3,14 +3,8 @@
 //! allowlist, usage from real CPA shapes, the CPA 401 failover, the CPA 400
 //! pass-through and an in-stream CPA error after commit (CPA-M1-5).
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::time::Duration;
 
@@ -206,7 +200,7 @@ async fn cpa_captures_pass_through_byte_for_byte() {
             let response: Collected = gateway.chat(body.clone()).await;
             let label = format!("{} seed {seed}", case.name);
             assert_eq!(response.status, 200, "{label}");
-            assert!(response.body == case.body, "{label}: body differs");
+            assert_eq!(response.body, case.body, "{label}: body differs");
             assert_downstream_headers(&response.headers, case.stream);
 
             let received = chat_requests(&upstream);
@@ -253,7 +247,7 @@ async fn cpa_bad_key_fails_over_to_the_next_channel() {
 
     let response = gateway.chat(chat_body(TEST_MODEL, true, None)).await;
     assert_eq!(response.status, 200);
-    assert!(response.body == GROK46_XHIGH_SSE);
+    assert_eq!(response.body, GROK46_XHIGH_SSE);
     assert_eq!(chat_requests(&bad).len(), 1);
     assert_eq!(chat_requests(&good).len(), 1);
 
@@ -287,7 +281,7 @@ async fn cpa_bad_request_is_forwarded_without_failover() {
 
     let response = gateway.chat(chat_body(TEST_MODEL, true, None)).await;
     assert_eq!(response.status, 400);
-    assert!(response.body == BOGUS_EFFORT_JSON);
+    assert_eq!(response.body, BOGUS_EFFORT_JSON);
     assert_downstream_headers(&response.headers, false);
     assert_eq!(chat_requests(&second).len(), 0);
 
@@ -352,7 +346,7 @@ async fn cpa_error_after_commit_truncates_without_failover() {
     assert_eq!(response.status(), 200);
     let (received, clean) = collect_until_error(response).await;
     assert!(!clean, "a truncated stream must not end cleanly");
-    assert!(received == sent, "the client sees exactly what CPA sent");
+    assert_eq!(received, sent, "the client sees exactly what CPA sent");
     assert_eq!(chat_requests(&second).len(), 0);
     drop(client);
 

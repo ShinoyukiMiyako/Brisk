@@ -3,14 +3,8 @@
 //! compressed bodies (D29), body limits, head parsing errors, model routing
 //! and `include_usage` injection into a `null` `stream_options`.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::time::Duration;
 
@@ -55,15 +49,43 @@ fn other_key() -> String {
     format_key(&[7_u8; KEY_RANDOM_BYTES]).into_inner()
 }
 
+/// Credential headers of one request, in the order they are sent.
+type Credentials = Vec<(&'static str, String)>;
+
+/// Sends a chat request carrying `credentials` and returns its status and
+/// `error.code`, if any.
+async fn send_with(gateway: &TestGateway, credentials: &Credentials) -> (u16, Option<String>) {
+    let mut request = anonymous();
+    for (header, value) in credentials {
+        request = request.header(*header, value);
+    }
+    let body = full(chat_body(TEST_MODEL, true, None));
+    let response = gateway
+        .h1()
+        .await
+        .send_collect(request.body(body).expect("valid request"))
+        .await;
+    let code = (response.status != 200).then(|| response.error_code());
+    (response.status.as_u16(), code)
+}
+
+async fn statuses(gateway: TestGateway) -> Vec<OutcomeStatus> {
+    let settled = gateway.finish().await;
+    settled
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.status)
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn credentials_are_checked_and_ambiguity_is_rejected() {
+async fn missing_malformed_unknown_and_ambiguous_keys_get_401() {
     let upstream = upstream().await;
     let gateway = gateway_to(&upstream, |_| {}).await;
-    let body = chat_body(TEST_MODEL, true, None);
     let key = gateway.key.clone();
     let bearer = format!("Bearer {key}");
 
-    let rejected: Vec<(&str, Vec<(&str, String)>, RejectReason)> = vec![
+    let rejected: Vec<(&str, Credentials, RejectReason)> = vec![
         ("missing", vec![], RejectReason::MissingKey),
         (
             "malformed",
@@ -85,9 +107,13 @@ async fn credentials_are_checked_and_ambiguity_is_rejected() {
             vec![("authorization", format!("Bearer  {key}"))],
             RejectReason::InvalidKey,
         ),
+        // Trailing whitespace never reaches the gateway: the HTTP/1.1 parser
+        // strips it from field values (RFC 9112, section 5) and HTTP/2
+        // forbids it, so the `auth` unit tests cover it. Trailing bytes
+        // that are not whitespace do arrive.
         (
-            "trailing space",
-            vec![("authorization", format!("Bearer {key} "))],
+            "trailing bytes",
+            vec![("authorization", format!("Bearer {key}x"))],
             RejectReason::InvalidKey,
         ),
         (
@@ -112,7 +138,26 @@ async fn credentials_are_checked_and_ambiguity_is_rejected() {
             RejectReason::InvalidKey,
         ),
     ];
-    let accepted: Vec<(&str, Vec<(&str, String)>)> = vec![
+
+    let mut expected = Vec::new();
+    for (name, credentials, reason) in &rejected {
+        let (status, code) = send_with(&gateway, credentials).await;
+        assert_eq!(status, 401, "{name}");
+        assert_eq!(code.as_deref(), Some("invalid_api_key"), "{name}");
+        expected.push(OutcomeStatus::Rejected(*reason));
+    }
+    assert_eq!(chat_requests(&upstream).len(), 0);
+    assert_eq!(statuses(gateway).await, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_credential_header_authenticates() {
+    let upstream = upstream().await;
+    let gateway = gateway_to(&upstream, |_| {}).await;
+    let key = gateway.key.clone();
+    let bearer = format!("Bearer {key}");
+
+    let accepted: Vec<(&str, Credentials)> = vec![
         ("authorization", vec![("authorization", bearer.clone())]),
         (
             "lowercase bearer",
@@ -128,44 +173,15 @@ async fn credentials_are_checked_and_ambiguity_is_rejected() {
             ],
         ),
     ];
-
-    let mut expected = Vec::new();
-    for (name, headers, reason) in &rejected {
-        let mut request = anonymous();
-        for (header, value) in headers {
-            request = request.header(*header, value);
-        }
-        let response = gateway
-            .h1()
-            .await
-            .send_collect(request.body(full(body.clone())).expect("valid request"))
-            .await;
-        assert_eq!(response.status, 401, "{name}");
-        assert_eq!(response.error_code(), "invalid_api_key", "{name}");
-        expected.push(OutcomeStatus::Rejected(*reason));
-    }
-    for (name, headers) in &accepted {
-        let mut request = anonymous();
-        for (header, value) in headers {
-            request = request.header(*header, value);
-        }
-        let response = gateway
-            .h1()
-            .await
-            .send_collect(request.body(full(body.clone())).expect("valid request"))
-            .await;
-        assert_eq!(response.status, 200, "{name}");
-        expected.push(OutcomeStatus::Completed);
+    for (name, credentials) in &accepted {
+        let (status, _) = send_with(&gateway, credentials).await;
+        assert_eq!(status, 200, "{name}");
     }
     assert_eq!(chat_requests(&upstream).len(), accepted.len());
-
-    let settled = gateway.finish().await;
-    let statuses: Vec<_> = settled
-        .outcomes
-        .iter()
-        .map(|outcome| outcome.status)
-        .collect();
-    assert_eq!(statuses, expected);
+    assert_eq!(
+        statuses(gateway).await,
+        vec![OutcomeStatus::Completed; accepted.len()]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -412,6 +428,7 @@ async fn unusable_heads_get_400() {
     let gateway = gateway_to(&upstream, |_| {}).await;
     let bodies: [&[u8]; 6] = [
         br#"{"model":"grok-4.6(xhigh)","model":"other","messages":[]}"#,
+        // The same key spelled with an escape (`e` is `e`).
         br#"{"model":"grok-4.6(xhigh)","model":"other","messages":[]}"#,
         br#"{"Model":"expensive","model":"grok-4.6(xhigh)","messages":[]}"#,
         br#"{"messages":[{"role":"user","content":"x","model":"grok-4.6(xhigh)"}]}"#,

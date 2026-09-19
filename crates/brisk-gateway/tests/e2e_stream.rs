@@ -3,14 +3,8 @@
 //! stripping (D8), usage settlement, exact upstream framing, model mapping and
 //! the SSE response headers Brisk sets itself.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::net::SocketAddr;
 

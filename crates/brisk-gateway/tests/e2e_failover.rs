@@ -2,14 +2,8 @@
 //! last-attempt replies (D3), the first-event error (D22), reclaiming small
 //! abandoned responses (D26), no failover after commit, and `max_attempts`.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::time::Duration;
 
@@ -53,6 +47,10 @@ enum Failure {
     EmptyStream,
     /// 200 SSE whose first event exceeds 1 MiB (D17).
     OversizedEvent,
+    /// 200 SSE whose body breaks off inside its first event.
+    BrokenStream,
+    /// 200 SSE head, then nothing until the first-byte deadline.
+    SilentStream,
 }
 
 const FAILURES: &[Failure] = &[
@@ -71,7 +69,13 @@ const FAILURES: &[Failure] = &[
     Failure::FirstEventErrorString,
     Failure::EmptyStream,
     Failure::OversizedEvent,
+    Failure::BrokenStream,
+    Failure::SilentStream,
 ];
+
+/// The start of a content event, cut before its terminating blank line.
+const PARTIAL_EVENT: &[u8] =
+    b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"po";
 
 fn oversized_event() -> Bytes {
     let mut event = b"data: \"".to_vec();
@@ -121,28 +125,40 @@ impl FailingUpstream {
                 frames: vec![(Duration::ZERO, oversized_event())],
                 end: SseEnd::Hang,
             },
+            Failure::BrokenStream => Reply::Sse {
+                head_delay: Duration::ZERO,
+                headers: sse_headers(),
+                frames: vec![(Duration::ZERO, Bytes::from_static(PARTIAL_EVENT))],
+                end: SseEnd::Close,
+            },
+            Failure::SilentStream => Reply::Sse {
+                head_delay: Duration::ZERO,
+                headers: sse_headers(),
+                frames: Vec::new(),
+                end: SseEnd::Hang,
+            },
         };
-        match failure {
-            Failure::Refused => Self {
+        if let Failure::Refused = failure {
+            return Self {
                 upstream: None,
                 third,
                 base_url: refused_base_url(),
-            },
-            _ => {
-                let upstream = ScriptedUpstream::start(chat_only(script)).await;
-                let base_url = upstream.base_url();
-                Self {
-                    upstream: Some(upstream),
-                    third,
-                    base_url,
-                }
-            }
+            };
+        }
+        let upstream = ScriptedUpstream::start(chat_only(script)).await;
+        let base_url = upstream.base_url();
+        Self {
+            upstream: Some(upstream),
+            third,
+            base_url,
         }
     }
 
     fn channel(&self, failure: Failure) -> ChannelSpec {
         let mut spec = channel("failing", &self.base_url, StreamUsage::Passthrough);
-        if matches!(failure, Failure::Hang) {
+        if matches!(failure, Failure::Hang | Failure::SilentStream) {
+            // Below the default 2 s `commit_hold`, so the first-byte
+            // deadline ends the commit window.
             spec.timeouts.first_byte = SHORT_FIRST_BYTE;
         }
         spec
@@ -175,7 +191,7 @@ async fn every_pre_commit_failure_fails_over_to_the_next_channel() {
 
         let response = gateway.chat(chat_body(TEST_MODEL, true, None)).await;
         assert_eq!(response.status, 200, "{failure:?}");
-        assert!(response.body == stream_ok(), "{failure:?}");
+        assert_eq!(response.body, stream_ok(), "{failure:?}");
         let expected_first = usize::from(!matches!(failure, Failure::Refused));
         assert_eq!(failing.chat_count(), expected_first, "{failure:?}");
         assert_eq!(chat_requests(&healthy).len(), 1, "{failure:?}");
@@ -211,7 +227,9 @@ fn last_attempt(failure: Failure) -> LastAttempt {
             code: "upstream_unreachable",
             class: FailureClass::Connect,
         },
-        Failure::Reset => Generated {
+        // A reset before the head and a body broken before the first event
+        // are both transport failures (2.3).
+        Failure::Reset | Failure::BrokenStream => Generated {
             status: 502,
             code: "upstream_unreachable",
             class: FailureClass::Transport,
@@ -232,7 +250,8 @@ fn last_attempt(failure: Failure) -> LastAttempt {
             class: FailureClass::Status,
         },
         Failure::Status(status) => Forwarded { status },
-        Failure::Hang => Generated {
+        // No head, or a head without data, by the first-byte deadline.
+        Failure::Hang | Failure::SilentStream => Generated {
             status: 504,
             code: "upstream_timeout",
             class: FailureClass::FirstByteTimeout,
@@ -295,9 +314,9 @@ async fn the_last_attempt_answers_per_section_2_3() {
                         Failure::FirstEventErrorObject => FIRST_EVENT_ERROR_OBJECT,
                         _ => FIRST_EVENT_ERROR_STRING,
                     };
-                    assert!(response.body == [expected, DONE_EVENT].concat());
+                    assert_eq!(response.body, [expected, DONE_EVENT].concat());
                 } else {
-                    assert!(response.body == UPSTREAM_ERROR_BODY, "{failure:?}");
+                    assert_eq!(response.body, UPSTREAM_ERROR_BODY, "{failure:?}");
                 }
                 OutcomeStatus::ForwardedError { status }
             }
@@ -406,7 +425,7 @@ async fn a_failure_after_commit_never_fails_over() {
     assert_eq!(response.status(), 200);
     let (received, clean) = collect_until_error(response).await;
     assert!(!clean);
-    assert!(received == CONTENT_EVENT);
+    assert_eq!(received, CONTENT_EVENT);
     assert_eq!(chat_requests(&second).len(), 0);
     drop(client);
 
@@ -434,7 +453,7 @@ async fn one_attempt_means_no_failover() {
 
     let response = gateway.chat(chat_body(TEST_MODEL, true, None)).await;
     assert_eq!(response.status, 503);
-    assert!(response.body == UPSTREAM_ERROR_BODY);
+    assert_eq!(response.body, UPSTREAM_ERROR_BODY);
     assert_eq!(chat_requests(&first).len(), 1);
     assert_eq!(chat_requests(&second).len(), 0);
 

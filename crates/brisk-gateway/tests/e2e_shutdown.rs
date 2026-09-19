@@ -2,14 +2,8 @@
 //! streams finish within the grace period, and streams that outlive it are
 //! aborted with a `ShutdownAborted` outcome.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -123,7 +117,7 @@ async fn streams_outliving_the_grace_period_are_aborted() {
     gateway.begin_shutdown();
     let (received, clean) = collect_until_error(response).await;
     assert!(!clean, "an aborted stream does not end cleanly");
-    assert!(received == CONTENT_EVENT);
+    assert_eq!(received, CONTENT_EVENT);
     drop(client);
 
     let settled = gateway.finish().await;

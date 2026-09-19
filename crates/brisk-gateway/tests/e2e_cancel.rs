@@ -4,14 +4,8 @@
 //! (D21), and a drain that runs out of time. Every case checks that the
 //! upstream connection closes promptly after the client left.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::time::Duration;
 
@@ -207,7 +201,7 @@ async fn leaving_between_finish_and_usage_drains_the_usage() {
             )
         }))
         .await;
-        let gateway = gateway_for(&upstream, |_| {}).await;
+        let mut gateway = gateway_for(&upstream, |_| {}).await;
 
         let mut client = gateway.client(protocol).await;
         let response = client
@@ -217,6 +211,10 @@ async fn leaving_between_finish_and_usage_drains_the_usage() {
         read_until(&mut body, FINISH_EVENT).await;
         drop(body);
         client.close();
+        // The drain settles once the usage arrives. Shutting down before the
+        // gateway has even seen the client leave would turn the drop into
+        // `ShutdownAborted` (2.7, rule 2), so wait for the settlement first.
+        gateway.next_outcome(Duration::from_secs(5)).await;
 
         let outcome = only_outcome(gateway).await;
         assert_eq!(outcome.status, OutcomeStatus::Drained, "{protocol:?}");

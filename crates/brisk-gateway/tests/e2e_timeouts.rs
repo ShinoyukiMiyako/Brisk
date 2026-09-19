@@ -1,16 +1,11 @@
 //! The upstream deadlines of section 2.8 with shortened values: first byte
 //! before the response head, the CPA shape where head and first chunk arrive
 //! together (CPA-M1-3), first byte after a `commit_hold` commit, idle time
-//! between chunks, and SSE comments resetting the idle clock (04, 8.4).
+//! between chunks, SSE comments resetting the idle clock (04, 8.4), and the
+//! bound on what the commit window holds.
 
-// Not built until the scripted upstream (P2-SUPPORT) and `Gateway`
-// (P5-GATEWAY) are merged into m1/integration; the integrator removes this
-// attribute and the `rustfmt::skip` on `mod scripted` at that checkpoint.
-#![cfg(any())]
-
-#[rustfmt::skip]
-mod scripted;
 mod e2e_support;
+mod scripted;
 
 use std::time::Duration;
 
@@ -82,7 +77,7 @@ async fn a_late_head_with_its_first_chunk_completes() {
 
     let response = gateway.chat(chat_body(TEST_MODEL, true, None)).await;
     assert_eq!(response.status, 200);
-    assert!(response.body == stream_ok());
+    assert_eq!(response.body, stream_ok());
     let settled = gateway.finish().await;
     assert_eq!(settled.only().status, OutcomeStatus::Completed);
 }
@@ -152,7 +147,7 @@ async fn silence_after_the_first_chunk_is_an_idle_timeout() {
     let (received, clean) = collect_until_error(response).await;
     let ended = started.elapsed();
     assert!(!clean);
-    assert!(received == CONTENT_EVENT);
+    assert_eq!(received, CONTENT_EVENT);
     // D15: the timeout lands in [idle, 1.25 x idle) after the last byte;
     // the upper side gets slack for scheduling on a loaded test machine.
     assert!(ended >= IDLE, "{ended:?}");
@@ -204,4 +199,47 @@ async fn keep_alive_comments_reset_the_idle_clock() {
     assert!(response.body.ends_with(DONE_EVENT));
     let settled = gateway.finish().await;
     assert_eq!(settled.only().status, OutcomeStatus::Completed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_comment_flood_before_the_first_data_event_commits_early() {
+    // Five comment events of 512 KiB each: every event is within the 1 MiB
+    // limit, together they exceed what the commit window holds.
+    let mut comment = b": ".to_vec();
+    comment.resize(512 << 10, b'x');
+    comment.extend_from_slice(b"\n\n");
+    let comment = Bytes::from(comment);
+    let upstream = ScriptedUpstream::start(chat_only(move |_, _| Reply::Sse {
+        head_delay: Duration::ZERO,
+        headers: sse_headers(),
+        frames: (0..5).map(|_| (Duration::ZERO, comment.clone())).collect(),
+        end: SseEnd::Hang,
+    }))
+    .await;
+    let mut gateway = gateway_with(
+        &upstream,
+        Timeouts {
+            commit_hold: Duration::from_secs(60),
+            ..Timeouts::default()
+        },
+    )
+    .await;
+
+    let started = Instant::now();
+    let mut client = gateway.h1().await;
+    let response = client
+        .send(gateway.chat_with(chat_body(TEST_MODEL, true, None)))
+        .await;
+    assert_eq!(response.status(), 200);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "committed without waiting for commit_hold"
+    );
+    drop(response);
+    client.close();
+    // Settled by the body's drop once the gateway sees the client leave.
+    let outcome = gateway.next_outcome(Duration::from_secs(5)).await;
+    assert_eq!(outcome.status, OutcomeStatus::ClientCancelled);
+    assert_eq!(outcome.http_status, Some(200));
+    gateway.finish().await;
 }
