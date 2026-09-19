@@ -4,3 +4,7 @@
 //!
 //! It is a library so that the configuration and live upstream tests drive
 //! exactly the code the binary runs.
+
+#![forbid(unsafe_code)]
+
+pub mod config;
