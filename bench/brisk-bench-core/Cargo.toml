@@ -1,0 +1,32 @@
+[package]
+name = "brisk-bench-core"
+description = "Shared low-level building blocks for the Brisk benchmark tools (mock, loadgen)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+base64 = { workspace = true }
+fastrand = { workspace = true }
+hdrhistogram = { workspace = true, features = ["serialization"] }
+httparse = { workspace = true }
+libc = { workspace = true }
+memchr = { workspace = true }
+mio = { workspace = true, features = ["os-poll", "os-ext", "net"] }
+rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
+rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pki-types = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+socket2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
