@@ -4,7 +4,9 @@
 //! redirects and never reads proxy settings from the environment (R24), and has
 //! no whole-request or read timeout because streamed responses may legitimately
 //! stay open for minutes (R13). Plain `http://` upstreams are fully supported,
-//! which is what `CLIProxyAPI` (CPA) exposes on the internal network.
+//! which is what `CLIProxyAPI` (CPA) exposes on the internal network. Host
+//! names resolve through [`SafeResolver`], which drops addresses outside the
+//! channel's address policy (R25).
 
 use std::time::Duration;
 
@@ -13,6 +15,7 @@ use reqwest::{Certificate, Client};
 use rustls_pki_types::CertificateDer;
 use tokio_rustls::rustls;
 
+use super::resolver::SafeResolver;
 use crate::net;
 
 /// Settings for [`build_client`].
@@ -80,7 +83,12 @@ pub enum UpstreamError {
 /// - no proxy, including none picked up from `HTTP_PROXY` and friends;
 /// - `TCP_NODELAY` on every upstream socket;
 /// - no global timeout and no read timeout;
-/// - `extra_root_certs` are trusted in addition to the platform roots.
+/// - `extra_root_certs` are trusted in addition to the platform roots;
+/// - host names resolve through [`SafeResolver`], so a name that resolves
+///   only to denied addresses (or to private ones without
+///   [`allow_private`](UpstreamClientConfig::allow_private)) fails to
+///   connect. IP-literal hosts bypass every resolver; they are checked when
+///   the base URL is validated.
 ///
 /// reqwest itself adds a default `Accept: */*` request header that cannot be
 /// removed at this layer; forwarding code must account for it.
@@ -100,7 +108,8 @@ pub fn build_client(config: &UpstreamClientConfig) -> Result<Client, UpstreamErr
         .tcp_keepalive(config.tcp_keepalive)
         .connect_timeout(config.connect_timeout)
         .pool_idle_timeout(config.pool_idle_timeout)
-        .tls_certs_merge(extra_roots);
+        .tls_certs_merge(extra_roots)
+        .dns_resolver(SafeResolver::new(config.allow_private));
     net::apply_tcp_user_timeout(builder, config.tcp_user_timeout)
         .build()
         .map_err(UpstreamError::Build)
