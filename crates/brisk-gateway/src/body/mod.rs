@@ -3,18 +3,52 @@
 //! usage from non-streaming responses, and the settlement that runs when a
 //! committed response ends, fails or is dropped (R6, R7, R9, R14, R15). Also
 //! the rewritten upstream request body.
+//!
+//! Every committed body emits exactly one `Outcome`, at EOF, on an error or
+//! on drop, whichever comes first.
+//!
+//! A body settles as soon as its upstream reports `is_end_stream()` after a
+//! frame, before returning that frame: hyper stops polling a body whose
+//! `Content-Length` has been written and drops it without ever seeing
+//! `None`, which would otherwise read as a client that left.
 
+mod chunk;
 mod idle;
+mod passthrough;
 mod settle;
 mod splice;
 
 use std::pin::Pin;
 use std::time::Duration;
 
+use brisk_proto::sse::SseError;
 use bytes::Bytes;
 
+use crate::BoxError;
+
+pub use passthrough::{PassthroughBody, StreamPlan};
 pub use settle::{DrainLimits, SettleCtx, SettleShared};
 pub use splice::SpliceBody;
+
+/// Why a committed response body ended early. The response has already
+/// been committed, so the error ends the downstream stream: h1 closes the
+/// connection without the terminating chunk, h2 resets the stream (D5).
+#[derive(Debug, thiserror::Error)]
+pub enum BodyError {
+    /// The upstream body failed; the error has passed through
+    /// [`scrub_error`](crate::secret::scrub_error).
+    #[error("upstream body failed")]
+    Upstream(#[source] BoxError),
+    /// No upstream byte for the idle timeout.
+    #[error("upstream idle for longer than {0:?}")]
+    Idle(Duration),
+    /// Committed before the first body byte, which then missed its deadline.
+    #[error("no upstream byte before the first-byte deadline")]
+    FirstByte,
+    /// An SSE event exceeded [`MAX_EVENT_BYTES`](brisk_proto::sse::MAX_EVENT_BYTES).
+    #[error("upstream SSE framing")]
+    Protocol(#[source] SseError),
+}
 
 /// Timing handed from `forward` to the committed body.
 #[derive(Debug)]

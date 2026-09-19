@@ -6,7 +6,9 @@
 //! fires once per period (`idle / 4`); a period in which no byte arrived is
 //! silent, and four silent periods in a row end the stream. The last byte
 //! therefore lies at most one period before the start of the silent run, and
-//! the timeout fires within `[idle, 1.25 * idle)` of it.
+//! the timeout fires within `[idle, 1.25 * idle)` of it; exactly
+//! `1.25 * idle` only for a byte that arrives at the very instant a period
+//! begins, such as the instant of commit on a paused test clock.
 
 use std::future::Future;
 use std::task::{Context, Poll};

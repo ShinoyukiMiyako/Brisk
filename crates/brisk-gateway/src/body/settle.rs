@@ -10,9 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use brisk_proto::{UsageErrorKind, UsageTokens};
+use bytes::Bytes;
+use http_body::Body;
+use http_body_util::BodyExt;
 use tokio::runtime::Handle;
 use tokio::time::Instant;
 
+use super::HeldFrames;
+use super::chunk::StreamScan;
 use crate::budget::ByteBudget;
 use crate::outcome::{self, Outcome, OutcomeSink, OutcomeStatus, SettleInput};
 use crate::spec::{ChannelId, KeyId};
@@ -146,6 +151,65 @@ impl SettleShared {
             Err(_) => DropPlan::Cancelled,
         }
     }
+}
+
+/// The bounded drain of section 2.7, rule 3: the client left after
+/// `finish_reason` but before a final usage. Reads on without forwarding,
+/// first the frames still `held` from before commit, then the upstream,
+/// until `[DONE]`, EOF, an error, `drain.max_bytes` or `drain.timeout`,
+/// whichever comes first; then settles as `Drained` if a usage arrived and
+/// as `ClientCancelled` otherwise. `response_bytes` were sent before the
+/// client left.
+pub(crate) async fn drain<B>(
+    mut upstream: B,
+    mut held: HeldFrames,
+    mut scan: StreamScan,
+    ctx: SettleCtx,
+    response_bytes: u64,
+) where
+    B: Body<Data = Bytes> + Unpin,
+{
+    let limits = ctx.shared.drain;
+    let read = async {
+        let mut read: u64 = 0;
+        while !scan.facts.done && read < u64::from(limits.max_bytes) {
+            let data = if let Some(frame) = held.pop_front() {
+                frame
+            } else {
+                let next = upstream.frame().await;
+                match next {
+                    Some(Ok(frame)) => match frame.into_data() {
+                        Ok(data) => data,
+                        Err(_trailers) => continue,
+                    },
+                    Some(Err(_)) | None => break,
+                }
+            };
+            read += data.len() as u64;
+            if scan.scan(&data).is_err() {
+                break;
+            }
+        }
+    };
+    // Running out of time ends the drain the way running out of bytes does;
+    // either way the settlement below decides from what was read.
+    let _elapsed = tokio::time::timeout(limits.timeout, read).await;
+
+    // The drain starts only after `finish_reason`, so any usage it read is
+    // final (D21), and none was final before it started.
+    let facts = &scan.facts;
+    let status = if facts.usage_final {
+        OutcomeStatus::Drained
+    } else {
+        OutcomeStatus::ClientCancelled
+    };
+    ctx.settle(Ending {
+        status,
+        usage: facts.usage.get(),
+        usage_final: facts.usage_final,
+        usage_error: facts.usage_error,
+        response_bytes,
+    });
 }
 
 #[cfg(test)]
