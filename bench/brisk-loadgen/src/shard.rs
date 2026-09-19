@@ -49,6 +49,7 @@ use mio::{Events, Poll, Token};
 use rustls::pki_types::ServerName;
 use serde::Serialize;
 
+use crate::diagnostics::{self, Miss};
 use crate::request::RequestTemplate;
 use crate::response::{Completion, Expect, ResponseParser};
 use crate::schedule::{
@@ -255,6 +256,8 @@ pub(crate) struct ShardOutput {
     pub(crate) counters: Counters,
     /// Clock steps detected by the realtime offset.
     pub(crate) clock_steps: u64,
+    /// Deadline misses, fresh connections and request slip per interval.
+    pub(crate) diagnostics: diagnostics::Intervals,
     /// When the shard stopped.
     pub(crate) end_ns: u64,
 }
@@ -279,6 +282,9 @@ struct Request {
     chunks: u32,
     step: u32,
     retried: bool,
+    /// The current attempt went out on a newly opened connection, so its
+    /// latencies include the handshake.
+    fresh: bool,
     /// Markers received so far.
     markers: u32,
     /// `t_sched` of the last marker received, on the mock's clock.
@@ -473,6 +479,11 @@ struct Shard {
     rx: Vec<u8>,
     counters: Counters,
     censored: Censored,
+    diagnostics: diagnostics::Recorder,
+    /// When the event loop last started waiting.
+    wait_started_ns: u64,
+    /// When the event loop last returned from its wait.
+    woke_ns: u64,
     live: Arc<Live>,
     ramp: Option<RampTracker>,
 }
@@ -511,6 +522,9 @@ impl Shard {
             rx: Vec::with_capacity(brisk_bench_core::transport::DEFAULT_READ_SIZE),
             counters: Counters::default(),
             censored: Censored::default(),
+            diagnostics: diagnostics::Recorder::new(spec.origin_ns),
+            wait_started_ns: 0,
+            woke_ns: 0,
             live: spec.live,
             ramp: spec.ramp.map(|spec| RampTracker {
                 spec,
@@ -544,7 +558,10 @@ impl Shard {
                 .timer
                 .poll_timeout(now, precise)
                 .map_or(coarse_wait, |t| t.min(coarse_wait));
-            match self.poll.poll(&mut events, Some(timeout)) {
+            self.wait_started_ns = now_ns();
+            let polled = self.poll.poll(&mut events, Some(timeout));
+            self.woke_ns = now_ns();
+            match polled {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
@@ -576,24 +593,44 @@ impl Shard {
     /// Spins to the next scheduled send and fires every due arrival once
     /// the next one is within the spin window.
     fn fire_if_due(&mut self) -> io::Result<()> {
+        let reached = now_ns();
         if let Some(arrival) = self.next
-            && self.timer.is_due(now_ns(), arrival.sched_ns)
+            && self.timer.is_due(reached, arrival.sched_ns)
         {
             self.timer.spin_until(arrival.sched_ns);
-            self.fire_due()?;
+            self.fire_due(reached)?;
         }
         Ok(())
     }
 
-    fn fire_due(&mut self) -> io::Result<()> {
+    /// Fires every due arrival; `reached` is when the loop found the first
+    /// one due.
+    fn fire_due(&mut self, reached: u64) -> io::Result<()> {
         while let Some(arrival) = self.next {
             if arrival.sched_ns > now_ns() {
                 break;
+            }
+            if arrival.sched_ns < reached {
+                self.deadline_missed(arrival.sched_ns, reached);
             }
             self.fire(arrival)?;
             self.next = self.schedule.next_arrival();
         }
         Ok(())
+    }
+
+    /// Classifies a send whose deadline `sched_ns` passed before the loop
+    /// reached it at `reached`: a deadline between the start and the end of
+    /// the last wait means the wake-up came late, anything else that the
+    /// loop was busy.
+    fn deadline_missed(&mut self, sched_ns: u64, reached: u64) {
+        let miss = if (self.wait_started_ns..self.woke_ns).contains(&sched_ns) {
+            Miss::LateWakeup
+        } else {
+            Miss::BusyLoop
+        };
+        self.diagnostics
+            .deadline_missed(reached, reached - sched_ns, miss);
     }
 
     fn fire(&mut self, arrival: Arrival) -> io::Result<()> {
@@ -604,6 +641,7 @@ impl Shard {
             chunks: arrival.chunks,
             step: arrival.step,
             retried: false,
+            fresh: false,
             markers: 0,
             last_marker_sched: 0,
         };
@@ -651,6 +689,7 @@ impl Shard {
         self.recorder
             .record_span(Metric::EmitLag, t_emit, request.sched_ns, t_emit);
         request.sent_ns = t_emit;
+        request.fresh = false;
         if written.is_err() {
             // Nothing was in flight: the peer dropped the idle connection.
             self.close(idx);
@@ -678,12 +717,14 @@ impl Shard {
                 .record_span(Metric::EmitLag, t_emit, request.sched_ns, t_emit);
         }
         request.sent_ns = t_emit;
+        request.fresh = true;
         let Ok(mut conn) = connected else {
             self.record_error(t_emit, "connect");
             self.finish_request(request, None);
             return Ok(());
         };
         self.counters.connections_opened += 1;
+        self.diagnostics.fresh_send(t_emit);
         conn.enable_rx_timestamps()?;
         if conn
             .write(self.template.render(request.sid, request.chunks))
@@ -765,12 +806,16 @@ impl Shard {
         let Self {
             slab,
             recorder,
+            diagnostics,
             rx,
             chunks_total,
             mode,
             ..
         } = self;
-        let streaming = matches!(mode, Mode::Stream { .. });
+        let (streaming, ttft_ns) = match *mode {
+            Mode::Stream { ttft_ns, .. } => (true, ttft_ns),
+            Mode::Whole { ttft_ns, .. } => (false, ttft_ns),
+        };
         let entry = slab.get_mut(idx).expect("caller checked the entry");
         let Connection {
             parser, request, ..
@@ -789,7 +834,18 @@ impl Shard {
                 *chunks_total += 1;
                 if request.markers == 0 {
                     recorder.record_span(Metric::Ttft, t_recv, request.sched_ns, t_recv);
+                    if request.fresh {
+                        diagnostics.fresh_ttft(t_recv, t_recv.saturating_sub(request.sched_ns));
+                    }
                 }
+            }
+            // A fresh connection's handshake would count as slip.
+            if request.markers == 0 && !request.fresh {
+                diagnostics.request_slip(
+                    t_recv,
+                    request.sent_ns,
+                    marker.t_sched.saturating_sub(ttft_ns),
+                );
             }
             request.markers += 1;
             request.last_marker_sched = marker.t_sched;
@@ -1066,6 +1122,7 @@ impl Shard {
             planned: self.planned.map(|(planned, ..)| planned.finish()),
             counters: self.counters,
             clock_steps: self.offset.steps(),
+            diagnostics: self.diagnostics.finish(),
             end_ns,
         })
     }

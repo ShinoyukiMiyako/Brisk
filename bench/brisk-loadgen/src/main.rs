@@ -15,6 +15,7 @@
 
 mod cli;
 mod compare;
+mod diagnostics;
 mod output;
 mod report;
 mod request;

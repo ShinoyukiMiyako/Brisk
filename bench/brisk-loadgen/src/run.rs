@@ -22,6 +22,7 @@ use serde::Serialize;
 use crate::cli::{
     BigbodyCmd, CommonArgs, CpuSet, NonstreamCmd, SelfcheckCmd, StreamCmd, StreamShape,
 };
+use crate::diagnostics::{self, Diagnostics};
 use crate::output::{self, Extension};
 use crate::report;
 use crate::request::{BodySpec, RequestSpec, RequestTemplate};
@@ -115,6 +116,7 @@ impl Setup {
         common: &CommonArgs,
         template: &RequestTemplate,
         outcome: &PhaseOutcome,
+        warmup_intervals: u64,
     ) -> Extension {
         Extension {
             version: env!("CARGO_PKG_VERSION"),
@@ -128,6 +130,7 @@ impl Setup {
             duration_s: seconds(outcome.end_ns.saturating_sub(outcome.origin_ns)),
             counters: outcome.counters,
             clock_steps: outcome.clock_steps,
+            diagnostics: Diagnostics::summarize(&outcome.diagnostics, warmup_intervals),
             stream_plan: None,
             load_check: None,
             planned: None,
@@ -207,6 +210,7 @@ struct PhaseOutcome {
     planned: Option<Vec<PlannedInterval>>,
     counters: Counters,
     clock_steps: u64,
+    diagnostics: diagnostics::Intervals,
     ramp: Option<RampOutcome>,
 }
 
@@ -267,6 +271,7 @@ fn run_phase(
     let mut planned = Vec::new();
     let mut counters = Counters::default();
     let mut clock_steps = 0;
+    let mut diagnostics = diagnostics::Intervals::new();
     let mut actual_end = origin_ns;
     for (index, handle) in handles.into_iter().enumerate() {
         let output = handle
@@ -277,6 +282,7 @@ fn run_phase(
         planned.extend(output.planned);
         counters.add(&output.counters);
         clock_steps += output.clock_steps;
+        diagnostics::merge_into(&mut diagnostics, output.diagnostics);
         actual_end = actual_end.max(output.end_ns);
     }
     let ramp = ramp.map(|mut coordinator| {
@@ -293,6 +299,7 @@ fn run_phase(
         planned: (!planned.is_empty()).then(|| merge_planned(planned)),
         counters,
         clock_steps,
+        diagnostics,
         ramp,
     })
 }
@@ -598,6 +605,7 @@ fn run_streams(
     let mut run = build_result(scenario, common, params, warmup_s, &outcome)?;
     let planned = outcome.planned.clone().unwrap_or_default();
     let load = validity::check_load(&run.intervals, &planned, warmup_s, concurrency);
+    let mut extension = setup.extension(common, &template, &outcome, warmup_s);
     run.validity = validity::evaluate(&Evidence {
         intervals: &run.intervals,
         warmup_intervals: warmup_s,
@@ -605,9 +613,9 @@ fn run_streams(
         clock_steps: outcome.clock_steps,
         load: Some(&load),
         counters: &outcome.counters,
+        diagnostics: &extension.diagnostics,
         markers_expected: true,
     });
-    let mut extension = setup.extension(common, &template, &outcome);
     extension.stream_plan = Some(plan);
     extension.load_check = Some(load);
     extension.planned = Some(planned);
@@ -631,7 +639,7 @@ fn finish_run(common: &CommonArgs, run: &RunResult, extension: &Extension) -> an
 
 /// `stream` (S1).
 pub(crate) fn stream(cmd: &StreamCmd) -> anyhow::Result<()> {
-    let (run, extension) = run_streams(
+    let (mut run, extension) = run_streams(
         &cmd.common,
         &cmd.shape,
         cmd.shape.concurrency,
@@ -640,6 +648,13 @@ pub(crate) fn stream(cmd: &StreamCmd) -> anyhow::Result<()> {
         "stream",
         params_of(cmd)?,
     )?;
+    if let Some(limit_us) = cmd.max_slip_us {
+        validity::check_slip(
+            &mut run.validity,
+            &extension.diagnostics,
+            limit_us.saturating_mul(1_000),
+        );
+    }
     finish_run(&cmd.common, &run, &extension)
 }
 
@@ -664,7 +679,13 @@ pub(crate) fn selfcheck(cmd: &SelfcheckCmd) -> anyhow::Result<()> {
         .load_check
         .as_ref()
         .expect("stream runs carry a load check");
-    let verdict = validity::selfcheck(&run.summary, load, &run.validity);
+    let verdict = validity::selfcheck(&validity::SelfcheckEvidence {
+        summary: &run.summary,
+        load,
+        diagnostics: &extension.diagnostics,
+        slip_limit_ns: cmd.max_slip_us.saturating_mul(1_000),
+        validity: &run.validity,
+    });
     extension.selfcheck = Some(verdict.clone());
     finish_run(&cmd.common, &run, &extension)?;
     report::print_selfcheck(&verdict, cmd.shape.concurrency, doubled);
@@ -834,6 +855,7 @@ pub(crate) fn nonstream(cmd: &NonstreamCmd) -> anyhow::Result<()> {
         "nonstream"
     };
     let mut run = build_result(scenario, common, params_of(cmd)?, cmd.warmup_s, &outcome)?;
+    let mut extension = setup.extension(common, &template, &outcome, cmd.warmup_s);
     run.validity = validity::evaluate(&Evidence {
         intervals: &run.intervals,
         warmup_intervals: cmd.warmup_s,
@@ -841,9 +863,9 @@ pub(crate) fn nonstream(cmd: &NonstreamCmd) -> anyhow::Result<()> {
         clock_steps: outcome.clock_steps,
         load: None,
         counters: &outcome.counters,
+        diagnostics: &extension.diagnostics,
         markers_expected,
     });
-    let mut extension = setup.extension(common, &template, &outcome);
     extension.ramp.clone_from(&outcome.ramp);
     finish_run(common, &run, &extension)
 }
@@ -924,6 +946,7 @@ pub(crate) fn bigbody(cmd: &BigbodyCmd) -> anyhow::Result<()> {
         )?;
         let scenario = format!("bigbody-{}", size.label);
         let mut run = build_result(&scenario, &sized, params.clone(), cmd.warmup_s, &outcome)?;
+        let mut extension = setup.extension(&sized, &template, &outcome, cmd.warmup_s);
         run.validity = validity::evaluate(&Evidence {
             intervals: &run.intervals,
             warmup_intervals: cmd.warmup_s,
@@ -931,9 +954,9 @@ pub(crate) fn bigbody(cmd: &BigbodyCmd) -> anyhow::Result<()> {
             clock_steps: outcome.clock_steps,
             load: None,
             counters: &outcome.counters,
+            diagnostics: &extension.diagnostics,
             markers_expected: true,
         });
-        let mut extension = setup.extension(&sized, &template, &outcome);
         extension.body_size = Some(size.clone());
         finish_run(&sized, &run, &extension)?;
     }

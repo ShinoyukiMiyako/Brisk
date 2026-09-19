@@ -33,12 +33,24 @@
 //!   and the per-second load check cannot see it: sampling and sending share
 //!   the event loop, so a stall delays both alike. The p99.9 bound tolerates
 //!   the odd scheduler hiccup while catching a lag that reaches the compared
-//!   tail;
+//!   tail. The reason names the likely cause from the deadline misses of
+//!   [`Diagnostics`]: sends the loop reached late call for a longer spin
+//!   window, lag without misses for a quieter CPU;
 //! - on Linux, a receive without a kernel timestamp: the contract requires
 //!   `SO_TIMESTAMPNS` for every receive, and the fallback clock would add
 //!   the event loop's latency to every span;
 //! - more than 0.1% of the recorded spans negative: the clock conversion is
-//!   off, and those spans were recorded as 0.
+//!   off, and those spans were recorded as 0;
+//! - on request (`--max-slip-us`, always in `selfcheck`), a request slip
+//!   p99 at or above the limit: the mock's inbound path queues requests, and
+//!   TTFT measures the mock instead of the target. Mock write lag cannot see
+//!   this, and neither can the load check: a longer TTFT stretches a
+//!   stream's life by a tiny fraction only.
+//!
+//! The p99 rules apply however few samples there are. With the 600 sends of
+//! a short S3 run the p99 is the sixth largest value, so a handful of
+//! outliers decides it; the reason states the sample count, and the remedy
+//! is a longer run, not a laxer rule that would pass for lack of evidence.
 
 use std::collections::BTreeMap;
 
@@ -46,6 +58,7 @@ use brisk_bench_core::result::{IntervalResult, MetricSummary, Validity};
 use brisk_bench_core::stats::Metric;
 use serde::Serialize;
 
+use crate::diagnostics::Diagnostics;
 use crate::schedule::{PlannedInterval, SEC_NS};
 use crate::shard::{Counters, STALE_RETRY};
 
@@ -225,6 +238,8 @@ pub(crate) struct Evidence<'a> {
     pub(crate) load: Option<&'a LoadCheck>,
     /// Transport counters of the whole run.
     pub(crate) counters: &'a Counters,
+    /// Post-warmup diagnostics.
+    pub(crate) diagnostics: &'a Diagnostics,
     /// Successful responses carry mock timestamp markers.
     pub(crate) markers_expected: bool,
 }
@@ -258,18 +273,25 @@ pub(crate) fn evaluate(evidence: &Evidence<'_>) -> Validity {
         _ => {}
     }
     if let Some(lag) = evidence.summary.get(&Metric::EmitLag) {
+        let cause = || emit_lag_cause(evidence.diagnostics, lag.count);
         if lag.p99_ns >= LAG_P99_LIMIT_NS {
             validity.invalidate(format!(
-                "emit lag p99 {:.1} us is not below {:.1} us: the load generator fell behind its schedule",
+                "emit lag p99 {:.1} us over {} sends is not below {:.1} us: \
+                 the load generator fell behind its schedule; {}",
                 micros(lag.p99_ns),
-                micros(LAG_P99_LIMIT_NS)
+                lag.count,
+                micros(LAG_P99_LIMIT_NS),
+                cause()
             ));
         }
         if lag.p999_ns >= EMIT_LAG_P999_LIMIT_NS {
             validity.invalidate(format!(
-                "emit lag p99.9 {:.1} us is not below {:.1} us: the load generator fell behind its schedule",
+                "emit lag p99.9 {:.1} us over {} sends is not below {:.1} us: \
+                 the load generator fell behind its schedule; {}",
                 micros(lag.p999_ns),
-                micros(EMIT_LAG_P999_LIMIT_NS)
+                lag.count,
+                micros(EMIT_LAG_P999_LIMIT_NS),
+                cause()
             ));
         }
     }
@@ -326,6 +348,40 @@ pub(crate) fn evaluate(evidence: &Evidence<'_>) -> Validity {
     validity
 }
 
+/// Why sends went out late, from the deadline misses.
+fn emit_lag_cause(diagnostics: &Diagnostics, sends: u64) -> String {
+    let misses = diagnostics.deadline_misses();
+    if misses == 0 {
+        "no send missed its spin window, so the thread lost the CPU while spinning or sending"
+            .to_owned()
+    } else {
+        format!(
+            "{misses} of {sends} sends were reached after their deadline ({} late wake-ups, \
+             {} behind other events, worst by {:.1} us); a longer --spin-us absorbs late wake-ups",
+            diagnostics.late_wakeups,
+            diagnostics.busy_loop_misses,
+            micros(diagnostics.max_deadline_miss_ns)
+        )
+    }
+}
+
+/// Invalidates the run when the request slip p99 reaches `limit_ns`, or
+/// when no slip was measured at all: the rule must not pass for lack of
+/// evidence.
+pub(crate) fn check_slip(validity: &mut Validity, diagnostics: &Diagnostics, limit_ns: u64) {
+    match &diagnostics.request_slip {
+        Some(slip) if slip.p99_ns >= limit_ns => validity.invalidate(format!(
+            "request slip p99 {:.1} us over {} requests is not below {:.1} us: \
+             requests wait at the mock before it reads them, and TTFT measures that wait",
+            micros(slip.p99_ns),
+            slip.count,
+            micros(limit_ns)
+        )),
+        Some(_) => {}
+        None => validity.invalidate("no request slip samples after the warmup"),
+    }
+}
+
 /// One `selfcheck` criterion.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct Criterion {
@@ -348,8 +404,25 @@ pub(crate) struct SelfcheckVerdict {
     pub(crate) criteria: Vec<Criterion>,
 }
 
+/// Inputs of [`selfcheck`].
+#[derive(Debug)]
+pub(crate) struct SelfcheckEvidence<'a> {
+    /// Post-warmup summary.
+    pub(crate) summary: &'a BTreeMap<Metric, MetricSummary>,
+    /// Load check of the run.
+    pub(crate) load: &'a LoadCheck,
+    /// Post-warmup diagnostics.
+    pub(crate) diagnostics: &'a Diagnostics,
+    /// Request slip p99 limit.
+    pub(crate) slip_limit_ns: u64,
+    /// Validity of the run.
+    pub(crate) validity: &'a Validity,
+}
+
 /// Judges a selfcheck run: emit lag p99 and mock write lag p99 below
-/// 10 µs, every measured interval's concurrency within 5% of the offered
+/// 10 µs, request slip p99 below its limit (a mock that keeps its write
+/// schedule can still queue arriving requests for milliseconds), every
+/// measured interval's concurrency within 5% of the offered
 /// load, the mean concurrency of the run within 5% of the nominal target
 /// (the contract's criterion; it catches a stream model that misses the
 /// target, which the offered-load comparison cannot see), and the run valid.
@@ -361,11 +434,14 @@ pub(crate) struct SelfcheckVerdict {
 /// selfcheck, where the 5% bound fails by chance about once in a thousand
 /// runs; at 200 streams over 10 s it is about 6%, too much for the bound to
 /// mean anything.
-pub(crate) fn selfcheck(
-    summary: &BTreeMap<Metric, MetricSummary>,
-    load: &LoadCheck,
-    validity: &Validity,
-) -> SelfcheckVerdict {
+pub(crate) fn selfcheck(evidence: &SelfcheckEvidence<'_>) -> SelfcheckVerdict {
+    let SelfcheckEvidence {
+        summary,
+        load,
+        diagnostics,
+        slip_limit_ns,
+        validity,
+    } = *evidence;
     let lag = |metric: Metric, name: &'static str| {
         let p99 = summary.get(&metric).map(|s| s.p99_ns);
         Criterion {
@@ -381,6 +457,18 @@ pub(crate) fn selfcheck(
     let criteria = vec![
         lag(Metric::EmitLag, "emit_lag_p99"),
         lag(Metric::MockWriteLag, "mock_write_lag_p99"),
+        Criterion {
+            name: "request_slip_p99",
+            observed: diagnostics.request_slip.as_ref().map_or_else(
+                || "no samples".to_owned(),
+                |s| format!("{:.2} us", micros(s.p99_ns)),
+            ),
+            limit: format!("< {:.0} us", micros(slip_limit_ns)),
+            pass: diagnostics
+                .request_slip
+                .as_ref()
+                .is_some_and(|s| s.p99_ns < slip_limit_ns),
+        },
         Criterion {
             name: "concurrency_deviation",
             observed: format!(
@@ -503,6 +591,16 @@ mod tests {
         censored_samples: 0,
     };
 
+    const NO_DIAGNOSTICS: Diagnostics = Diagnostics {
+        late_wakeups: 0,
+        busy_loop_misses: 0,
+        max_deadline_miss_ns: 0,
+        fresh_conn_sends: 0,
+        fresh_conn_ttft: None,
+        request_slip: None,
+        negative_slips: 0,
+    };
+
     #[test]
     fn load_check_counts_deviating_intervals_after_warmup() {
         let mut intervals: Vec<_> = (0..202).map(|i| interval(i, 1000.0, 30_000, 100)).collect();
@@ -558,6 +656,7 @@ mod tests {
             clock_steps: 0,
             load: None,
             counters: &NO_COUNTERS,
+            diagnostics: &NO_DIAGNOSTICS,
             markers_expected: true,
         };
         assert_eq!(evaluate(&evidence), Validity::default());
@@ -621,6 +720,7 @@ mod tests {
             clock_steps: 0,
             load: None,
             counters: &NO_COUNTERS,
+            diagnostics: &NO_DIAGNOSTICS,
             markers_expected: true,
         };
         let v = evaluate(&evidence);
@@ -641,7 +741,7 @@ mod tests {
     #[test]
     fn a_lagging_load_generator_invalidates_the_run() {
         let intervals: Vec<_> = (0..4).map(|i| interval(i, 1.0, 0, 100)).collect();
-        let judge = |p99_ns, far_tail_ns| {
+        let judge = |p99_ns, far_tail_ns, diagnostics: &Diagnostics| {
             let mut summary = good_summary();
             summary.extend(summary_tail(Metric::EmitLag, p99_ns, far_tail_ns));
             evaluate(&Evidence {
@@ -651,18 +751,71 @@ mod tests {
                 clock_steps: 0,
                 load: None,
                 counters: &NO_COUNTERS,
+                diagnostics,
                 markers_expected: true,
             })
         };
-        assert!(judge(9_999, 999_999).valid);
-        let v = judge(10_000, 20_000);
-        assert_eq!(v.reasons.len(), 1, "{v:?}");
-        assert!(v.reasons[0].starts_with("emit lag p99 10.0 us"), "{v:?}");
-        let v = judge(5_000, 1_000_000);
-        assert_eq!(v.reasons.len(), 1, "{v:?}");
-        assert!(
-            v.reasons[0].starts_with("emit lag p99.9 1000.0 us"),
+        assert!(judge(9_999, 999_999, &NO_DIAGNOSTICS).valid);
+        let v = judge(10_000, 20_000, &NO_DIAGNOSTICS);
+        assert_eq!(
+            v.reasons,
+            [
+                "emit lag p99 10.0 us over 1000 sends is not below 10.0 us: the load generator \
+                 fell behind its schedule; no send missed its spin window, so the thread lost \
+                 the CPU while spinning or sending"
+            ],
             "{v:?}"
+        );
+        let late = Diagnostics {
+            late_wakeups: 9,
+            busy_loop_misses: 3,
+            max_deadline_miss_ns: 27_140,
+            ..NO_DIAGNOSTICS
+        };
+        let v = judge(5_000, 1_000_000, &late);
+        assert_eq!(
+            v.reasons,
+            [
+                "emit lag p99.9 1000.0 us over 1000 sends is not below 1000.0 us: the load \
+                 generator fell behind its schedule; 12 of 1000 sends were reached after their \
+                 deadline (9 late wake-ups, 3 behind other events, worst by 27.1 us); a longer \
+                 --spin-us absorbs late wake-ups"
+            ],
+            "{v:?}"
+        );
+    }
+
+    #[test]
+    fn request_slip_rule_needs_evidence_below_the_limit() {
+        let slip = |p99_ns| Diagnostics {
+            request_slip: Some(MetricSummary {
+                count: 5000,
+                min_ns: 3_000,
+                mean_ns: 20_000.0,
+                p50_ns: 15_000,
+                p90_ns: 40_000,
+                p99_ns,
+                p999_ns: p99_ns,
+                max_ns: p99_ns,
+            }),
+            ..NO_DIAGNOSTICS
+        };
+        let judge = |diagnostics: &Diagnostics| {
+            let mut v = Validity::default();
+            check_slip(&mut v, diagnostics, 200_000);
+            v
+        };
+        assert!(judge(&slip(199_999)).valid);
+        assert_eq!(
+            judge(&slip(3_125_000)).reasons,
+            [
+                "request slip p99 3125.0 us over 5000 requests is not below 200.0 us: requests \
+                 wait at the mock before it reads them, and TTFT measures that wait"
+            ]
+        );
+        assert_eq!(
+            judge(&NO_DIAGNOSTICS).reasons,
+            ["no request slip samples after the warmup"]
         );
     }
 
@@ -677,6 +830,7 @@ mod tests {
                 clock_steps: 0,
                 load: None,
                 counters,
+                diagnostics: &NO_DIAGNOSTICS,
                 markers_expected: true,
             })
         };
@@ -731,21 +885,47 @@ mod tests {
         let load = check_load(&intervals, &plan, 0, 100);
         let mut summary = summary_with(Metric::EmitLag, 4_000);
         summary.extend(summary_with(Metric::MockWriteLag, 6_000));
-        let verdict = selfcheck(&summary, &load, &Validity::default());
+        let slip = |p99_ns| Diagnostics {
+            request_slip: Some(summary_with(Metric::Ttft, p99_ns)[&Metric::Ttft]),
+            ..NO_DIAGNOSTICS
+        };
+        let healthy = slip(80_000);
+        let valid = Validity::default();
+        let judge = |summary: &BTreeMap<Metric, MetricSummary>,
+                     load: &LoadCheck,
+                     diagnostics: &Diagnostics| {
+            selfcheck(&SelfcheckEvidence {
+                summary,
+                load,
+                diagnostics,
+                slip_limit_ns: 200_000,
+                validity: &valid,
+            })
+        };
+        let verdict = judge(&summary, &load, &healthy);
         assert!(verdict.pass, "{verdict:?}");
         assert_eq!(
             verdict.criteria.iter().map(|c| c.name).collect::<Vec<_>>(),
             [
                 "emit_lag_p99",
                 "mock_write_lag_p99",
+                "request_slip_p99",
                 "concurrency_deviation",
                 "nominal_concurrency",
                 "run_valid"
             ]
         );
 
+        // The pilot's saturated mock: write lag in bounds, TTFT p99 3.1 ms.
+        let verdict = judge(&summary, &load, &slip(3_125_000));
+        assert!(!verdict.pass);
+        assert_eq!(verdict.criteria[2].observed, "3125.00 us");
+        assert_eq!(verdict.criteria[2].limit, "< 200 us");
+        assert!(!verdict.criteria[2].pass);
+        assert!(!judge(&summary, &load, &NO_DIAGNOSTICS).criteria[2].pass);
+
         summary.extend(summary_with(Metric::EmitLag, 12_000));
-        let verdict = selfcheck(&summary, &load, &Validity::default());
+        let verdict = judge(&summary, &load, &healthy);
         assert!(!verdict.pass);
         assert!(!verdict.criteria[0].pass);
 
@@ -753,9 +933,9 @@ mod tests {
         shaky[3].concurrency.mean = 94.0;
         let load = check_load(&shaky, &plan, 0, 100);
         summary.extend(summary_with(Metric::EmitLag, 4_000));
-        let verdict = selfcheck(&summary, &load, &Validity::default());
-        assert!(!verdict.criteria[2].pass);
-        assert!(verdict.criteria[3].pass);
+        let verdict = judge(&summary, &load, &healthy);
+        assert!(!verdict.criteria[3].pass);
+        assert!(verdict.criteria[4].pass);
         assert!(!verdict.pass);
 
         // Schedule and achieved load agree in every interval but both sit 6%
@@ -763,9 +943,9 @@ mod tests {
         let low: Vec<_> = (0..10).map(|i| interval(i, 94.0, 3000, 30)).collect();
         let low_plan: Vec<_> = (0..10).map(|i| planned(i, 94.0, 3000)).collect();
         let load = check_load(&low, &low_plan, 0, 100);
-        let verdict = selfcheck(&summary, &load, &Validity::default());
-        assert!(verdict.criteria[2].pass);
-        assert!(!verdict.criteria[3].pass, "{verdict:?}");
+        let verdict = judge(&summary, &load, &healthy);
+        assert!(verdict.criteria[3].pass);
+        assert!(!verdict.criteria[4].pass, "{verdict:?}");
         assert!(!verdict.pass);
     }
 }

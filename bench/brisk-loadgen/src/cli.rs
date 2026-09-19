@@ -130,6 +130,12 @@ pub(crate) struct StreamCmd {
     /// Measurement window after the warmup, seconds.
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) measure_s: u64,
+    /// Invalidate the run when the request slip p99 (send to the mock's
+    /// receipt of the whole request, pooled connections) reaches this,
+    /// microseconds. Only meaningful for an arm aimed straight at the mock:
+    /// through a gateway the slip includes the forwarding.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) max_slip_us: Option<u64>,
 }
 
 /// `selfcheck`.
@@ -147,7 +153,21 @@ pub(crate) struct SelfcheckCmd {
     /// Measurement window after the warmup, seconds.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) measure_s: u64,
+    /// Request slip p99 limit, microseconds (see `stream --max-slip-us`).
+    #[arg(long, default_value_t = DEFAULT_SELFCHECK_SLIP_US, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) max_slip_us: u64,
 }
+
+/// Default request slip p99 limit of `selfcheck`, microseconds.
+///
+/// An unsaturated mock still holds an arriving request while it spins
+/// towards its next chunk (a 50 µs window by default) and writes the chunks
+/// due, so tens of microseconds of slip are normal at the selfcheck's load.
+/// A saturated mock queues requests for milliseconds (3 ms TTFT p99 at 2000
+/// streams on one mock core in the pilot) while its write lag stays within
+/// bounds. The limit sits between the two, and below the tail the floor-A
+/// TTFT comparison has to resolve.
+pub(crate) const DEFAULT_SELFCHECK_SLIP_US: u64 = 200;
 
 /// `nonstream` (S2).
 #[derive(Debug, Clone, Args, Serialize)]
@@ -418,6 +438,7 @@ mod tests {
         assert!((cmd.shape.dur_p99 - 60.0).abs() < f64::EPSILON);
         assert!((cmd.shape.dur_max - 120.0).abs() < f64::EPSILON);
         assert_eq!((cmd.warmup_s, cmd.measure_s), (150, 300));
+        assert_eq!(cmd.max_slip_us, None);
         assert_eq!(cmd.common.shards, 1);
         assert_eq!(cmd.common.label, "run");
         assert!(cmd.common.cpu_list.is_none());
@@ -470,6 +491,7 @@ mod tests {
         assert_eq!(cmd.common.headers[0].name, "Authorization");
         assert_eq!(cmd.common.headers[0].value, "Bearer x");
         assert_eq!((cmd.warmup_s, cmd.measure_s), (10, 30));
+        assert_eq!(cmd.max_slip_us, DEFAULT_SELFCHECK_SLIP_US);
         assert!(
             parse(&[
                 "selfcheck",

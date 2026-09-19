@@ -298,6 +298,15 @@ fn streams_record_ttft_and_chunk_metrics() {
     );
     assert_eq!(run.output.clock_steps, 0);
     assert_eq!(c.censored_requests, 0);
+    // The first request pays for the connection; the pooled ones measure
+    // the slip up to the responder, which stamps its markers on reading.
+    let d = crate::diagnostics::Diagnostics::summarize(&run.output.diagnostics, 0);
+    assert_eq!(d.fresh_conn_sends, 1);
+    assert_eq!(d.fresh_conn_ttft.map(|s| s.count), Some(1));
+    let slip = d.request_slip.expect("pooled sends measure the slip");
+    assert_eq!(slip.count, 19);
+    assert!(slip.max_ns < 100_000_000, "{slip:?}");
+    assert_eq!(d.negative_slips, 0);
 }
 
 #[test]

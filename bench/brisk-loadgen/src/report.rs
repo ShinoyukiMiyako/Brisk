@@ -146,6 +146,44 @@ fn counts(out: &mut String, measured: &[&IntervalResult], extension: &Extension)
         c.rx_batches_without_timestamp,
         c.rx_batches
     );
+    let d = &extension.diagnostics;
+    let fresh_ttft = d.fresh_conn_ttft.as_ref().map_or_else(String::new, |s| {
+        format!(
+            " (their TTFT p50 {:.1} us, p99 {:.1} us)",
+            micros(s.p50_ns),
+            micros(s.p99_ns)
+        )
+    });
+    put!(
+        out,
+        "after warmup: sends on new connections {}{fresh_ttft}; sends reached after their \
+         deadline {} ({} late wake-ups, {} behind other events, worst by {:.1} us)",
+        d.fresh_conn_sends,
+        d.deadline_misses(),
+        d.late_wakeups,
+        d.busy_loop_misses,
+        micros(d.max_deadline_miss_ns)
+    );
+    if let Some(s) = &d.request_slip {
+        put!(
+            out,
+            "request slip (send to the mock's receipt, pooled connections): count {}, \
+             p50 {:.1} us, p99 {:.1} us, p99.9 {:.1} us, max {:.1} us",
+            s.count,
+            micros(s.p50_ns),
+            micros(s.p99_ns),
+            micros(s.p999_ns),
+            micros(s.max_ns)
+        );
+    }
+    if d.negative_slips > 0 {
+        put!(
+            out,
+            "note: {} request slip(s) ended before they started: the load generator and the \
+             mock do not share a clock",
+            d.negative_slips
+        );
+    }
     if c.censored_requests > 0 {
         put!(
             out,

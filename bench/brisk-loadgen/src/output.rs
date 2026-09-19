@@ -11,6 +11,7 @@ use brisk_bench_core::result::RunResult;
 use serde::Serialize;
 
 use crate::cli::BodySize;
+use crate::diagnostics::Diagnostics;
 use crate::run::RampOutcome;
 use crate::schedule::{PlannedInterval, StreamPlan};
 use crate::shard::Counters;
@@ -45,6 +46,8 @@ pub(crate) struct Extension {
     pub(crate) counters: Counters,
     /// Clock steps detected.
     pub(crate) clock_steps: u64,
+    /// Post-warmup deadline misses, fresh connections and request slip.
+    pub(crate) diagnostics: Diagnostics,
     /// S1 model parameters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) stream_plan: Option<StreamPlan>,
