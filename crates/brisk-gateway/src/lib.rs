@@ -31,3 +31,5 @@ pub mod server;
 pub mod spec;
 mod state;
 pub mod upstream;
+
+pub use gateway::{BuildError, Gateway};
