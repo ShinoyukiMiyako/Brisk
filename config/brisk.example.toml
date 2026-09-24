@@ -1,0 +1,104 @@
+# Brisk 完整配置参考。列出全部字段，取值即默认值；标注「必填」的字段没有默认值。
+#
+# 本文件进 git，不含任何密钥。本地使用时复制为 *.local.toml（已被 .gitignore 排除）。
+# 上游密钥 api_key 只能写成 { env = "NAME" }、{ file = "path" } 或 { value = "..." } 之一，
+# 其中 value 只在文件名以 .local.toml 结尾时允许，否则加载失败。
+#
+# 时长写成整数加单位 ms、s、m、h（如 "600s"）；大小写成整数加 B、KiB、MiB、GiB，
+# 或不带单位的整数字节数。不接受小数。所有表都拒绝未知字段。
+# 相对路径（ca_file、TLS 证书与私钥、api_key.file）相对于本文件所在目录。
+
+[server]
+# 必填。不是回环地址时，必须配置 [server.tls] 或设 allow_plaintext = true。
+listen = "127.0.0.1:8080"
+# 默认取 available_parallelism。
+# workers = 8
+# 默认由 RLIMIT_NOFILE 推算。
+# max_connections = 10000
+header_read_timeout = "30s"
+tls_handshake_timeout = "10s"
+graceful_shutdown_timeout = "30s"
+tcp_keepalive = "30s"
+backlog = 4096
+# 非回环地址明文监听时 bk- key 会以明文在网络上传输，需要显式开启。
+allow_plaintext = false
+
+# 入站 TLS。配置后 ALPN 提供 h2 与 http/1.1。
+# [server.tls]
+# cert = "tls/brisk.crt"
+# key = "tls/brisk.key"
+
+[limits]
+max_body = "32MiB"
+inflight_body_budget = "256MiB"
+body_read_timeout = "60s"
+body_min_rate_bytes = "64KiB"
+body_min_rate_window = "10s"
+response_tap_budget = "256MiB"
+
+[forwarding]
+max_attempts = 3
+# 0s 表示收到 2xx 响应头立即 commit（E4）。
+commit_hold = "2s"
+first_byte_timeout = "600s"
+idle_timeout = "120s"
+drain_timeout = "2s"
+drain_max_bytes = "64KiB"
+outcome_queue = 16384
+
+[upstream]
+connect_timeout = "5s"
+pool_idle_timeout = "90s"
+tcp_keepalive = "30s"
+# 只在 Linux 上生效。
+tcp_user_timeout = "60s"
+warmup_interval = "60s"
+ready_timeout = "3s"
+warmup_request_timeout = "10s"
+
+[experiments]
+# "axum" 或 "match"（E1）。
+router = "axum"
+# "segments" 或 "concat"（E2）。
+splice = "segments"
+
+# 虚拟 key 只存 SHA-256 摘要，由 `brisk keygen --name <name>` 生成。
+[[keys]]
+name = "local-dev"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[channels]]
+name = "cpa"
+# 带版本前缀（D1），上游请求地址为 base_url 加 /chat/completions。
+base_url = "http://192.168.10.180:8317/v1"
+api_key = { env = "BRISK_CPA_KEY" }
+weight = 1
+# 允许私网与回环地址（04 第 8.1 条）；云元数据地址始终拒绝。
+allow_private = true
+# "inject" 或 "passthrough"（D8）；CPA 用 passthrough。
+stream_usage = "passthrough"
+# 为空表示任意模型。
+models = ["grok-4.6(xhigh)"]
+# 客户端模型名 = 上游模型名。
+model_map = {}
+warmup = { method = "HEAD", path = "/healthz" }
+# 以下各项不写时取全局值。
+# commit_hold = "2s"
+# first_byte_timeout = "600s"
+# idle_timeout = "120s"
+# connect_timeout = "5s"
+# pool_idle_timeout = "90s"
+# 额外信任的 CA 证书（PEM）。
+# ca_file = "certs/upstream-ca.pem"
+expose_ratelimit_headers = false
+
+# 本机的 brisk-mock（基准用）。brisk-mock 对 HEAD / 回应带 body 的 404，
+# 默认预热对它无效，因此显式配置 GET /v1/models。
+# [[channels]]
+# name = "mock"
+# base_url = "https://127.0.0.1:19443/v1"
+# api_key = { value = "mock" }   # 只在 *.local.toml 中允许
+# allow_private = true
+# stream_usage = "inject"
+# ca_file = "mock-ca.pem"
+# warmup = { method = "GET", path = "/v1/models" }

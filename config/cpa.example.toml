@@ -1,0 +1,47 @@
+# 内网 CPA 模板。复制为仓库根目录的 cpa.local.toml 后使用（*.local.toml 已被 .gitignore 排除）。
+#
+# CPA 侧的部署要求（04 CPA-M1-10）：
+#   nonstream-keepalive-interval 必须为 0，否则非流式错误会以 200 返回，Brisk 无法故障转移；
+#   streaming.keepalive-seconds 建议保持 0；
+#   api-keys 不能是示例值，否则所有代理端点返回 403。
+#
+# 虚拟 key：运行 `brisk keygen --name local-dev`，把输出的 [[keys]] 片段替换下面的占位，
+# key 明文只显示这一次，交给客户端保存。
+
+[server]
+listen = "127.0.0.1:18080"
+workers = 4
+
+[forwarding]
+commit_hold = "2s"
+first_byte_timeout = "600s"
+idle_timeout = "120s"
+
+[[keys]]
+name = "local-dev"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# 两个渠道指向同一个 CPA，profile 相同，共用一个连接池。这只用于 live 故障转移测试
+# （live 测试会把第一个渠道的 key 临时换成错误值）。生产环境不要这样配：CPA 已在内部按
+# request-retry 重试过 408、429、5xx，再转移到同一个 CPA 只会把首字节延迟再放大一轮，
+# model_cooldown 类的 429 转过去必然再得到 429；最坏总时长为 max_attempts × first_byte_timeout。
+# 生产环境让不同渠道指向不同的上游，只有一个 CPA 时设 [forwarding] max_attempts = 1。
+[[channels]]
+name = "cpa-a"
+base_url = "http://192.168.10.180:8317/v1"
+api_key = { env = "BRISK_CPA_KEY" }
+weight = 3
+allow_private = true
+stream_usage = "passthrough"
+models = ["grok-4.6(xhigh)"]
+warmup = { method = "HEAD", path = "/healthz" }
+
+[[channels]]
+name = "cpa-b"
+base_url = "http://192.168.10.180:8317/v1"
+api_key = { env = "BRISK_CPA_KEY" }
+weight = 1
+allow_private = true
+stream_usage = "passthrough"
+models = ["grok-4.6(xhigh)"]
+warmup = { method = "HEAD", path = "/healthz" }
