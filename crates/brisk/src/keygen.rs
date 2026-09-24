@@ -13,8 +13,6 @@
 //! sha256 = "<64 lowercase hex digits>"
 //! ```
 
-use std::error::Error as StdError;
-use std::fmt;
 use std::fmt::Write as _;
 use std::io;
 
@@ -38,24 +36,15 @@ impl GeneratedKey {
 }
 
 /// Why no key was generated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KeygenError {
     /// The system random number generator failed.
+    #[error("the system random number generator failed")]
     Random,
     /// The name is empty or not printable ASCII.
+    #[error("key name must be non-empty printable ASCII")]
     Name,
 }
-
-impl fmt::Display for KeygenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Random => "the system random number generator failed",
-            Self::Name => "key name must be non-empty printable ASCII",
-        })
-    }
-}
-
-impl StdError for KeygenError {}
 
 /// Accepts non-empty printable ASCII (space through `~`), so the name reads
 /// the same in logs, the TOML file and a terminal.
