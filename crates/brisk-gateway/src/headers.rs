@@ -297,44 +297,22 @@ mod tests {
         );
     }
 
-    /// Response headers as CPA v7.3.8 sends them (from
-    /// `docs/samples/cpa/grok46-xhigh-chat-stream.headers`, trace id zeroed
-    /// as in the sanitised fixtures).
-    const CPA_STREAM_HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\n\
-Access-Control-Allow-Headers: *\r\n\
-Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Access-Control-Expose-Headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id\r\n\
-Cache-Control: no-cache\r\n\
-Connection: keep-alive\r\n\
-Content-Type: text/event-stream\r\n\
-X-Cpa-Trace-Id: 20260919011838-0-0\r\n\
-Date: Sat, 19 Sep 2026 01:18:40 GMT\r\n\
-Transfer-Encoding: chunked\r\n\
-\r\n";
+    /// Response heads as CPA v7.3.8 sends them, from the sanitised fixtures
+    /// (contract 4.4 item 7), so the test follows any fixture refresh.
+    const CPA_STREAM_HEADERS: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/cpa/chat-stream-grok46-xhigh.headers"
+    ));
 
-    /// From `docs/samples/cpa/grok46-xhigh-chat-nonstream.headers`.
-    const CPA_JSON_HEADERS: &[u8] = b"HTTP/1.1 200 OK\r\n\
-Access-Control-Allow-Headers: *\r\n\
-Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Access-Control-Expose-Headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id\r\n\
-Content-Type: application/json\r\n\
-X-Cpa-Trace-Id: 20260919011841-0-0\r\n\
-Date: Sat, 19 Sep 2026 01:18:44 GMT\r\n\
-Content-Length: 525\r\n\
-\r\n";
+    const CPA_JSON_HEADERS: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/cpa/chat-nonstream-grok46-xhigh.headers"
+    ));
 
-    /// From `docs/samples/cpa/error-bad-key.headers`.
-    const CPA_ERROR_HEADERS: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
-Access-Control-Allow-Headers: *\r\n\
-Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Access-Control-Expose-Headers: X-CPA-TRACE-ID, X-CPA-VERSION, X-CPA-COMMIT, X-CPA-BUILD-DATE, X-CPA-SUPPORT-PLUGIN, X-CPA-HOME-VERSION, X-CPA-HOME-BUILD-DATE, X-SERVER-VERSION, X-SERVER-BUILD-DATE, Location, Retry-After, X-Request-Id, OpenAI-Request-Id\r\n\
-Content-Type: application/json; charset=utf-8\r\n\
-Date: Sat, 19 Sep 2026 01:15:06 GMT\r\n\
-Content-Length: 27\r\n\
-\r\n";
+    const CPA_ERROR_HEADERS: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/cpa/error-bad-key.headers"
+    ));
 
     fn parse_response_head(raw: &[u8]) -> HeaderMap {
         let mut slots = [httparse::EMPTY_HEADER; 32];
