@@ -6,7 +6,6 @@
 //! shutdown stay under direct control (see the data-plane design, section on
 //! the downstream side and R20).
 
-use std::error::Error as StdError;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -28,9 +27,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::net;
-
-type BoxError = Box<dyn StdError + Send + Sync>;
+use crate::{BoxError, net};
 
 /// File descriptors kept free for upstream connections when deriving the
 /// default inbound connection limit from `RLIMIT_NOFILE`.
