@@ -884,11 +884,6 @@ for s in s1 s2 s3; do
     has_scenario "$s" || continue
     if ((${!reps_var} < 2)); then
         log "WARNING: $reps_var=${!reps_var}; with one repetition the comparison falls back to the within-run bootstrap, which leaves out the run-to-run spread and understates the CI"
-    elif ((${!reps_var} < 5)); then
-        # Calibration of the paired percentile bootstrap on the pilot data:
-        # at 3 pairs the nominal 95% CIs covered about 81% (baseline) and
-        # 75-91% (delta), so a narrow baseline CI passes the gate too easily.
-        log "WARNING: $reps_var=${!reps_var}; below 5 repetitions the percentile CIs undercover (about 81% for the baseline at 3), so the baseline gate is lenient"
     fi
 done
 if has_scenario s3 && ((s3_samples < 1000)); then
