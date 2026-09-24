@@ -65,3 +65,11 @@ CI 不需要 Python：`crates/brisk-proto/tests/fixtures_sanitised.rs` 用 `incl
 | `responses-stream-grok46-xhigh.sse` | `grok46-xhigh-responses-stream.body` | 10910 | `27349f9ad9585396b67eda0285d83e03f0353cd80f13fb5d591b50ccb14d1f31` |
 | `anthropic-stream-grok46-suffix.sse` | `grok46-suffix-anthropic-stream.body` | 3725 | `b6f4d059ef822245479a805cabcc5a3dc354144f5a1b142c1f7a9e1245e7f8a9` |
 | `gemini-sse-grok46-suffix.sse` | `grok46-suffix-gemini-sse.body` | 4705 | `a6f0ca9c00dd16e90a35acb793beaa9966738f12733519f93f5d5bf2ed670362` |
+
+## `--secret-env` 检查记录
+
+| 日期 | 执行者 | 命令 | 结果 |
+|---|---|---|---|
+| 2026-09-24 | 集成负责人（本机 Windows，夹具提交 a4a5363） | `python scripts/fixtures/sanitize-cpa.py --check fixtures/cpa --secret-env BRISK_CPA_KEY` | 通过：17 个夹具与本文件都不含该值 |
+
+`BRISK_CPA_KEY` 取自基准机上 CPA v7.3.8 的 `api-keys`（配置里只有 1 个 key），执行前先用它请求 `GET /v1/models` 得到 200、在它前面加一个字符得到 401，确认取到的是生效的 key，而不是一次空检查。
