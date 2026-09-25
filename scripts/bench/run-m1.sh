@@ -151,8 +151,9 @@
 # rules as MET or NOT_MET (TRIGGERED or not in e11) and a decision; a rule
 # on the within-run interval of a single repetition is UNDECIDED (UNCERTAIN
 # in e11) and changes no default. Memory, idle RSS, CPU per chunk
-# and per request, chunk_wire, the strip cost and the HITM counts are
-# reported only, with the contract's reference values where it names them.
+# and per request, chunk_wire, the strip cost, the HITM counts and the
+# legacy pool lock share (C21) are reported only, with the contract's
+# reference values where it names them.
 #
 # The session refuses to start unless setup-host.sh --check passes
 # (ALLOW_UNPREPARED_HOST=1 overrides), holds $RESULTS_ROOT/.run-m0.lock for
