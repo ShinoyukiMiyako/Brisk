@@ -102,6 +102,15 @@
 # direct ramp the mock itself, so ramps take their own mock write lag limit
 # (RAMP_MOCK_WRITE_LAG_LIMIT_US).
 #
+# A ramp step is sustainable (6.1) when its p99 is within the limit, it had
+# no error and loadgen's validity checks hold over the step's own intervals.
+# loadgen checks validity once over the whole ramp, saturating last step
+# included, so its emit lag, mock write lag, failure and stale retry rules
+# are applied again per step from the intervals of the result, and only a
+# reason no step can own (a clock step, say) voids a ramp. The saturation
+# that ends a ramp thus ends its run of sustainable steps instead of voiding
+# it; in the direct ramp, loadgen falling behind marks the tool limit.
+#
 # Verdicts (contract 05, 7.5 and 6.3) on the 95% t interval of each paired
 # delta: FAIL when its low end exceeds the limit, PASS when the estimate and
 # its high end are within it, else UNCERTAIN; one repetition is never PASS.
@@ -109,9 +118,14 @@
 # whose interval half width exceeds a quarter of its limit is reported only.
 # While a gated verdict of a block is UNCERTAIN, the block gets one more
 # repetition at a time, up to EXTEND_MAX_REPS (EXTEND_UNCERTAIN). The ramp
-# ratio Brisk / floor-A: all of at least 3 pairs >= 0.85 PASS, mean < 0.85
-# FAIL, else UNCERTAIN. The e-sessions print their rules as MET or NOT_MET
-# (TRIGGERED or not in e11) and a decision. Memory, idle RSS, CPU per chunk
+# ratio Brisk / floor-A over at least 3 pairs: all >= 0.85 PASS, mean < 0.85
+# FAIL, else UNCERTAIN; a ramp without a sustainable step lies below
+# RAMP_START, which bounds its pair's ratio, and a tool-limited block is
+# only reported. The reuse limit (>= 99.9%) must hold in every run of the
+# Brisk arms, the voided and rerun ones included. The e-sessions print their
+# rules as MET or NOT_MET (TRIGGERED or not in e11) and a decision; a rule
+# on the within-run interval of a single repetition is UNDECIDED (UNCERTAIN
+# in e11) and changes no default. Memory, idle RSS, CPU per chunk
 # and per request, chunk_wire, the strip cost and the HITM counts are
 # reported only, with the contract's reference values where it names them.
 #
@@ -777,10 +791,16 @@ prog_check_delta='
           else ((.hi - .lo) / 2) as $half
                | .verdict = (if $kind == "le" then judge_le(.x; .lo; .hi; $thr; $single)
                              elif $kind == "abs" then judge_abs(.x; .lo; .hi; $thr; $single)
+                             # A decision rule changes a default, which the
+                             # within-run interval of a single repetition is
+                             # too narrow to do (03, 9.2).
+                             elif ($kind == "improve" or $kind == "below0" or $kind == "notworse") and $single
+                             then "UNDECIDED"
                              elif $kind == "improve" then (if .x <= (0 - $thr) and .hi < 0 then "MET" else "NOT_MET" end)
                              elif $kind == "below0" then (if .x < 0 and .hi < 0 then "MET" else "NOT_MET" end)
                              elif $kind == "notworse" then (if .lo <= 0 then "MET" else "NOT_MET" end)
                              else "REPORT" end)
+               | if .verdict == "UNDECIDED" then .note = "a single repetition decides no rule" else . end
                | if $prec > 0 and $half > $prec * 1000
                  then .counts = false
                       | .note = "CI half width \($half / 1000 | fixed1) us above \($prec) us, a quarter of the limit"
@@ -826,16 +846,39 @@ prog_ramp_pairs='
                  b: (map(select(.arm == $b)) | .[0].ramp)}])}
 '
 
-# The throughput verdict of a ramp block: 7.5 (gate) or the E1 rule.
+# The throughput verdict of a ramp block: 7.5 (gate) or the E1 rule. A ramp
+# without a sustainable step failed its first step, so its rate lies below
+# RAMP_START ($start), and its pair gets bounds of the ratio B / A instead
+# of a value: [0, RAMP_START / A] when B has no rate, [B / RAMP_START, none]
+# when A has none, no bound when neither has. The 7.5 rule over at least 3
+# pairs: PASS when every ratio is at least 0.85 (every low bound), FAIL when
+# their mean is below 0.85 (the mean of the high bounds), else UNCERTAIN,
+# which more pairs can settle unless a pair has no bound. A tool-limited
+# block is reported only, whatever its ratios.
 # shellcheck disable=SC2016
 prog_ramp_verdict='
+def ramp_rate: if . == null then "<" + ($start | rate) else rate end;
+def ratio_text: if .lo == .hi then .lo | fixed3
+                elif .hi != null then "<" + (.hi | fixed3)
+                elif .lo > 0 then ">" + (.lo | fixed3)
+                else "n/a" end;
 .tool as $tool
 | .pairs as $pairs
 | ($pairs | length) as $n
 | ([$pairs[] | .a.max_sustainable_rate | numbers] | max) as $amax
-| (if $tool == null or $amax == null then null else ($amax >= $share * $tool) end) as $limited
-| [$pairs[] | if ((.a.max_sustainable_rate // 0) > 0) and (.b.max_sustainable_rate != null)
-              then .b.max_sustainable_rate / .a.max_sustainable_rate else null end] as $ratios
+# Without any rate A stays below RAMP_START, which the tool limit, a step
+# rate itself, is at least.
+| (if $tool == null then null
+   elif $amax != null then ($amax >= $share * $tool)
+   elif $share * $tool >= $start then false
+   else null end) as $limited
+| [$pairs[] | .a.max_sustainable_rate as $ra | .b.max_sustainable_rate as $rb
+   | if $ra != null and $rb != null then {lo: ($rb / $ra), hi: ($rb / $ra)}
+     elif $ra != null then {lo: 0, hi: ($start / $ra)}
+     elif $rb != null then {lo: ($rb / $start), hi: null}
+     else {lo: 0, hi: null} end] as $bounds
+| [$bounds[] | if .lo == .hi then .lo else null end] as $ratios
+| ([$bounds[] | select(.lo == 0 and .hi == null)] | length) as $unbounded
 | (if $session == "e1" then
      {rule: "e1-throughput", counts: false, statistical: false,
       rule_text: "rule: at least 3 pairs, \($b) never a step below \($a) and a step (\($step_pct)%) above it in 2",
@@ -849,28 +892,35 @@ prog_ramp_verdict='
                                              and .b.last_step >= .a.last_step + 1)] | length) >= 2
                 then "MET" else "NOT_MET" end)}
    else
+     # Tool-limited first: such a block is reported only, whatever else holds.
      (if $n == 0 then {verdict: "MISSING", note: "no pair of valid ramps"}
-      elif any($ratios[]; . == null) then {verdict: "UNCERTAIN", note: "a ramp has no sustainable step"}
       elif $limited == true then {verdict: "REPORT", note: "tool-limited: \($a) reached \($amax / $tool | pct) of the direct ramp"}
+      elif $limited == null and $tool != null
+      then {verdict: "UNCERTAIN",
+            note: "\($a) has no sustainable step in any pair, and RAMP_START exceeds \($share) of the tool limit, so whether the block is tool-limited is unknown"}
       elif $limited == null then {verdict: "UNCERTAIN", note: "tool limit unknown: no valid direct ramp"}
-      elif $n >= 3 and all($ratios[]; . >= 0.85) then {verdict: "PASS"}
-      elif ($ratios | add / length) < 0.85 then {verdict: "FAIL"}
+      elif $n < 3 then {verdict: "UNCERTAIN", statistical: true, note: "\($n) pair(s), the rule needs 3"}
+      elif all($bounds[]; .lo >= 0.85) then {verdict: "PASS"}
+      elif all($bounds[]; .hi != null) and ([$bounds[].hi] | add / length) < 0.85 then {verdict: "FAIL"}
+      elif $unbounded > 0
+      then {verdict: "UNCERTAIN",
+            note: "neither ramp of \($unbounded) pair(s) sustained RAMP_START (\($start | rate) req/s), so their ratios have no bound; lower RAMP_START"}
       else {verdict: "UNCERTAIN", statistical: true} end)
      | . + {rule: "7.5 S2 throughput",
-            rule_text: "rule: all of at least 3 ratios >= 0.85 PASS, mean < 0.85 FAIL"}
+            rule_text: "rule: at least 3 pairs, every ratio >= 0.85 PASS, their mean < 0.85 FAIL"}
      | .counts = ($scope == "gated" and .verdict != "REPORT")
    end) as $v
-| ([$pairs[] | "\(.b.max_sustainable_rate | rate)/\(.a.max_sustainable_rate | rate)"] | join(", ")) as $rates
+| ([$pairs[] | "\(.b.max_sustainable_rate | ramp_rate)/\(.a.max_sustainable_rate | ramp_rate)"] | join(", ")) as $rates
 | (if $v.note == null then "" else ": \($v.note)" end) as $note
 | {id: "\($block):ramp", block: $block, kind: "ramp", rule: $v.rule, verdict: $v.verdict, gated: $v.counts,
    extendable: ($v.counts and $v.verdict == "UNCERTAIN" and $v.statistical == true),
    text: ("\($block): max sustainable rate \($b)/\($a) per pair [\($rates)] req/s, ratios ["
-          + ([$ratios[] | fixed3] | join(", "))
+          + ([$bounds[] | ratio_text] | join(", "))
           + "]; direct tool limit \($tool | rate) req/s; \($v.rule_text): \($v.verdict)"
           + (if $v.counts then " (gated\($note))"
              elif $session == "e1" then ""
              else " (reported\($note))" end)),
-   data: {tool: $tool, limited: $limited, ratios: $ratios, pairs: $pairs}}
+   data: {tool: $tool, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
 '
 
 # Sustainable rate per vCPU of the SUT, from the ramp pairs.
@@ -888,17 +938,40 @@ def per_cpu: if . == null then null else . / $cpus end;
  data: {a: $ra, b: $rb, cpus: $cpus}}
 '
 
-# Upstream connection reuse of a block. Input: a selection.
+# Upstream connection reuse of a block, 7.5: at least 99.9% in the steady
+# state. A run below MIN_REUSE is voided and its repetition rerun (6.2),
+# which keeps cold connections out of the comparisons but does not undo the
+# observation, so the verdict reads every run of the block, voided ones
+# included, and one run of a judged arm below 99.9% fails it. Judged are the
+# Brisk arms of the selection, whose property 7.5 states, or in a block
+# without one every arm but direct; the others are reported. A failed run
+# (loadgen or the SUT broke) has no steady state and is left out. Input: a
+# selection; $runs: runs.jsonl, slurped.
 # shellcheck disable=SC2016
 prog_reuse='
-[.runs | to_entries[] | {arm: .key, rates: [.value[].reuse.rate | numbers]}] as $by
-| [$by[].rates[]] as $all
-| (if ($all | length) == 0 then "MISSING" elif ($all | min) >= 0.999 then "PASS" else "FAIL" end) as $v
-| {id: "\($block):reuse", block: $block, kind: "reuse", rule: "7.5 reuse", verdict: $v,
+[.runs | keys_unsorted[]] as $arms
+| ([$arms[] | select(startswith("brisk"))] | if length > 0 then . else [$arms[] | select(. != "direct")] end) as $judged
+| [$runs[] | select(.scen == $s and .config == $c and .var == $v and .kind == "run" and .failed != true
+                    and (.reuse.rate | type) == "number")] as $all
+| [$arms[] as $arm
+   | [$all[] | select(.arm == $arm)] as $r
+   | {arm: $arm, judged: ($arm | IN($judged[])), runs: ($r | length), lowest: ([$r[].reuse.rate] | min),
+      below: ([$r[] | select(.reuse.rate < 0.999)] | length),
+      voided_below: ([$r[] | select(.reuse.rate < 0.999 and .valid != true)] | length)}] as $by
+| [$by[] | select(.judged)] as $j
+| (if ($j | length) == 0 or any($j[]; .runs == 0) then "MISSING"
+   elif all($j[]; .below == 0) then "PASS"
+   else "FAIL" end) as $verdict
+| {id: "\($block):reuse", block: $block, kind: "reuse", rule: "7.5 reuse", verdict: $verdict,
    gated: ($scope == "gated"), extendable: false,
-   text: ("\($block) upstream connection reuse over the window, lowest per arm: "
-          + ([$by[] | "\(.arm) \(.rates | min | pct4)"] | join(", "))
-          + "; limit >= 99.9%: \($v)" + (if $scope == "gated" then " (gated)" else " (reported)" end)),
+   text: ("\($block) upstream connection reuse over the window, lowest per arm over all its runs, voided ones included: "
+          + ([$by[] | "\(.arm) \(.lowest | pct4) (\(.runs) run(s)"
+                      + (if .below == 0 then ""
+                         else ", \(.below) below 99.9%"
+                              + (if .voided_below > 0 then ", \(.voided_below) of them voided and rerun" else "" end) end)
+                      + (if .judged then "" else ", reported" end) + ")"] | join(", "))
+          + "; limit >= 99.9% in every run of \($judged | join(", ")): \($verdict)"
+          + (if $scope == "gated" then " (gated)" else " (reported)" end)),
    data: $by}
 '
 
@@ -982,6 +1055,10 @@ p99($fa[0]) as $A
 | p99($fb[0]) as $B
 | p99($ab[0]) as $D
 | (if $A == null or $B == null or $D == null then {verdict: "MISSING", note: "a comparison is missing"}
+   # The rule decides whether to build a pool, which the within-run interval
+   # of a single repetition is too narrow to do (03, 9.2).
+   elif any($fa[0], $fb[0], $ab[0]; .single_repetition_fallback == true)
+   then {verdict: "UNCERTAIN", note: "a single repetition decides no rule"}
    elif $A.delta_ns <= 0 then {verdict: "NOT_TRIGGERED", note: "floor-A adds no p99 over direct"}
    elif $D.delta_ci_high_ns == null then {verdict: "UNCERTAIN", note: "floor-B - floor-A has no finite interval"}
    elif $B.delta_ns < 0.8 * $A.delta_ns and $D.delta_ci_high_ns < 0 then {verdict: "TRIGGERED"}
@@ -1034,6 +1111,9 @@ last_by(.id) as $all
              text: ("E1 decision: make match the default router ("
                     + ([if $lat_met then "latency rule met" else empty end,
                         if $tp_met then "throughput rule met" else empty end] | join(", ")) + ")")}
+       elif any($lat[]; .verdict == "UNDECIDED")
+       then {verdict: "UNDECIDED",
+             text: "E1 decision: undecided, the latency rule rests on a single repetition and the throughput rule is not met (latency \([$lat[].verdict] | join(", ")), throughput \([$tp[].verdict] | join(", "))); the default stays axum"}
        else {verdict: "AXUM",
              text: "E1 decision: keep axum (latency \([$lat[].verdict] | join(", ")), throughput \([$tp[].verdict] | join(", ")))"}
        end)
@@ -1044,6 +1124,10 @@ last_by(.id) as $all
        then {verdict: "UNDECIDED", text: "E2 decision: undecided, S3 or S1 comparisons are missing"}
        elif all($t[]; .verdict == "MET") and all($ch[]; .verdict == "MET")
        then {verdict: "CONCAT", text: "E2 decision: make concat the default splice (TTFT p50 better in all \($t | length) S3 size(s), S1 chunk p99 not worse)"}
+       # No rule decided against concat, but one rests on a single repetition.
+       elif any(($t + $ch)[]; .verdict == "UNDECIDED") and all(($t + $ch)[]; .verdict != "NOT_MET")
+       then {verdict: "UNDECIDED",
+             text: "E2 decision: undecided, a rule rests on a single repetition (S3 TTFT \([$t[].verdict] | join(", ")), S1 chunk p99 \([$ch[].verdict] | join(", "))); the default stays segments"}
        else {verdict: "SEGMENTS",
              text: "E2 decision: keep segments (S3 TTFT \([$t[].verdict] | join(", ")), S1 chunk p99 \([$ch[].verdict] | join(", ")))"}
        end)
@@ -1074,13 +1158,15 @@ last_by(.id) as $all
    gated: false, extendable: false, text: .text}
 '
 
-# One runs.jsonl record from a result file.
+# One runs.jsonl record from a result file. A ramp's loadgen validity is the
+# one judged per step (prog_ramp_evidence).
 # shellcheck disable=SC2016
 prog_record_run='
 .warmup_intervals as $w
 | $ctx + {file: $file, label, scenario,
-          valid: (.validity.valid and ($h.reasons | length) == 0),
-          loadgen_valid: .validity.valid, reasons: (.validity.reasons + $h.reasons),
+          valid: ((if $h.ramp == null then .validity.valid else $h.ramp.valid end) and ($h.reasons | length) == 0),
+          loadgen_valid: .validity.valid,
+          reasons: ((if $h.ramp == null then .validity.reasons else $h.ramp.run_reasons end) + $h.reasons),
           failed: $h.failed, seed: .params.common.seed,
           duration_s: .loadgen.duration_s, counters: .loadgen.counters,
           errors: ([.intervals[] | select(.index >= $w) | .errors | to_entries[]]
@@ -1160,22 +1246,135 @@ $m[$n] as $s
   end
 '
 
-# The sustainable rate of a ramp result: the last step of the leading run of
-# steps that completed requests without an error and within the p99 limit.
+# The sustainable rate of a ramp result, by the step condition of contract
+# 05, 6.1: the step's p99 within the limit, no error, and loadgen's validity
+# checks passing. loadgen checks validity once over the whole ramp, whose
+# last step saturates something by design, and keeps no verdict per step;
+# its result does keep the one-second intervals, so each step is checked
+# here over its own intervals with loadgen's limits (validity.rs): emit lag
+# p99 and p99.9 and mock write lag p99 from the interval histograms (base64
+# of an uncompressed HDR V2 serialization, read as hdrhistogram 7.6 reads
+# it), the failure and stale retry shares from the interval counts. The
+# sustainable rate is the last step of the leading run of steps that pass.
+# loadgen's whole-ramp reasons for those rules are thereby judged per step
+# (judged_per_step); a reason no step can own (a clock step, receives
+# without a kernel timestamp, negative spans, no samples at all) still voids
+# the ramp (run_reasons, valid). The reasons are told apart by the wording
+# of validity.rs, so a reworded one stays a reason of the run. An event
+# counts in the interval it happened in: a request sent at the end of one
+# step and answered in the next counts in the next, a negligible share of
+# a 20 s step. Input: a result file.
 # shellcheck disable=SC2016
 prog_ramp_evidence='
+def hdr_bytes:
+    [explode[] | if . >= 65 and . <= 90 then . - 65 elif . >= 97 and . <= 122 then . - 71
+                 elif . >= 48 and . <= 57 then . + 4 elif . == 43 then 62 elif . == 47 then 63
+                 else empty end] as $s
+    | ($s | length * 3 / 4 | floor) as $n
+    # The sextets a padded end lacks are zero bits, and the bytes they fill
+    # are cut off below.
+    | [range(0; $s | length; 4) as $i
+       | ($s[$i] * 262144 + ($s[$i + 1] // 0) * 4096 + ($s[$i + 2] // 0) * 64 + ($s[$i + 3] // 0)) as $w
+       | ($w / 65536 | floor), (($w / 256 | floor) % 256), ($w % 256)]
+    | .[:$n];
+def hdr_uint($b; $at; $len): reduce $b[$at:$at + $len][] as $x (0; . * 256 + $x);
+def hdr_decode:
+    hdr_bytes as $b
+    | if hdr_uint($b; 0; 4) != 478450451
+      then error("an interval histogram is not an uncompressed HDR V2 serialization") else . end
+    | {low: hdr_uint($b; 16; 8), sigfig: hdr_uint($b; 12; 4),
+       # [index, count] of the non-empty buckets: LEB128 varints (7 bits a
+       # byte, all 8 in a ninth) of ZigZag i64s, a negative one a run of
+       # empty buckets.
+       counts: (reduce $b[40:40 + hdr_uint($b; 4; 4)][] as $x ({i: 0, v: 0, m: 1, out: []};
+                    (if .m == 72057594037927936 then .v += $x * .m | .done = true
+                     else .v += ($x % 128) * .m | .done = ($x < 128) | .m *= 128 end)
+                    | if .done | not then .
+                      else (if .v % 2 == 0 then .v / 2 else -(.v + 1) / 2 end) as $z
+                           | (if $z < 0 then .i -= $z
+                              elif $z == 0 then .i += 1
+                              else .out += [[.i, $z]] | .i += 1 end)
+                           | .v = 0 | .m = 1
+                      end)
+                | .out)};
+def hdr_merge:
+    if length == 0 then null
+    elif (map([.low, .sigfig]) | unique | length) > 1 then error("the interval histograms differ in their bounds")
+    else {low: .[0].low, sigfig: .[0].sigfig,
+          counts: ([.[].counts[]] | group_by(.[0]) | map([.[0][0], (map(.[1]) | add)]))}
+    end;
+# value_at_quantile of hdrhistogram: the highest value equivalent to the
+# bucket in which the running count reaches ceil(q * total).
+def hdr_quantile($q):
+    if . == null then null
+    else ((2 * pow(10; .sigfig) | log2 | ceil) - 1) as $half_mag
+         | pow(2; $half_mag) as $half
+         | (.low | log2 | floor) as $unit
+         | ([.counts[][1]] | add) as $total
+         | ([($q * $total | ceil), 1] | max) as $target
+         | first(foreach .counts[] as $e (0; . + $e[1]; if . >= $target then $e[0] else empty end)) as $i
+         | (($i / $half | floor) - 1) as $bucket
+         | if $bucket < 0 then ($i + 1) * pow(2; $unit) - 1
+           else (($i % $half) + $half + 1) * pow(2; $bucket + $unit) - 1 end
+    end;
+def step_rule:
+    test("^emit lag p99(\\.9)? [0-9.]+ us over [0-9]+ sends ") or test("^mock write lag p99 [0-9.]+ us is not below ")
+    or test("^[0-9]+ of [0-9]+ requests after the warmup failed ") or test("^[0-9]+ stale keep-alive retries for ");
+def us1: . / 100 | round / 10;
+def per_us: if . == null then null else . / 1000 end;
 .loadgen.ramp as $r
 | if $r == null then null
   else $r.stop_p99_ns as $lim
-       | (reduce $r.steps[] as $s ({done: false, ok: []};
-            if .done or $s.requests == 0 or $s.errors != 0 or $s.p99_ns > $lim
-            then .done = true
-            else .ok += [$s] end)
+       | .warmup_intervals as $w
+       | .params.ramp_step_s as $len
+       # As loadgen converts --max-mock-write-lag-us (dist::seconds_to_ns).
+       | (.params.common.max_mock_write_lag_us / 1e6 * 1e9 | round) as $mwl_lim
+       | (.summary | has("mock_write_lag")) as $markers
+       | .intervals as $iv
+       | [$r.steps[] as $s
+          | [$iv[] | select(.index >= $w + ($s.step - 1) * $len and .index < $w + $s.step * $len)] as $in
+          | ([$in[] | .histograms.emit_lag | select(. != null) | hdr_decode] | hdr_merge) as $emit
+          | ([$in[] | .histograms.mock_write_lag | select(. != null) | hdr_decode] | hdr_merge) as $mwl
+          | ($emit | hdr_quantile(0.99)) as $e99
+          | ($emit | hdr_quantile(0.999)) as $e999
+          | ($mwl | hdr_quantile(0.99)) as $m99
+          | (reduce $in[] as $x ({requests: 0, failures: 0, stale: 0};
+                .requests += $x.requests
+                | reduce ($x.errors | to_entries[]) as $e (.;
+                      if $e.key == "stale_retry" then .stale += $e.value else .failures += $e.value end))) as $k
+          | {step: $s.step, rate: $s.rate, requests: $s.requests, errors: $s.errors, censored: $s.censored,
+             p99_us: ($s.p99_ns / 1000), emit_lag_p99_us: ($e99 | per_us), emit_lag_p999_us: ($e999 | per_us),
+             mock_write_lag_p99_us: ($m99 | per_us), interval_failures: $k.failures,
+             interval_stale_retries: $k.stale,
+             reasons: [
+                if $s.requests == 0 then "no request completed" else empty end,
+                if $s.errors != 0 then "\($s.errors) failed request(s)" else empty end,
+                if $s.p99_ns > $lim then "p99 \($s.p99_ns | us1) us above \($lim | us1) us" else empty end,
+                if $e99 != null and $e99 >= 10000
+                then "emit lag p99 \($e99 | us1) us, loadgen limit 10 us" else empty end,
+                if $e999 != null and $e999 >= 1000000
+                then "emit lag p99.9 \($e999 | us1) us, loadgen limit 1000 us" else empty end,
+                if $m99 != null and $m99 >= $mwl_lim
+                then "mock write lag p99 \($m99 | us1) us, limit \($mwl_lim | us1) us"
+                elif $m99 == null and $markers then "no mock write lag samples"
+                else empty end,
+                if $k.requests + $k.failures > 0 and $k.failures / ($k.requests + $k.failures) > 0.001
+                then "\($k.failures) of \($k.requests + $k.failures) requests in its intervals failed, loadgen limit 0.1%"
+                else empty end,
+                if $k.stale > 0.001 * $k.requests
+                then "\($k.stale) stale keep-alive retries for \($k.requests) requests in its intervals, loadgen limit 0.1%"
+                else empty end]}] as $steps
+       | (reduce $steps[] as $s ({done: false, ok: []};
+            if .done or ($s.reasons | length) > 0 then .done = true else .ok += [$s] end)
           | .ok) as $ok
+       | [.validity.reasons[] | select(step_rule | not)] as $run_reasons
        | {stop_p99_ns: $lim, steps_judged: ($r.steps | length), stopped_by: $r.stopped_by,
           loadgen_max_sustainable_rate: $r.max_sustainable_rate,
           max_sustainable_rate: ($ok | last | .rate), last_step: ($ok | last | .step),
-          steps: [$r.steps[] | {step, rate, requests, errors, censored, p99_us: (.p99_ns / 1000)}]}
+          ended_by: ([$steps[] | select((.reasons | length) > 0) | {step, reasons}] | first),
+          valid: (($run_reasons | length) == 0), run_reasons: $run_reasons,
+          judged_per_step: [.validity.reasons[] | select(step_rule)],
+          steps: $steps}
   end
 '
 
@@ -1796,7 +1995,10 @@ execute_run() {
         log "  $tag: reuse $(jq -r "$jq_defs"'"\(.rate | pct4) at \(.mock) (\(.accepts) accepts, \(.requests) requests)"' <<<"$reuse")"
     fi
     if [[ "$ramp" != null ]]; then
-        log "  $tag: ramp $(jq -r "$jq_defs"'"sustainable \(.max_sustainable_rate | rate) req/s (step \(.last_step // "n/a") of \(.steps_judged) judged; \(.stopped_by))"' <<<"$ramp")"
+        log "  $tag: ramp $(jq -r "$jq_defs"'"sustainable \(.max_sustainable_rate | rate) req/s (step \(.last_step // "n/a") of \(.steps_judged) judged; \(.stopped_by))"
+            + (if .ended_by == null then "" else "; step \(.ended_by.step) not sustainable: \(.ended_by.reasons | join(", "))" end)
+            + (if (.judged_per_step | length) == 0 then ""
+               else "; judged per step instead of over the whole ramp: \(.judged_per_step | join("; "))" end)' <<<"$ramp")"
     fi
     harness="$(jq -nc --argjson failed "$failed" --argjson reuse "$reuse" --argjson sut "$sut" \
         --argjson ramp "$ramp" --argjson perf "$perf_ev" \
@@ -2265,6 +2467,8 @@ add_verdict() {
 #             improve   delta <= -limit and CI high below 0 (E1): MET or NOT_MET
 #             below0    delta and CI high below 0 (E2): MET or NOT_MET
 #             notworse  CI low end at most 0 (E2): MET or NOT_MET
+#             (the last three UNDECIDED on a single repetition, as the le
+#             and abs ones are UNCERTAIN)
 #             report    no rule
 #   precision a positive value keeps the verdict gated only while the CI
 #             half width is within it (TTFT p99, 7.5), microseconds
@@ -2280,9 +2484,12 @@ check_delta() {
         "$jq_defs$prog_check_delta")"
 }
 
+# Upstream connection reuse of the selection's arms over every run of the
+# block (prog_reuse).
 report_reuse() {
-    local block="$1" selection="$2" scope="$3"
-    add_verdict "$(jq -c --arg block "$block" --arg scope "$scope" "$jq_defs$prog_reuse" <<<"$selection")"
+    local block="$1" selection="$2" scope="$3" scen="$4" config="$5" var="$6"
+    add_verdict "$(jq -c --slurpfile runs "$run_dir/runs.jsonl" --arg block "$block" --arg scope "$scope" \
+        --arg s "$scen" --arg c "$config" --arg v "$var" "$jq_defs$prog_reuse" <<<"$selection")"
 }
 
 # CPU per chunk (S1) or per request (S2, S3) of every SUT arm, and between
@@ -2410,8 +2617,8 @@ evaluate_ramp() {
     fi
     pairs="$(jq -sc --arg c "$config" --arg a "$a" --arg b "$b" "$prog_ramp_pairs" "$run_dir/runs.jsonl")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" --arg scope "$scope" \
-        --argjson share "$RAMP_TOOL_LIMIT_SHARE" --arg step_pct "$RAMP_STEP_PCT" "$jq_defs$prog_ramp_verdict" \
-        <<<"$pairs")"
+        --argjson share "$RAMP_TOOL_LIMIT_SHARE" --argjson start "$RAMP_START" --arg step_pct "$RAMP_STEP_PCT" \
+        "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" \
         --argjson cpus "$(cpu_count "$SUT_CPUS")" "$jq_defs$prog_ramp_vcpu" <<<"$pairs")"
 }
@@ -2432,9 +2639,9 @@ evaluate_block() {
         scope=gated
     fi
     if [[ "$scen" == s3 ]]; then
-        report_reuse "$block" "$selection" reported
+        report_reuse "$block" "$selection" reported "$scen" "$config" "$var"
     else
-        report_reuse "$block" "$selection" "$scope"
+        report_reuse "$block" "$selection" "$scope" "$scen" "$config" "$var"
     fi
     report_cpu "$scen" "$block" "$selection" "$@"
     if [[ "$scen" == s1 ]]; then
