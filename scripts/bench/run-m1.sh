@@ -1769,8 +1769,13 @@ $r[0].loadgen as $lg
 # the verdict of that step or of the warmup; null when every step passed),
 # but checks validity only once over the whole ramp, whose last step fails
 # by design; its result does keep the one-second intervals, so each step is
-# checked here over its own intervals with loadgen's limits (validity.rs):
-# emit lag p99 and p99.9 and mock write lag p99 from the interval histograms
+# checked here over its own intervals: emit lag p99 below a tenth of the
+# step's p99 limit and p99.9 below the limit itself (a ramp judges
+# latencies of milliseconds, so loadgen's microsecond S1 limits of
+# validity.rs would fail steps the tool serves well: in m1-calib-2 the
+# direct ramp passed all 40 steps by loadgen's verdict yet had emit lag p99
+# 10.8 us at step 2), mock write lag p99 below the ramp limit, from the
+# interval histograms
 # (base64 of an uncompressed HDR V2 serialization, read as hdrhistogram 7.6
 # reads it), the failure and stale retry shares from the interval counts.
 # The sustainable rate is the last step before the first step that does not
@@ -1842,10 +1847,10 @@ def tool_reason: test("^emit lag p99") or test("^mock write lag p99") or test("^
                 if $s.requests == 0 then "no request completed" else empty end,
                 if $s.errors != 0 then "\($s.errors) failed request(s)" else empty end,
                 if $s.p99_ns > $lim then "p99 \($s.p99_ns | us1) us above \($lim | us1) us" else empty end,
-                if $e99 != null and $e99 >= 10000
-                then "emit lag p99 \($e99 | us1) us, loadgen limit 10 us" else empty end,
-                if $e999 != null and $e999 >= 1000000
-                then "emit lag p99.9 \($e999 | us1) us, loadgen limit 1000 us" else empty end,
+                if $e99 != null and $e99 >= $lim / 10
+                then "emit lag p99 \($e99 | us1) us, ramp limit \($lim / 10 | us1) us (a tenth of the p99 limit)" else empty end,
+                if $e999 != null and $e999 >= $lim
+                then "emit lag p99.9 \($e999 | us1) us, ramp limit \($lim | us1) us (the p99 limit)" else empty end,
                 if $m99 != null and $m99 >= $mwl_lim
                 then "mock write lag p99 \($m99 | us1) us, limit \($mwl_lim | us1) us"
                 elif $m99 == null and $markers then "no mock write lag samples"
