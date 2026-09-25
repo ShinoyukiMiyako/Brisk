@@ -106,8 +106,9 @@
 #   before the first request, and at the middle of the window; memory per 1k
 #   streams = (middle - idle) / (S1_CONCURRENCY / 1000);
 # - after the S2 repetitions of a config, one more S2 run per SUT arm with
-#   perf stat counting HITM-related events on the SUT (PERF), or the reason
-#   it could not.
+#   perf stat counting HITM-related events on the SUT (PERF) and a CPU
+#   profile of SUT_CPUS for the legacy pool lock share of C21 (C21_PROFILE;
+#   method in the C21 section), or the reason either could not.
 #
 # Ramp (contract 05, section 6.1): nonstream from RAMP_START req/s, up
 # RAMP_STEP_PCT percent every RAMP_STEP_S seconds for at most RAMP_MAX_STEPS
@@ -295,6 +296,7 @@ knob_table=(
     "PT_CONFIGS|P|gate configs whose S1 also runs brisk-pt (stream_usage passthrough, reported only); empty for none"
     "PERF|auto|perf stat run per SUT arm after S2: auto (when perf works), 1 (required), 0 (never)"
     "PERF_EVENTS||HITM-related perf events to try, comma-separated (default: Intel and AMD names, see perf_probe)"
+    "C21_PROFILE|auto|CPU profile of SUT_CPUS in each S2 perf run for the legacy pool lock share (C21): auto (when perf can take it, see c21_probe), 1 (required), 0 (never)"
 )
 
 log() {
@@ -447,6 +449,7 @@ done
 [[ "$PERF" =~ ^(auto|0|1)$ ]] || die "PERF must be auto, 0 or 1, got '$PERF'"
 [[ -z "$PERF_EVENTS" || "$PERF_EVENTS" =~ ^[A-Za-z0-9_.:/=-]+(,[A-Za-z0-9_.:/=-]+)*$ ]] ||
     die "PERF_EVENTS must be a comma-separated list of perf event names, got '$PERF_EVENTS'"
+[[ "$C21_PROFILE" =~ ^(auto|0|1)$ ]] || die "C21_PROFILE must be auto, 0 or 1, got '$C21_PROFILE'"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] || die "RUN_ID may contain letters, digits, '.', '_' and '-' only"
 [[ "$RESERVED_PORTS" =~ ^[0-9]*([ ,]+[0-9]+)*$ ]] ||
     die "RESERVED_PORTS must be a list of port numbers, got '$RESERVED_PORTS'"
@@ -684,6 +687,9 @@ perf_reason="the session runs no S2 block"
 perf_events=""
 perf_hitm_events=""
 perf_hitm_note=""
+c21_status=not_needed
+c21_reason="the session runs no S2 block"
+c21_perf=()
 clk_tck="$(getconf CLK_TCK)"
 
 # ---------------------------------------------------------------- jq programs
@@ -1689,17 +1695,19 @@ reset_live_mocks() {
 # Background sampler of one run's measurement window. After <offset>
 # seconds it resets the mock statistics (marker <tag>.reset-ok), records the
 # load generator's thread placement, snapshots CPU and interrupt counters and,
-# with <perf>, starts perf stat on the SUT for the window; <mid> seconds later
+# with <perf>, starts perf stat on the SUT for the window, with <c21> the C21
+# profile of SUT_CPUS (c21_evidence reads it); <mid> seconds later
 # it reads the SUT's VmRSS (0: never); <window> seconds after the start it
 # snapshots again (0: the caller does, when the load generator exits). Its
 # sleeps are waited on so that a TERM ends them too, instead of leaving a
 # sleep that holds the session log's pipe open.
 sample_window() {
-    local tag="$1" offset="$2" window="$3" mid="$4" perf="$5" nap_pid="" perf_pid="" rest
-    local logs="$run_dir/logs"
-    shift 5
+    local tag="$1" offset="$2" window="$3" mid="$4" perf="$5" c21="$6" nap_pid="" perf_pid="" c21_pid="" rest
+    local logs="$run_dir/logs" c21_rc
+    shift 6
     trap 'if [[ -n "$nap_pid" ]]; then kill "$nap_pid" 2>/dev/null; fi
           if [[ -n "$perf_pid" ]]; then kill "$perf_pid" 2>/dev/null; fi
+          if [[ -n "$c21_pid" ]]; then kill "$c21_pid" 2>/dev/null; fi
           exit 0' TERM
     sleep "$offset" &
     nap_pid=$!
@@ -1718,6 +1726,11 @@ sample_window() {
             >/dev/null 2>"$logs/$tag.perf.err" &
         perf_pid=$!
     fi
+    if ((c21)) && [[ -n "${pids[sut]:-}" ]]; then
+        "${c21_perf[@]}" record "${c21_record_args[@]}" -e cpu-clock:I -o "$stage_dir/$tag.c21.perf" \
+            -- sleep "$window" >/dev/null 2>"$logs/$tag.c21.err" &
+        c21_pid=$!
+    fi
     rest="$window"
     if ((mid > 0)) && [[ -n "${pids[sut]:-}" ]]; then
         sleep "$mid" &
@@ -1733,6 +1746,11 @@ sample_window() {
     cat /proc/interrupts >"$logs/$tag.irq-b"
     if [[ -n "$perf_pid" ]]; then
         wait "$perf_pid" || true
+    fi
+    # c21_evidence judges the profile by this status; a TERM leaves none.
+    if [[ -n "$c21_pid" ]]; then
+        if wait "$c21_pid"; then c21_rc=0; else c21_rc=$?; fi
+        echo "$c21_rc" >"$stage_dir/$tag.c21.rc"
     fi
 }
 
@@ -1926,7 +1944,7 @@ execute_run() {
     if [[ "$scen" == s1 && -n "${pids[sut]:-}" ]]; then
         mid=$((measure / 2 - 1))
     fi
-    sample_window "$tag" "$((warmup + 1))" "$window" "$mid" "$perf" "${sampled[@]}" &
+    sample_window "$tag" "$((warmup + 1))" "$window" "$mid" "$perf" "${run_ctx[c21]:-0}" "${sampled[@]}" &
     sampler_pid=$!
     if wait "${pids[loadgen]}"; then rc=0; else rc=$?; fi
     unset "pids[loadgen]"
@@ -2012,6 +2030,10 @@ execute_run() {
     fi
     if ((perf)); then
         perf_ev="$(perf_evidence "$logs/$tag.perf.csv" "$(jq -r '.requests // 0' <<<"$sut")")"
+    fi
+    if [[ "${run_ctx[c21]:-0}" == 1 ]]; then
+        perf_ev="$(jq -c --argjson c21 "$(c21_evidence "$tag" "${run_ctx[sut_pid]}" "${run_ctx[arm]}")" \
+            '. + {c21: $c21}' <<<"$perf_ev")"
     fi
     [[ "$scen" == sc ]] && roles="$roles_sc"
     steal="$(steal_summary "$cpu" "$roles")"
@@ -2273,7 +2295,8 @@ rep_order() {
 }
 
 # One run of one arm; sets run_ok. kind: run (a repetition), tool (the direct
-# ramp of a ramp block), perf (the extra S2 run under perf stat).
+# ramp of a ramp block), perf (the extra S2 run under perf stat and the C21
+# profile).
 run_arm() {
     local scen="$1" config="$2" var="$3" arm="$4" rep="$5" attempt="$6" pos="$7" kind="$8"
     local block base pair_id url seed tls=0 spin="$SPIN_US" lag="$MOCK_WRITE_LAG_LIMIT_US"
@@ -2346,7 +2369,8 @@ run_arm() {
         [idle_rss]="" [check_reuse]=1 [arm_mock]="$(arm_mock "$scen" "$config" "$arm")"
         [staged]="$staged" [result]="$run_dir/results/$base.json")
     if [[ "$kind" == perf ]]; then
-        run_ctx[perf]=1
+        [[ "$perf_status" != available ]] || run_ctx[perf]=1
+        [[ "$c21_status" != available ]] || run_ctx[c21]=1
     fi
     if ! direct_arm "$arm"; then
         start_sut "$arm" "$config" "$base"
@@ -2451,14 +2475,15 @@ run_tool_ramp() {
     done
 }
 
-# One more S2 run per SUT arm with perf stat on the SUT.
+# One more S2 run per SUT arm with perf stat on the SUT and the C21 profile,
+# whichever of them this host can take.
 run_perf_runs() {
     local config="$1" arm
     shift
-    [[ "$perf_status" == available ]] || return 0
+    [[ "$perf_status" == available || "$c21_status" == available ]] || return 0
     for arm in "$@"; do
         [[ "$arm" != direct ]] || continue
-        log "== config $config, s2, perf stat run of $arm"
+        log "== config $config, s2, perf run of $arm (perf stat $perf_status, C21 profile $c21_status)"
         run_arm s2 "$config" "" "$arm" 0 0 1 perf
     done
 }
@@ -2680,8 +2705,8 @@ report_memory() {
     add_verdict "$(jq -c --arg block "$block" --arg session "$SESSION" "$jq_defs$prog_memory" <<<"$report_selection")"
 }
 
-# perf stat counts of the S2 perf runs of a config, or why there are none;
-# the legacy pool lock share (C21) is not collected by this script.
+# perf stat counts and the legacy pool lock share (C21) of the S2 perf runs
+# of a config, or why there are none.
 report_perf() {
     local block="$1" config="$2" note=""
     if [[ "$perf_status" != available ]]; then
@@ -2696,11 +2721,15 @@ report_perf() {
         add_verdict "$(jq -sc --arg block "$block" --arg c "$config" --arg hitm_note "$note" \
             "$jq_defs$prog_perf_report" "$run_dir/runs.jsonl")"
     fi
-    add_verdict "$(jq -nc --arg block "$block" \
-        '{id: "\($block):c21", block: $block, kind: "report", rule: "7.5 C21", verdict: "REPORT",
-          gated: false, extendable: false,
-          text: "\($block) legacy pool lock share (C21): not collected by run-m1.sh; it needs a lock contention profile of the SUT",
-          data: null}')"
+    if [[ "$c21_status" != available ]]; then
+        add_verdict "$(jq -nc --arg block "$block" --arg reason "$c21_reason" \
+            '{id: "\($block):c21", block: $block, kind: "report", rule: "7.5 C21", verdict: "REPORT",
+              gated: false, extendable: false,
+              text: "\($block) legacy pool lock share (C21): not collected: \($reason)", data: null}')"
+    else
+        add_verdict "$(jq -sc --arg block "$block" --arg c "$config" "$jq_defs$prog_c21_report" \
+            "$run_dir/runs.jsonl")"
+    fi
 }
 
 # The 7.5 limit of the S3 TTFT delta p50 of a size, microseconds; empty for
@@ -2925,6 +2954,257 @@ perf_probe() {
         die "PERF=1 but ${perf_reason:-$perf_hitm_note}"
     fi
     log "perf: $perf_status${perf_reason:+ ($perf_reason)}${perf_events:+; events $perf_events}"
+}
+
+# ---------------------------------------------------------------- C21
+
+# The legacy pool lock share (02 C21; contract 05, 6.1, 6.3 E11 and 7.5),
+# taken in the S2 perf run of every SUT arm and reported only.
+#
+# The lock. floor-A and Brisk reach the upstream through reqwest 0.13.5, whose
+# client is the legacy client of hyper-util 0.1.20 (Cargo.lock). Its pool,
+# hyper_util::client::legacy::pool, keeps the idle connections in one
+# std::sync::Mutex<PoolInner> per client, locked by <Checkout as Future>::poll
+# (taking a connection) and by the drop of Pooled (PoolInner::put, giving it
+# back), besides Pool::connecting, the drops of Checkout and Connecting and
+# IdleTask::run. std's Mutex on Linux takes a free lock with one
+# compare-exchange; a held one goes to
+# <std::sys::sync::mutex::futex::Mutex>::lock_contended, which spins and then
+# sleeps in futex(2), and an unlock that finds a sleeper wakes it by futex(2).
+#
+# The share. perf record samples cpu-clock on SUT_CPUS (idle excluded) over
+# the window, with kernel call chains only; perf script, filtered to the
+# SUT's pid, gives each sample's leaf symbol and kernel chain, which put every
+# SUT sample in one class:
+#   futex  the kernel chain passes through the futex code;
+#   mutex  the leaf is std's Mutex slow path (lock_contended);
+#   pool   the leaf names hyper_util::client::legacy::pool: the pool's own
+#          functions and the generic code instantiated for its types, into
+#          which fat LTO inlines the lock's fast path and the critical
+#          sections (the v0 mangling of the pinned toolchain spells out the
+#          type arguments of every instance, so these leaves carry the name;
+#          c21_lock_sites checks that the lock sites kept their own symbols);
+#   other  the rest.
+# The report gives each class's share of the SUT's samples. mutex and futex
+# count every std Mutex and Condvar of the SUT (tokio's own locks, its
+# parked workers), so pool + mutex + futex bounds the pool's share from
+# above: at or below 3%, the C21 trigger is ruled out. It is CPU time: a
+# thread asleep on the lock spends none, entering and leaving the sleep does.
+# The profile shares the perf run with perf stat, whose counts include its
+# timer interrupts (c21_freq per second on each SUT CPU) while the SUT runs.
+#
+# Why no user call chains, which would attribute lock_contended to its
+# caller: the release profile keeps the symbol table (strip = "debuginfo") but
+# no frame pointers, and perf 7.0.14 with libdw 0.194 on the benchmark host
+# unwound brisk-floor's DWARF call chains no deeper than five frames, and for
+# many samples not at all (libdw: "No such file or directory"), while the
+# leaf symbol was always there. Why CPU-wide: in the same check perf record
+# -p spent about 0.8 CPU polling on the harness CPU, which loadgen shares;
+# recording the CPUs did not. --no-bpf-event: the share needs no BPF program
+# events, and it spares a side-band thread on the harness CPU.
+# Recording CPUs needs perf_event_paranoid <= 0 or CAP_PERFMON and the futex
+# chains need kernel symbols (kptr_restrict), so c21_probe tries perf, then
+# sudo -n perf, which the benchmark host (paranoid 4) needs. The profile
+# stays in the private staging directory; logs/<tag>.c21.txt keeps the
+# samples per class and leaf symbol ("count<TAB>class<TAB>symbol").
+
+c21_freq=499
+c21_record_args=(--no-bpf-event --no-buildid --no-buildid-cache -C "$SUT_CPUS" -F "$c21_freq" -g --kernel-callchains)
+
+# Pass 1 over `perf script -F pid,ip,sym`: one character per sample, F when
+# its kernel chain passes through the futex code, else a dot.
+# shellcheck disable=SC2016
+c21_chain_prog='
+function flush() { if (seen) printf "%s", (fx ? "F" : "."); fx = 0 }
+NF == 1 && $1 ~ /^[0-9]+$/ { flush(); seen = 1; next }
+/futex/ { fx = 1 }
+END { flush(); print "" }
+'
+
+# Pass 2 over `perf script -G -F ip,sym,dso`, the same samples in the same
+# order, one leaf per line: prints count, class and symbol per leaf symbol,
+# and writes to countfile "samples pool mutex futex kernel kernel_unknown
+# sut sut_unknown flags" (sut: samples in <binary>, flags: pass 1 samples).
+# shellcheck disable=SC2016
+c21_leaf_prog='
+BEGIN { if ((getline flags < flagfile) <= 0) flags = "" }
+{
+    line = $0
+    sub(/^[ \t]+/, "", line)
+    ip = line
+    sub(/ .*/, "", ip)
+    sub(/^[^ ]+ /, "", line)
+    sym = line
+    dso = ""
+    if (match(line, / \([^()]*\)$/)) {
+        dso = substr(line, RSTART + 2, RLENGTH - 3)
+        sym = substr(line, 1, RSTART - 1)
+    }
+    n++
+    kernel = (ip ~ /^ffff/)
+    if (substr(flags, n, 1) == "F") class = "futex"
+    else if (kernel) class = "other"
+    else if (index(sym, "<std::sys::sync::mutex::futex::Mutex>::lock_contended") == 1) class = "mutex"
+    else if (index(sym, "hyper_util::client::legacy::pool::") > 0) class = "pool"
+    else class = "other"
+    count[class]++
+    if (kernel) { nk++; if (sym == "[unknown]") nku++ }
+    else if (dso ~ ("/" binary "$")) { ns++; if (sym == "[unknown]") nsu++ }
+    bysym[class "\t" sym]++
+}
+END {
+    for (k in bysym) printf "%d\t%s\n", bysym[k], k
+    printf "%d %d %d %d %d %d %d %d %d\n", n, count["pool"], count["mutex"], count["futex"],
+        nk, nku, ns, nsu, length(flags) > countfile
+}
+'
+
+# The C21 share of the S2 perf runs of one config. Input: runs.jsonl,
+# slurped.
+# shellcheck disable=SC2016
+prog_c21_report='
+def pct2: if . == null then "n/a" else (. * 100 | r2 | tostring) + "%" end;
+[.[] | select(.kind == "perf" and .scen == "s2" and .config == $c)] | group_by(.arm) | map(last) as $recs
+| {id: "\($block):c21", block: $block, kind: "report", rule: "7.5 C21", verdict: "REPORT",
+   gated: false, extendable: false,
+   text: ("\($block) legacy pool lock share (C21, reported; above 3% it is a trigger for building the own pool, 02), "
+          + "as a share of the SUT CPU samples over an extra S2 window: "
+          + (if ($recs | length) == 0 then "no perf run"
+             else ([$recs[]
+                    | .perf.c21 as $p
+                    | "\(.arm): "
+                      + (if $p == null then "not profiled"
+                         elif $p.status != "ran" then "not measured (\($p.reason))"
+                         else "at most \($p.share.upper | pct2) (legacy pool code \($p.share.pool | pct2), "
+                              + "std Mutex slow path \($p.share.mutex | pct2), kernel futex \($p.share.futex | pct2); "
+                              + "\($p.samples) samples)"
+                              + (if $p.lock_sites != "outlined"
+                                 then " (the lock sites of the pool are \($p.lock_sites) in this build, so the bound may miss them)"
+                                 elif $p.share.upper <= 0.03 then ", so not above 3%"
+                                 else ", 3% not ruled out" end)
+                              + (if $p.lost == null then "" else " (perf: \($p.lost))" end)
+                         end)
+                      + (if .valid then "" else " (in an invalid run)" end)]
+                   | join("; "))
+             end)
+          + "; the Mutex and futex parts count every lock and condvar of the SUT, which bounds the pool from above"),
+   data: [$recs[] | {arm, valid, c21: .perf.c21}]}
+'
+jq_programs+=(prog_c21_report)
+
+# Whether this host can take the C21 profile, and with which perf command: a
+# short profile of SUT_CPUS (idle included, so that it has samples) has to
+# resolve kernel symbols.
+c21_probe() {
+    local paranoid attempt data out
+    local -a cmd
+    if ((session_has_brisk + session_has_floor == 0)) || ! has_scenario s2; then
+        return 0
+    fi
+    if [[ "$C21_PROFILE" == 0 ]]; then
+        c21_status=disabled c21_reason="C21_PROFILE=0"
+        return 0
+    fi
+    paranoid="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)" || paranoid=unreadable
+    c21_status=unavailable c21_reason=""
+    if ! command -v perf >/dev/null; then
+        c21_reason="perf is not installed"
+    else
+        data="$stage_dir/c21-probe.perf"
+        for attempt in "perf" "sudo -n perf"; do
+            read -r -a cmd <<<"$attempt"
+            rm -f "$data"
+            if ! out="$("${cmd[@]}" record "${c21_record_args[@]}" -e cpu-clock -o "$data" -- sleep 0.2 2>&1 >/dev/null)"; then
+                c21_reason+="${c21_reason:+; }$attempt record fails: $(tr -s '\n\t ' ' ' <<<"$out" | cut -c1-300)"
+            elif ! out="$("${cmd[@]}" script -i "$data" -F ip,sym 2>&1)"; then
+                c21_reason+="${c21_reason:+; }$attempt script fails: $(tr -s '\n\t ' ' ' <<<"$out" | cut -c1-300)"
+            elif ! grep -Eq '^[[:space:]]*ffff[0-9a-f]+ [^[]' <<<"$out"; then
+                c21_reason+="${c21_reason:+; }$attempt resolves no kernel symbol"
+            else
+                c21_perf=("${cmd[@]}") c21_status=available c21_reason=""
+                break
+            fi
+        done
+        if [[ "$c21_status" != available ]]; then
+            c21_reason+=" (perf_event_paranoid $paranoid)"
+        fi
+    fi
+    if [[ "$C21_PROFILE" == 1 && "$c21_status" != available ]]; then
+        die "C21_PROFILE=1 but the C21 profile is unavailable: $c21_reason"
+    fi
+    log "C21 profile: $c21_status${c21_reason:+ ($c21_reason)}${c21_perf[*]:+; with ${c21_perf[*]}}"
+}
+
+# Whether the pool's lock sites on the HTTP/1 path, <Checkout as
+# Future>::poll and the drop of Pooled, are functions of their own in the
+# binary, as in the release builds checked: the pool class needs that, since
+# inlined into a caller named otherwise their samples would count as other.
+# Prints outlined, inlined, or unknown when nm cannot tell.
+c21_lock_sites() {
+    local syms
+    if ! syms="$(nm -C --defined-only "$1" 2>/dev/null)"; then
+        echo unknown
+    elif grep -Eq '^[0-9a-f]+ [tT] <hyper_util::client::legacy::pool::Checkout<.* as core::future::future::Future>::poll$' <<<"$syms" &&
+        grep -Eq '^[0-9a-f]+ [tT] core::ptr::drop_(glue|in_place)::<hyper_util::client::legacy::pool::Pooled<' <<<"$syms"; then
+        echo outlined
+    else
+        echo inlined
+    fi
+}
+
+# The C21 evidence of one perf run as JSON, from the profile the sampler
+# took (sample_window): the samples per class of the SUT (pid) with their
+# shares, or why there are none.
+c21_evidence() {
+    local tag="$1" pid="$2" arm="$3" binary=brisk reason="" lost
+    local data="$stage_dir/$tag.c21.perf" rc_file="$stage_dir/$tag.c21.rc" flags="$stage_dir/$tag.c21.flags"
+    local counts="$stage_dir/$tag.c21.counts" table="$run_dir/logs/$tag.c21.txt" err="$run_dir/logs/$tag.c21.err"
+    local samples pool mutex futex kernel kernel_unknown sut sut_unknown flagged
+    [[ "$arm" != floor-* ]] || binary="brisk-floor"
+    if [[ ! -f "$rc_file" ]]; then
+        reason="perf record did not finish; the window was cut short"
+    elif [[ "$(<"$rc_file")" != 0 ]]; then
+        reason="perf record exited with status $(<"$rc_file") (logs/$tag.c21.err)"
+    elif [[ ! -s "$data" ]]; then
+        reason="perf record wrote no profile (logs/$tag.c21.err)"
+    elif ! "${c21_perf[@]}" script -i "$data" --pid "$pid" -F pid,ip,sym 2>>"$err" |
+        awk "$c21_chain_prog" >"$flags"; then
+        reason="perf script failed on the kernel chains (logs/$tag.c21.err)"
+    elif ! "${c21_perf[@]}" script -i "$data" --pid "$pid" -G -F ip,sym,dso 2>>"$err" |
+        awk -v flagfile="$flags" -v countfile="$counts" -v binary="$binary" "$c21_leaf_prog" |
+        sort -rn >"$table"; then
+        reason="perf script failed on the leaf symbols (logs/$tag.c21.err)"
+    else
+        read -r samples pool mutex futex kernel kernel_unknown sut sut_unknown flagged <"$counts"
+        if ((flagged != samples)); then
+            reason="the two perf script passes disagree ($flagged and $samples samples)"
+        elif ((samples == 0)); then
+            reason="no sample of the SUT (pid $pid) on SUT_CPUS"
+        elif ((sut == 0)); then
+            reason="none of the $samples samples of pid $pid is in $binary"
+        elif ((2 * sut_unknown > sut)); then
+            reason="$sut_unknown of $sut samples in $binary resolve to no symbol; the C21 classes need its symbol table"
+        elif ((kernel > 0 && kernel_unknown == kernel)); then
+            reason="no kernel symbol resolved; the futex class needs them"
+        fi
+    fi
+    if [[ -n "$reason" ]]; then
+        jq -nc --arg reason "$reason" '{status: "failed", reason: $reason}'
+        return 0
+    fi
+    # perf warns on stderr when the ring buffer overflowed and samples were
+    # dropped, which the shares would not show.
+    if ! lost="$(grep -m 1 -i 'lost' "$err")"; then
+        lost=""
+    fi
+    jq -nc --argjson n "$samples" --argjson pool "$pool" --argjson mutex "$mutex" --argjson futex "$futex" \
+        --argjson kernel "$kernel" --arg lost "$lost" --arg table "logs/$tag.c21.txt" \
+        --arg sites "$(c21_lock_sites "$run_dir/bin/$binary")" \
+        '{status: "ran", reason: null, samples: $n, kernel_samples: $kernel,
+          pool: $pool, mutex: $mutex, futex: $futex,
+          share: {pool: ($pool / $n), mutex: ($mutex / $n), futex: ($futex / $n),
+                  upper: (($pool + $mutex + $futex) / $n)},
+          lock_sites: $sites, lost: (if $lost == "" then null else $lost end), table: $table}'
 }
 
 # ---------------------------------------------------------------- selfcheck
@@ -3174,6 +3454,7 @@ certs_dir="$(mktemp -d)"
 ca="$certs_dir/ca.pem"
 
 perf_probe
+c21_probe
 
 if ((session_has_brisk)); then
     # The frozen stdout of brisk keygen (contract 05, section 1.5): the key,
