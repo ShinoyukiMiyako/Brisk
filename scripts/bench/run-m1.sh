@@ -1776,7 +1776,10 @@ $r[0].loadgen as $lg
 # The sustainable rate is the last step before the first step that does not
 # pass (ended_by). What ended the run of sustainable steps (end): that
 # step's loadgen verdict (no_requests, errors, p99_exceeded or
-# tool_saturated), checks where loadgen passed it and a check here did not,
+# tool_saturated), tool_saturated as well where loadgen passed it and only
+# tool-side checks here failed (emit lag, mock write lag: they measure the
+# tools, so the step is rerun and never charged to the SUT), checks where a
+# SUT-side check here failed (errors, p99, failure or stale retry shares),
 # or, when every judged step passes, tool_saturated for a ramp loadgen
 # stopped for a saturation in its warmup or in a step already judged, and
 # max_steps for one that passed all its steps. The rate of a ramp that ended
@@ -1799,6 +1802,10 @@ def step_rule:
     or test("^[0-9]+ of [0-9]+ requests after the warmup failed ") or test("^[0-9]+ stale keep-alive retries for ");
 def us1: . / 100 | round / 10;
 def per_us: if . == null then null else . / 1000 end;
+# Emit lag and mock write lag measure the tools, not the SUT: a step that
+# loadgen passed but that fails only these checks ends the ramp as tool
+# saturation (rerun, then tool-limited), never as the SUT arm limit.
+def tool_reason: test("^emit lag p99") or test("^mock write lag p99") or test("^no mock write lag samples");
 .loadgen.ramp as $r
 | if $r == null then null
   elif ($r | has("stop_reason")) and all($r.steps[]; has("verdict") and has("unsent") and has("late_sends")) | not
@@ -1853,7 +1860,10 @@ def per_us: if . == null then null else . / 1000 end;
             if .done or ($s.reasons | length) > 0 then .done = true else .ok += [$s] end)
           | .ok) as $ok
        | $steps[$ok | length] as $fail
-       | (if $fail != null then (if $fail.verdict == "passed" then "checks" else $fail.verdict end)
+       | (if $fail != null
+          then (if $fail.verdict != "passed" then $fail.verdict
+                elif all($fail.reasons[]; tool_reason) then "tool_saturated"
+                else "checks" end)
           elif $r.stop_reason == null then "max_steps"
           else $r.stop_reason end) as $end
        | (if $end != "tool_saturated" then null
