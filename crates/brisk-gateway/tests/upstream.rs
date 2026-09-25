@@ -15,10 +15,12 @@ use brisk_gateway::spec::{ChannelSpec, StreamUsage, Timeouts, WarmupTarget};
 use brisk_gateway::upstream::registry::{ChannelSet, ChannelWarning, ClientRegistry};
 use brisk_gateway::upstream::{UpstreamClientConfig, build_client};
 use bytes::Bytes;
-use http::{Response, StatusCode, header};
+use http::{Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use scripted::{Reply, ScriptConfig, ScriptedUpstream, Split, SseEnd, fixture_reply, frames_of};
+use tokio::net::TcpStream;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn redirect_is_returned_not_followed() {
@@ -587,8 +589,18 @@ async fn fixture_replies_arrive_byte_for_byte() {
         _ => fixture_reply(BOGUS_EFFORT_HEAD, BOGUS_EFFORT_BODY, Split::Whole),
     })
     .await;
-    let client = build_client(&loopback_profile()).unwrap();
-    let url = format!("{}/chat/completions", upstream.base_url());
+    // One connection driven by hand instead of a pooled client. The pool
+    // takes a connection back only after its connection task has seen the
+    // end of the body and asked for the next request, which can happen after
+    // the caller already holds the whole body; the next request then finds
+    // the pool empty and opens a second connection. `ready()` waits for that
+    // same signal, and fails if a replay left the connection unusable.
+    let stream = TcpStream::connect(upstream.addr()).await.unwrap();
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
+            .await
+            .unwrap();
+    let connection = tokio::spawn(connection);
     let expected: [(u16, &str, &[u8]); 4] = [
         (200, "text/event-stream", STREAM_BODY),
         (200, "application/json", JSON_BODY),
@@ -596,18 +608,29 @@ async fn fixture_replies_arrive_byte_for_byte() {
         (400, "application/json", BOGUS_EFFORT_BODY),
     ];
     for (status, content_type, body) in expected {
-        let resp = client
-            .post(&url)
-            .body(r#"{"model":"grok-4.6(xhigh)"}"#)
-            .send()
+        sender
+            .ready()
             .await
+            .expect("the connection is ready for the next request");
+        let request = Request::post("/v1/chat/completions")
+            .header(header::HOST, upstream.addr().to_string())
+            .body(Full::new(Bytes::from_static(
+                br#"{"model":"grok-4.6(xhigh)"}"#,
+            )))
             .unwrap();
+        let resp = sender.send_request(request).await.unwrap();
         assert_eq!(resp.status().as_u16(), status);
         assert_eq!(resp.headers()[header::CONTENT_TYPE], content_type);
         // The recorded `Date` is dropped and the scripted server adds none.
         assert!(resp.headers().get(header::DATE).is_none());
-        assert_eq!(resp.bytes().await.unwrap(), body);
+        assert_eq!(resp.into_body().collect().await.unwrap().to_bytes(), body);
     }
+    sender
+        .ready()
+        .await
+        .expect("the connection is reusable after the last replay");
+    drop(sender);
+    connection.await.unwrap().unwrap();
     assert_eq!(upstream.requests().len(), 4);
     assert_eq!(upstream.accepts(), 1);
 }
