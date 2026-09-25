@@ -86,7 +86,8 @@ pub(crate) struct CommonArgs {
     #[arg(long, value_parser = parse_pair_id)]
     pub(crate) pair_id: Option<String>,
     /// Abandon a request that has not completed this long after its
-    /// scheduled start, seconds.
+    /// scheduled start, seconds. A `nonstream` ramp caps it at 100 times
+    /// `--stop-p99-ms`, but no lower than 1 s.
     #[arg(long, default_value_t = 300.0, value_parser = parse_positive)]
     pub(crate) request_timeout_s: f64,
     /// Invalidate the run (and fail the `selfcheck` criterion) when the mock
@@ -212,7 +213,10 @@ pub(crate) struct NonstreamCmd {
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) ramp_step_s: u64,
     /// Ramp mode: stop after the first step whose p99 exceeds this,
-    /// milliseconds.
+    /// milliseconds. Each step is judged this plus twice this (at least
+    /// 50 ms) after its end, with the requests still open counted above the
+    /// limit. The ramp also stops, as tool-saturated, once the load
+    /// generator's own sends fall 100 ms behind the schedule.
     #[arg(long, default_value_t = 2.0, value_parser = parse_positive)]
     pub(crate) stop_p99_ms: f64,
     /// Ramp mode: upper bound on the number of steps.

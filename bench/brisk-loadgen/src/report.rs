@@ -7,7 +7,7 @@ use brisk_bench_core::result::{IntervalResult, RunResult};
 use brisk_bench_core::stats::Metric;
 
 use crate::output::Extension;
-use crate::run::RampOutcome;
+use crate::run::{RampOutcome, StepVerdict};
 use crate::validity::{LoadCheck, SelfcheckVerdict, micros};
 
 /// Appends one formatted line.
@@ -202,19 +202,30 @@ fn ramp_table(out: &mut String, ramp: &RampOutcome) {
     for step in &ramp.steps {
         put!(
             out,
-            "  step {:>3}  {:>10.1} req/s  p50 {:>9.1} us  p99 {:>9.1} us  errors {}/{}  {}",
+            "  step {:>3}  {:>10.1} req/s  p50 {:>9.1} us  p99 {:>9.1} us  errors {}/{}  \
+             censored {} (unsent {})  late sends {}  max emit lag {:.1} us  {}",
             step.step,
             step.rate,
             micros(step.p50_ns),
             micros(step.p99_ns),
             step.errors,
             step.requests + step.errors,
-            if step.passed { "ok" } else { "FAIL" }
+            step.censored,
+            step.unsent,
+            step.late_sends,
+            micros(step.max_emit_lag_ns),
+            match step.verdict {
+                StepVerdict::Passed => "ok",
+                StepVerdict::NoRequests => "FAIL (no request completed)",
+                StepVerdict::Errors => "FAIL (errors)",
+                StepVerdict::P99Exceeded => "FAIL (p99)",
+                StepVerdict::ToolSaturated => "FAIL (loadgen saturated)",
+            }
         );
     }
     match ramp.max_sustainable_rate {
         Some(rate) => put!(out, "max sustainable rate: {rate:.1} req/s"),
-        None => put!(out, "max sustainable rate: none (the first step failed)"),
+        None => put!(out, "max sustainable rate: none (no step passed)"),
     }
 }
 
