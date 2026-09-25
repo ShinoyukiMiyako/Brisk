@@ -27,6 +27,13 @@
 #   config T  direct: loadgen -https-> mock   others: loadgen -https-> SUT -https-> mock
 #   config N  direct: loadgen -http->  mock   others: loadgen -http->  SUT -http->  mock
 #
+# The direct ramp that gives a ramp block its tool limit (see Ramp) reaches
+# the mock the block's SUT arms reach, so in config P it runs loadgen -https->
+# mock (arm direct-tls) rather than the plaintext direct path. It carries
+# loadgen's TLS cost, which the SUT arms of P do not, so that limit errs low:
+# it can turn a gated throughput comparison into a reported one, but never
+# lets one pass that the TLS mock capped.
+#
 # The SUT (process under test) is brisk-floor --mode a (floor-A) or --mode b
 # (floor-B), or brisk serve with a configuration rendered from
 # brisk-bench.toml.in. Core plan (LAYOUT=8vcpu of run-m0.sh): the SUT on CPUs
@@ -206,7 +213,7 @@ knob_table=(
     "LOADGEN_SHARDS|2|loadgen shard threads"
     "HARNESS_CPUS||CPUs of this script and its helpers (default: first LOADGEN_CPUS entry)"
     "MOCK_PLAIN_PORT|19080|plaintext mock (direct in P and N, SUT upstream in N)"
-    "MOCK_TLS_PORT|19443|TLS mock (direct in T, SUT upstream in P and T)"
+    "MOCK_TLS_PORT|19443|TLS mock (direct in T and the tool ramp of P, SUT upstream in P and T)"
     "SUT_P_PORT|19180|process under test, plaintext inbound (P, N)"
     "SUT_T_PORT|19543|process under test, TLS inbound (T)"
     "SC_PORT|19090|selfcheck mock"
@@ -1586,11 +1593,13 @@ mock_balance() {
 }
 
 # The mock that serves an arm: config P's direct arm reaches the plaintext
-# mock and its SUT the TLS one.
+# mock and its SUT the TLS one; direct-tls always reaches the TLS one.
 arm_mock() {
     local scen="$1" config="$2" arm="$3"
     if [[ "$scen" == sc ]]; then
         echo mock-sc
+    elif [[ "$arm" == direct-tls ]]; then
+        echo mock-tls
     elif [[ "$config" == N || ("$config" == P && "$arm" == direct) ]]; then
         echo mock-plain
     else
@@ -1824,14 +1833,26 @@ sut_port() {
     if [[ "$1" == T ]]; then echo "$SUT_T_PORT"; else echo "$SUT_P_PORT"; fi
 }
 
+# Whether an arm runs without a process under test: direct, and direct-tls,
+# the tool ramp of config P (tool_ramp_arm).
+direct_arm() {
+    [[ "$1" == direct || "$1" == direct-tls ]]
+}
+
+# Whether loadgen reaches an arm over TLS: every arm of config T, and
+# direct-tls.
+arm_over_tls() {
+    [[ "$1" == T || "$2" == direct-tls ]]
+}
+
 target_url() {
     local config="$1" arm="$2" scheme=http port
-    if [[ "$config" == T ]]; then
+    if arm_over_tls "$config" "$arm"; then
         scheme=https
     fi
-    if [[ "$arm" != direct ]]; then
+    if ! direct_arm "$arm"; then
         port="$(sut_port "$config")"
-    elif [[ "$config" == T ]]; then
+    elif [[ "$scheme" == https ]]; then
         port="$MOCK_TLS_PORT"
     else
         port="$MOCK_PLAIN_PORT"
@@ -2039,7 +2060,7 @@ run_arm() {
     esac
     ((attempt == 0)) || base+="-a$attempt"
     seed=$((SEED + (rep > 0 ? rep - 1 : 0)))
-    if [[ "$config" == T ]]; then
+    if arm_over_tls "$config" "$arm"; then
         tls=1
     fi
     url="$(target_url "$config" "$arm")"
@@ -2101,7 +2122,7 @@ run_arm() {
     if [[ "$kind" == perf ]]; then
         run_ctx[perf]=1
     fi
-    if [[ "$arm" != direct ]]; then
+    if ! direct_arm "$arm"; then
         start_sut "$arm" "$config" "$base"
         run_ctx[sut_pid]="${pids[sut]}"
         if [[ "$scen" == s1 ]] && ((IDLE_RSS_S > 0)); then
@@ -2143,17 +2164,26 @@ run_rep() {
     done
 }
 
+# The direct arm whose ramp gives the ramp block of a config its tool limit:
+# it reaches the mock the block's SUT arms reach, the TLS mock in P and T and
+# the plaintext one in N. Every ramp block measures its own, right before
+# its pairs, so P and T each run the same TLS path once.
+tool_ramp_arm() {
+    if [[ "$1" == P ]]; then echo direct-tls; else echo direct; fi
+}
+
 # The direct ramp that gives a ramp block its tool limit.
 run_tool_ramp() {
-    local config="$1" attempt=0
+    local config="$1" attempt=0 arm
+    arm="$(tool_ramp_arm "$config")"
     while true; do
-        log "== config $config, ramp, direct tool limit$( ((attempt == 0)) || echo ", rerun $attempt")"
-        run_arm ramp "$config" "" direct 0 "$attempt" 1 tool
+        log "== config $config, ramp, $arm tool limit at $(arm_mock ramp "$config" "$arm")$( ((attempt == 0)) || echo ", rerun $attempt")"
+        run_arm ramp "$config" "" "$arm" 0 "$attempt" 1 tool
         if ((run_ok)); then
             return 0
         fi
         if ((attempt >= RETRY_INVALID)); then
-            log "  the direct ramp of config $config is still invalid; its tool limit is unknown"
+            log "  the $arm ramp of config $config is still invalid; its tool limit is unknown"
             return 0
         fi
         attempt=$((attempt + 1))
