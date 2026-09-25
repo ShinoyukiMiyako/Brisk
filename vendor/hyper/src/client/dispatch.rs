@@ -37,7 +37,11 @@ pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
         giver,
         inner: tx,
     };
-    let rx = Receiver { inner: rx, taker };
+    let rx = Receiver {
+        inner: rx,
+        taker,
+        wanting: false,
+    };
     (tx, rx)
 }
 
@@ -176,16 +180,32 @@ impl<T, U> Clone for UnboundedSender<T, U> {
 pub(crate) struct Receiver<T, U> {
     inner: mpsc::UnboundedReceiver<Envelope<T, U>>,
     taker: want::Taker,
+    // Local patch, not in hyper 1.11.1: the `wanting` flag and its uses in
+    // `poll_recv` and `try_recv`. The upstream issue against hyperium/hyper
+    // has not been filed yet.
+    /// Want has been signaled since a message was last taken.
+    ///
+    /// `Sender::can_send` consumes the want with `give()` and only then
+    /// enqueues its message. Signaling want again in between, from another
+    /// poll that still finds the queue empty, would leave a want behind once
+    /// that message is taken, and `Sender::is_ready` would report the busy
+    /// connection as ready for the next request. So want is signaled once
+    /// per idle period, and signaled again only after a message is taken.
+    wanting: bool,
 }
 
 impl<T, U> Receiver<T, U> {
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
         match self.inner.poll_recv(cx) {
             Poll::Ready(item) => {
+                self.wanting = false;
                 Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
             }
             Poll::Pending => {
-                self.taker.want();
+                if !self.wanting {
+                    self.wanting = true;
+                    self.taker.want();
+                }
                 Poll::Pending
             }
         }
@@ -200,7 +220,10 @@ impl<T, U> Receiver<T, U> {
     #[cfg(feature = "http1")]
     pub(crate) fn try_recv(&mut self) -> Option<(T, Callback<T, U>)> {
         match crate::common::task::now_or_never(self.inner.recv()) {
-            Some(Some(mut env)) => env.0.take(),
+            Some(Some(mut env)) => {
+                self.wanting = false;
+                env.0.take()
+            }
             _ => None,
         }
     }
@@ -394,6 +417,11 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
+    #[cfg(feature = "http1")]
+    use tokio::sync::oneshot;
+
+    #[cfg(feature = "http1")]
+    use super::Envelope;
     use super::{channel, Callback, Receiver};
 
     #[derive(Debug)]
@@ -465,6 +493,61 @@ mod tests {
         assert!(PollOnce(&mut rx).await.is_none(), "rx empty");
 
         tx.try_send(Custom(2)).expect("2 ready");
+    }
+
+    // `try_send` consumes the want with `give()` and only then enqueues the
+    // message. The h1 dispatcher polls the receiver several times per idle
+    // period, so a poll can find the queue still empty in between. It must
+    // not signal want again there: a want left over once the message is taken
+    // makes `is_ready()` report the busy connection as ready, and a pool
+    // then queues the next request behind a response that may still be
+    // streaming.
+    #[cfg(feature = "http1")]
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn want_is_not_signaled_again_between_give_and_enqueue() {
+        let (mut tx, mut rx) = channel::<Custom, ()>();
+
+        // Idle: the receiver finds the queue empty and signals want.
+        assert!(PollOnce(&mut rx).await.is_none(), "rx empty");
+        assert!(tx.is_ready(), "idle receiver wants");
+
+        // First half of `try_send`: `give()` consumes the want.
+        assert!(tx.can_send(), "can send after want");
+
+        // The receiver polls again before the message is in the queue.
+        assert!(PollOnce(&mut rx).await.is_none(), "rx still empty");
+
+        // Second half of `try_send`: enqueue.
+        let (cb, _promise) = oneshot::channel();
+        let enqueued = tx
+            .inner
+            .send(Envelope(Some((Custom(1), Callback::NoRetry(Some(cb))))));
+        assert!(enqueued.is_ok(), "enqueue");
+
+        // The receiver takes the message and is busy with it.
+        assert!(PollOnce(&mut rx).await.is_some(), "rx takes message");
+        assert!(!tx.is_ready(), "busy receiver must not want");
+
+        // The next idle period signals want again.
+        assert!(PollOnce(&mut rx).await.is_none(), "rx empty again");
+        assert!(tx.is_ready(), "idle receiver wants again");
+    }
+
+    // Taking a message with `try_recv` ends the idle period too, or the
+    // receiver would never signal want again.
+    #[cfg(feature = "http1")]
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn want_is_signaled_again_after_try_recv() {
+        let (mut tx, mut rx) = channel::<Custom, ()>();
+
+        assert!(PollOnce(&mut rx).await.is_none(), "rx empty");
+        tx.try_send(Custom(1)).expect("ready");
+        assert!(rx.try_recv().is_some(), "try_recv takes message");
+
+        assert!(PollOnce(&mut rx).await.is_none(), "rx empty again");
+        assert!(tx.is_ready(), "idle receiver wants again");
     }
 
     #[cfg(feature = "http2")]
