@@ -570,6 +570,7 @@ warmup = {{ method = "GET", path = "/v1/models" }}
         let client = client();
 
         let started = Instant::now();
+        let abandoned_at = std::cell::Cell::new(None);
         let exercise = async {
             wait_ready(&client, addr).await;
             let in_flight = chat_request(&client, addr, &key).send();
@@ -579,14 +580,20 @@ warmup = {{ method = "GET", path = "/v1/models" }}
                 // whole 30s grace period; the second request cuts it short.
                 send_request.send("first").expect("the server listens");
                 send_request.send("second").expect("the server listens");
+                abandoned_at.set(Some(Instant::now()));
             };
             let (response, ()) = tokio::join!(in_flight, signal_twice);
             response
         };
-        let (served, response) = tokio::join!(
-            timeout(Duration::from_secs(30), serve_bound(bound, &mut requests)),
-            exercise
-        );
+        let serve = async {
+            let served = timeout(Duration::from_secs(30), serve_bound(bound, &mut requests)).await;
+            (served, Instant::now())
+        };
+        let ((served, returned_at), response) = tokio::join!(serve, exercise);
+        // Abandoning must also stop the warm-up task, which holds an outcome
+        // sender; otherwise the logger waits out the whole FINAL_DRAIN.
+        let abandon = returned_at - abandoned_at.get().expect("both signals were sent");
+        assert!(abandon < Duration::from_secs(1), "{abandon:?}");
         let err = served
             .expect("the gateway stopped within 30s")
             .expect_err("an abandoned drain is an error");
