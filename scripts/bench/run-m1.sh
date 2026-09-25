@@ -23,6 +23,11 @@
 # --scope), so a dropped ssh connection neither ends it nor sends terminal
 # output over the network during the measurement.
 #
+# --print-config runs every check a session makes of its knobs, and fails
+# where the session would, before it prints them. It leaves out what reads
+# the host (CPUs online, the ephemeral port range, ports in use, tools,
+# binaries, setup-host.sh --check), which the session still checks.
+#
 #   config P  direct: loadgen -http->  mock   others: loadgen -http->  SUT -https-> mock
 #   config T  direct: loadgen -https-> mock   others: loadgen -https-> SUT -https-> mock
 #   config N  direct: loadgen -http->  mock   others: loadgen -http->  SUT -http->  mock
@@ -400,13 +405,6 @@ done
 : "${SC_CONCURRENCY:=$S1_CONCURRENCY}"
 : "${S1_REPS:=${REPS:-5}}" "${S2_REPS:=${REPS:-3}}" "${S3_REPS:=${REPS:-3}}" "${RAMP_REPS:=${REPS:-3}}"
 
-if ((print_config)); then
-    for name in "${knob_names[@]}"; do
-        printf '%s=%s\n' "$name" "${!name}"
-    done
-    exit 0
-fi
-
 # ---------------------------------------------------------------- checks
 
 positive_number() {
@@ -555,15 +553,10 @@ for arm in ${session_arms[$SESSION]}; do
     [[ "$arm" != floor-* ]] || session_has_floor=1
 done
 
-[[ -r /sys/devices/system/cpu/online ]] || die "/sys/devices/system/cpu/online is not readable; run-m1.sh needs the Linux benchmark host"
-online=" $(expand_cpus "$(</sys/devices/system/cpu/online)") "
 for name in SUT_CPUS MOCK_CPUS LOADGEN_CPUS HARNESS_CPUS; do
     valid_cpu_list "${!name}" || die "$name must be a CPU list like 0-1 or 2,3, got '${!name}'"
-    # An assignment, so that a failed expansion stops the script.
-    expanded="$(expand_cpus "${!name}")"
-    for c in $expanded; do
-        [[ "$online" == *" $c "* ]] || die "$name includes CPU $c, which is not online (online:$online)"
-    done
+    # Not in a command substitution, so that a reversed range stops the script.
+    expand_cpus "${!name}" >/dev/null
 done
 
 # Overlapping sets would let the tools and the SUT compete for a core without
@@ -585,6 +578,36 @@ for pair in MOCK_SHARDS:MOCK_CPUS LOADGEN_SHARDS:LOADGEN_CPUS; do
         die "$shards_knob (${!shards_knob}) exceeds the $(cpu_count "${!cpus_knob}") CPU(s) of $cpus_knob (${!cpus_knob})"
 done
 
+ports=("$MOCK_PLAIN_PORT" "$MOCK_TLS_PORT" "$SUT_P_PORT" "$SUT_T_PORT" "$SC_PORT")
+if (($(printf '%s\n' "${ports[@]}" | sort -u | wc -l) != ${#ports[@]})); then
+    die "the five ports must differ: ${ports[*]}"
+fi
+for port in "${ports[@]}"; do
+    ((port >= 1024 && port <= 65535)) || die "port $port must lie in 1024-65535"
+    for reserved in "${reserved_ports[@]}"; do
+        ((port != reserved)) || die "port $port is reserved (RESERVED_PORTS) for another service"
+    done
+done
+
+# Everything above checks the knobs alone, so that --print-config refuses
+# what a session would refuse for its knobs; what follows reads the host.
+if ((print_config)); then
+    for name in "${knob_names[@]}"; do
+        printf '%s=%s\n' "$name" "${!name}"
+    done
+    exit 0
+fi
+
+[[ -r /sys/devices/system/cpu/online ]] || die "/sys/devices/system/cpu/online is not readable; run-m1.sh needs the Linux benchmark host"
+online=" $(expand_cpus "$(</sys/devices/system/cpu/online)") "
+for name in SUT_CPUS MOCK_CPUS LOADGEN_CPUS HARNESS_CPUS; do
+    # An assignment, so that a failed expansion stops the script.
+    expanded="$(expand_cpus "${!name}")"
+    for c in $expanded; do
+        [[ "$online" == *" $c "* ]] || die "$name includes CPU $c, which is not online (online:$online)"
+    done
+done
+
 for tool in jq curl taskset nstat sha256sum ss getconf flock lscpu grep; do
     command -v "$tool" >/dev/null || die "$tool is required"
 done
@@ -596,19 +619,12 @@ for bin in "${required_bins[@]}"; do
         die "$BIN_DIR/$bin not found; run scripts/bench/sync.sh (brisk: CARGO_TARGET_DIR=~/brisk-target cargo build --locked --release -p brisk)"
 done
 
-ports=("$MOCK_PLAIN_PORT" "$MOCK_TLS_PORT" "$SUT_P_PORT" "$SUT_T_PORT" "$SC_PORT")
-if (($(printf '%s\n' "${ports[@]}" | sort -u | wc -l) != ${#ports[@]})); then
-    die "the five ports must differ: ${ports[*]}"
-fi
 # A port inside the ephemeral range can be taken by any outgoing connection
 # between the check below and the bind.
 read -r ephemeral_low _ </proc/sys/net/ipv4/ip_local_port_range
 for port in "${ports[@]}"; do
     ((port >= 1024 && port < ephemeral_low)) ||
         die "port $port must lie in 1024-$((ephemeral_low - 1)), below the ephemeral range"
-    for reserved in "${reserved_ports[@]}"; do
-        ((port != reserved)) || die "port $port is reserved (RESERVED_PORTS) for another service"
-    done
     # A listening port belongs to someone else; never bind next to it or send
     # load to it.
     if [[ -n "$(ss -Hltn "sport = :$port")" ]]; then
