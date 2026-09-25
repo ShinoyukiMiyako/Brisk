@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "bench/*"]
+# Vendored third-party crates are patched in below, not workspace members:
+# workspace lints, clippy and tests do not apply to them. Entries here are
+# path prefixes (no globs), so "vendor" covers every crate under vendor/.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.0.0"
@@ -56,6 +60,15 @@ toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5.8"
+
+# hyper 1.11.1 with a fix for a want-signal race in the HTTP/1 client
+# dispatcher (src/client/dispatch.rs): the hyper-util legacy pool could put a
+# connection back while its streamed response body was still arriving, and the
+# next request then waited for that stream to end. Brisk and floor-A share this
+# client. The fix is not upstream yet (hyperium/hyper issue to be filed); drop
+# this patch and vendor/hyper once a hyper release contains it.
+[patch.crates-io]
+hyper = { path = "vendor/hyper" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
