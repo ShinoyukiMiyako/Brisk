@@ -117,9 +117,9 @@
 # each: a violation the same seed repeats is a defect, which must not hide
 # as a missing comparison. A run that failed, or a check without connection
 # counts, is not evaluated. A violation that is the only evaluated one of
-# its repetition leaves the verdict UNCERTAIN, with more repetitions added
-# (EXTEND_UNCERTAIN); with RETRY_INVALID=0 no violation can be rechecked,
-# so one is UNCERTAIN with no repetition added, and the text says why.
+# its repetition leaves the verdict UNCERTAIN with no repetition added: a
+# new repetition runs a new seed and cannot recheck that one. The text says
+# why (with RETRY_INVALID=0 nothing is ever rechecked).
 #
 # Brisk: at the start of the session `brisk keygen` makes a virtual key, read
 # by its frozen output format (contract 05, section 1.5). Its digest goes into
@@ -1170,9 +1170,9 @@ def per_cpu: if . == null then null else . / $cpus end;
 # arm broke (b) in every evaluated attempt of one, at least two each
 # (recheck), instead of letting the repetition show up only as a missing
 # comparison. A violation that is the only evaluated one of its repetition
-# was never rechecked, so the verdict is UNCERTAIN: extendable when the
-# other runs or attempts failed or lacked connection counts, not under
-# RETRY_INVALID=0, which reruns nothing and so can recheck no violation.
+# was never rechecked, so the verdict is UNCERTAIN, and never extendable: an
+# added repetition runs a new seed, so it cannot recheck that repetition and
+# would only extend the block to EXTEND_MAX_REPS without settling anything.
 # Judged are the Brisk arms but brisk-pt (reported only, 8.9 RM5), or in a
 # block without one every arm but direct; the others are reported. The other
 # compared pairs, across pool policies (against direct, floor-B against
@@ -1260,9 +1260,9 @@ def broke($what; $unit):
 | (if $verdict != "UNCERTAIN" then ""
    elif $retries == 0
    then ": a violation was never rechecked, since RETRY_INVALID=0 reruns no repetition; no repetition is added, none could be rechecked either"
-   else ": a violation was never rechecked, since no other run or attempt of its repetition was evaluated (they failed or lacked connection counts)" end) as $why
+   else ": a violation was never rechecked, since no other run or attempt of its repetition was evaluated (they failed or lacked connection counts); no repetition is added, as a new seed cannot recheck it" end) as $why
 | {id: "\($block):reuse", block: $block, kind: "reuse", rule: "7.5 reuse", verdict: $verdict,
-   gated: ($scope == "gated"), extendable: ($scope == "gated" and $verdict == "UNCERTAIN" and $retries > 0),
+   gated: ($scope == "gated"), extendable: false,
    text: ("\($block) connections over the window, mean per compared run: "
           + ([$by[] | "\(.arm) (\(.compared) run(s)): upstream \(.new_conns | fixed1) new (\(.new_per_s | fixed3)/s, reuse \(.reuse | pct4)), "
                       + (if .direct then "no inbound leg of its own" else "inbound \(.inbound_fresh | fixed1) fresh" end)
