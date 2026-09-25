@@ -47,8 +47,6 @@ use hyper::{HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use tokio::net::TcpStream;
-// tokio's `sync` feature is not in this crate's manifest; brisk-gateway, which
-// every build of this crate includes, enables it.
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};

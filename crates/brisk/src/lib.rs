@@ -43,8 +43,6 @@ use brisk_gateway::upstream::chat_url;
 use brisk_gateway::upstream::registry::ChannelWarning;
 use brisk_gateway::upstream::resolver::validate_base_url;
 use tokio::net::TcpListener;
-// tokio's `sync` feature is not in this crate's manifest; brisk-gateway, which
-// every build of this crate includes, enables it.
 use tokio::sync::oneshot;
 use tokio::task::JoinError;
 use tokio_rustls::TlsAcceptor;

@@ -65,8 +65,6 @@ const MAX_OUTCOME_QUEUE: usize = 1 << 24;
 /// Largest accepted `server.max_connections`: `server::serve` sizes a Tokio
 /// semaphore with it and refuses to start above that semaphore's limit, so
 /// the loader rejects such a value before `check-config` can pass it.
-// tokio's `sync` feature is not in this crate's manifest; brisk-gateway, which
-// every build of this crate includes, enables it.
 const MAX_CONNECTIONS: usize = tokio::sync::Semaphore::MAX_PERMITS;
 
 /// The range of [`MAX_CONNECTIONS`] as error text; `ConfigError::Invalid`

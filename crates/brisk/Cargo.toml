@@ -20,7 +20,7 @@ clap = { workspace = true }
 rustls-pki-types = { workspace = true, features = ["std"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "net", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "macros", "net", "sync", "time"] }
 tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 toml = { workspace = true }
 # Unifies across the whole dependency graph: debug and trace events of the
