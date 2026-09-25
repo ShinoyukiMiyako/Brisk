@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
 use crate::auth::{KeyTable, KeyTableError};
@@ -142,7 +143,8 @@ impl Gateway {
     }
 
     /// Starts warm-up, serves until `shutdown` completes, then drains
-    /// connections for `graceful_shutdown_timeout` and stops warm-up. Must run
+    /// connections for `graceful_shutdown_timeout` and stops warm-up.
+    /// Dropping the future before it completes also stops warm-up. Must run
     /// inside a multi-thread Tokio runtime.
     ///
     /// When `shutdown` completes, bodies are told first (so a stream aborted
@@ -166,6 +168,12 @@ impl Gateway {
         }
         let jobs = self.state().resolve().channels.warmup_jobs().to_vec();
         let (readiness, warmup) = spawn_warmup(jobs, &self.inner.warmup, self.sink().clone());
+        // Owned by this future, so warm-up also stops when the future is
+        // dropped instead of completing (`brisk` aborts the serve task on a
+        // second signal). A detached warm-up task would keep its
+        // `OutcomeSink` clones and the outcome logger would never see every
+        // sender gone.
+        let _warmup = AbortOnDrop(warmup);
         // A second `serve` keeps the first readiness; both loops warm the
         // same pools.
         let _ = self.inner.readiness.set(readiness);
@@ -176,7 +184,7 @@ impl Gateway {
             sink.begin_shutdown();
         };
         let config = self.inner.server.clone();
-        let served = match self.inner.experiments.router {
+        match self.inner.experiments.router {
             RouterKind::Axum => {
                 let service = Sanitize::new(TowerToHyperService::new(axum_router(self)));
                 server::serve(listener, tls, config, service, shutdown).await
@@ -184,9 +192,7 @@ impl Gateway {
             RouterKind::Match => {
                 server::serve(listener, tls, config, MatchService::new(self), shutdown).await
             }
-        };
-        warmup.abort();
-        served
+        }
     }
 
     /// Whether `/readyz` answers 200: the first warm-up round finished or
@@ -238,6 +244,15 @@ impl Gateway {
     /// Where outcomes go.
     pub(crate) fn sink(&self) -> &OutcomeSink {
         &self.inner.settle.sink
+    }
+}
+
+/// Aborts the task when dropped, so that it cannot outlive its owner.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
