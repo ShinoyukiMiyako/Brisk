@@ -121,8 +121,10 @@
 # ratio Brisk / floor-A over at least 3 pairs: all >= 0.85 PASS, mean < 0.85
 # FAIL, else UNCERTAIN; a ramp without a sustainable step lies below
 # RAMP_START, which bounds its pair's ratio, and a tool-limited block is
-# only reported. The e-sessions print their rules as MET or NOT_MET
-# (TRIGGERED or not in e11) and a decision. Memory, idle RSS, CPU per chunk
+# only reported. The reuse limit (>= 99.9%) must hold in every run of the
+# Brisk arms, the voided and rerun ones included. The e-sessions print their
+# rules as MET or NOT_MET (TRIGGERED or not in e11) and a decision.
+# Memory, idle RSS, CPU per chunk
 # and per request, chunk_wire, the strip cost and the HITM counts are
 # reported only, with the contract's reference values where it names them.
 #
@@ -929,17 +931,40 @@ def per_cpu: if . == null then null else . / $cpus end;
  data: {a: $ra, b: $rb, cpus: $cpus}}
 '
 
-# Upstream connection reuse of a block. Input: a selection.
+# Upstream connection reuse of a block, 7.5: at least 99.9% in the steady
+# state. A run below MIN_REUSE is voided and its repetition rerun (6.2),
+# which keeps cold connections out of the comparisons but does not undo the
+# observation, so the verdict reads every run of the block, voided ones
+# included, and one run of a judged arm below 99.9% fails it. Judged are the
+# Brisk arms of the selection, whose property 7.5 states, or in a block
+# without one every arm but direct; the others are reported. A failed run
+# (loadgen or the SUT broke) has no steady state and is left out. Input: a
+# selection; $runs: runs.jsonl, slurped.
 # shellcheck disable=SC2016
 prog_reuse='
-[.runs | to_entries[] | {arm: .key, rates: [.value[].reuse.rate | numbers]}] as $by
-| [$by[].rates[]] as $all
-| (if ($all | length) == 0 then "MISSING" elif ($all | min) >= 0.999 then "PASS" else "FAIL" end) as $v
-| {id: "\($block):reuse", block: $block, kind: "reuse", rule: "7.5 reuse", verdict: $v,
+[.runs | keys_unsorted[]] as $arms
+| ([$arms[] | select(startswith("brisk"))] | if length > 0 then . else [$arms[] | select(. != "direct")] end) as $judged
+| [$runs[] | select(.scen == $s and .config == $c and .var == $v and .kind == "run" and .failed != true
+                    and (.reuse.rate | type) == "number")] as $all
+| [$arms[] as $arm
+   | [$all[] | select(.arm == $arm)] as $r
+   | {arm: $arm, judged: ($arm | IN($judged[])), runs: ($r | length), lowest: ([$r[].reuse.rate] | min),
+      below: ([$r[] | select(.reuse.rate < 0.999)] | length),
+      voided_below: ([$r[] | select(.reuse.rate < 0.999 and .valid != true)] | length)}] as $by
+| [$by[] | select(.judged)] as $j
+| (if ($j | length) == 0 or any($j[]; .runs == 0) then "MISSING"
+   elif all($j[]; .below == 0) then "PASS"
+   else "FAIL" end) as $verdict
+| {id: "\($block):reuse", block: $block, kind: "reuse", rule: "7.5 reuse", verdict: $verdict,
    gated: ($scope == "gated"), extendable: false,
-   text: ("\($block) upstream connection reuse over the window, lowest per arm: "
-          + ([$by[] | "\(.arm) \(.rates | min | pct4)"] | join(", "))
-          + "; limit >= 99.9%: \($v)" + (if $scope == "gated" then " (gated)" else " (reported)" end)),
+   text: ("\($block) upstream connection reuse over the window, lowest per arm over all its runs, voided ones included: "
+          + ([$by[] | "\(.arm) \(.lowest | pct4) (\(.runs) run(s)"
+                      + (if .below == 0 then ""
+                         else ", \(.below) below 99.9%"
+                              + (if .voided_below > 0 then ", \(.voided_below) of them voided and rerun" else "" end) end)
+                      + (if .judged then "" else ", reported" end) + ")"] | join(", "))
+          + "; limit >= 99.9% in every run of \($judged | join(", ")): \($verdict)"
+          + (if $scope == "gated" then " (gated)" else " (reported)" end)),
    data: $by}
 '
 
@@ -2439,9 +2464,12 @@ check_delta() {
         "$jq_defs$prog_check_delta")"
 }
 
+# Upstream connection reuse of the selection's arms over every run of the
+# block (prog_reuse).
 report_reuse() {
-    local block="$1" selection="$2" scope="$3"
-    add_verdict "$(jq -c --arg block "$block" --arg scope "$scope" "$jq_defs$prog_reuse" <<<"$selection")"
+    local block="$1" selection="$2" scope="$3" scen="$4" config="$5" var="$6"
+    add_verdict "$(jq -c --slurpfile runs "$run_dir/runs.jsonl" --arg block "$block" --arg scope "$scope" \
+        --arg s "$scen" --arg c "$config" --arg v "$var" "$jq_defs$prog_reuse" <<<"$selection")"
 }
 
 # CPU per chunk (S1) or per request (S2, S3) of every SUT arm, and between
@@ -2591,9 +2619,9 @@ evaluate_block() {
         scope=gated
     fi
     if [[ "$scen" == s3 ]]; then
-        report_reuse "$block" "$selection" reported
+        report_reuse "$block" "$selection" reported "$scen" "$config" "$var"
     else
-        report_reuse "$block" "$selection" "$scope"
+        report_reuse "$block" "$selection" "$scope" "$scen" "$config" "$var"
     fi
     report_cpu "$scen" "$block" "$selection" "$@"
     if [[ "$scen" == s1 ]]; then
