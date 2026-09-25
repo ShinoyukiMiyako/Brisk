@@ -213,7 +213,8 @@
 # on exit, failures included. Exit status: 0 when every gated verdict is PASS
 # and nothing failed; 1 when the selfcheck, a run, a comparison or an
 # evaluation failed, or a gated verdict is FAIL or MISSING; 3 when a gated
-# verdict is still UNCERTAIN.
+# verdict is still UNCERTAIN. The S2 perf runs are reported only: a failed
+# one goes into the perf and C21 reports and the manifest's perf field.
 
 set -euo pipefail
 
@@ -1017,8 +1018,11 @@ prog_ramp_pairs='
 # when A has none, no bound when neither has. The 7.5 rule over at least 3
 # pairs: PASS when every ratio is at least 0.85 (every low bound), FAIL when
 # their mean is below 0.85 (the mean of the high bounds), else UNCERTAIN,
-# which more pairs can settle unless a pair has no bound. A tool-limited
-# block is reported only, whatever its ratios.
+# which more pairs can settle unless a pair has no bound or B has no rate in
+# any pair: its high bounds then come from RAMP_START, not from B, and stay
+# at 0.85 or more while A stays close to RAMP_START. A tool-limited block is
+# reported only, whatever its ratios. $tool_arm names the direct arm whose
+# ramp gave the tool limit (tool_ramp_arm).
 # shellcheck disable=SC2016
 prog_ramp_verdict='
 def ramp_rate: if . == null then "<" + ($start | rate) else rate end;
@@ -1058,17 +1062,24 @@ def ratio_text: if .lo == .hi then .lo | fixed3
    else
      # Tool-limited first: such a block is reported only, whatever else holds.
      (if $n == 0 then {verdict: "MISSING", note: "no pair of valid ramps"}
-      elif $limited == true then {verdict: "REPORT", note: "tool-limited: \($a) reached \($amax / $tool | pct) of the direct ramp"}
+      elif $limited == true then {verdict: "REPORT", note: "tool-limited: \($a) reached \($amax / $tool | pct) of the \($tool_arm) ramp"}
       elif $limited == null and $tool != null
       then {verdict: "UNCERTAIN",
             note: "\($a) has no sustainable step in any pair, and RAMP_START exceeds \($share) of the tool limit, so whether the block is tool-limited is unknown"}
-      elif $limited == null then {verdict: "UNCERTAIN", note: "tool limit unknown: no valid direct ramp"}
+      elif $limited == null then {verdict: "UNCERTAIN", note: "tool limit unknown: no valid \($tool_arm) ramp"}
       elif $n < 3 then {verdict: "UNCERTAIN", statistical: true, note: "\($n) pair(s), the rule needs 3"}
       elif all($bounds[]; .lo >= 0.85) then {verdict: "PASS"}
       elif all($bounds[]; .hi != null) and ([$bounds[].hi] | add / length) < 0.85 then {verdict: "FAIL"}
       elif $unbounded > 0
       then {verdict: "UNCERTAIN",
             note: "neither ramp of \($unbounded) pair(s) sustained RAMP_START (\($start | rate) req/s), so their ratios have no bound; lower RAMP_START"}
+      # B below RAMP_START in every pair, A with a rate in each (no unbounded
+      # pair): the ratios only have high bounds RAMP_START / A, 0.85 or more
+      # on average, and more pairs with B again below RAMP_START do not bring
+      # them lower while A stays close to RAMP_START.
+      elif all($pairs[]; .b.max_sustainable_rate == null)
+      then {verdict: "UNCERTAIN",
+            note: "\($b) sustained RAMP_START (\($start | rate) req/s) in no pair, so each ratio only has the high bound RAMP_START / \($a), whose mean \([$bounds[].hi] | add / length | fixed3) comes from RAMP_START rather than from \($b); more repetitions do not settle it, lower RAMP_START"}
       else {verdict: "UNCERTAIN", statistical: true} end)
      | . + {rule: "7.5 S2 throughput",
             rule_text: "rule: at least 3 pairs, every ratio >= 0.85 PASS, their mean < 0.85 FAIL"}
@@ -1080,11 +1091,11 @@ def ratio_text: if .lo == .hi then .lo | fixed3
    extendable: ($v.counts and $v.verdict == "UNCERTAIN" and $v.statistical == true),
    text: ("\($block): max sustainable rate \($b)/\($a) per pair [\($rates)] req/s, ratios ["
           + ([$bounds[] | ratio_text] | join(", "))
-          + "]; direct tool limit \($tool | rate) req/s; \($v.rule_text): \($v.verdict)"
+          + "]; \($tool_arm) tool limit \($tool | rate) req/s; \($v.rule_text): \($v.verdict)"
           + (if $v.counts then " (gated\($note))"
              elif $session == "e1" then ""
              else " (reported\($note))" end)),
-   data: {tool: $tool, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
+   data: {tool: $tool, tool_arm: $tool_arm, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
 '
 
 # Sustainable rate per vCPU of the SUT, from the ramp pairs.
@@ -1271,11 +1282,12 @@ prog_perf_report='
                          then ([$p.counts | to_entries[]
                                 | "\(.key) \(.value | rate) (\($p.per_request[.key] | fixed3)/request)"]
                                | join(", "))
-                         else "not counted (\($p.reason))" end)]
+                         else "not counted (\($p.reason))" end)
+                      + (if .failed then " (the perf run failed: \(.reasons | join("; ")))" else "" end)]
                    | join("; "))
              end)
           + $hitm_note),
-   data: [$recs[] | {arm, perf, requests: .sut.requests}]}
+   data: [$recs[] | {arm, failed, reasons, perf, requests: .sut.requests}]}
 '
 
 # E11 on S1 chunk_latency p99 (contract 05, 6.3).
@@ -1622,7 +1634,10 @@ def kv: split("\n") | map(select(test("=")) | capture("^(?<k>[^=]+)=(?<v>.*)$") 
    virtual_key: (if $key_sha256 == "" then null else {name: $key_name, sha256: $key_sha256} end),
    cpu_method: "per CPU: busy = 1 - (idle + iowait) / wall clock, steal = /proc/stat steal ticks / wall clock, softirq as /proc/softirqs events; per process and SUT: utime + stime over the window",
    selfcheck: $selfcheck, selfcheck_detail: $selfcheck_detail,
-   perf: {status: $perf_status, reason: $perf_reason, events: $perf_events, hitm_events: $perf_hitm},
+   perf: {status: $perf_status, reason: $perf_reason, events: $perf_events, hitm_events: $perf_hitm,
+          c21_status: $c21_status, c21_reason: $c21_reason,
+          failed_runs: [$runs[] | select(.kind == "perf" and .failed == true)
+                        | {tag, config, arm, reasons, c21_status: .perf.c21.status, c21_reason: .perf.c21.reason}]},
    invalid_runs: $invalid, retries: $retries, extensions: $extensions, failed_runs: $failed,
    evaluation_errors: $evaluation_errors,
    gated: {pass: ([$final[] | select(.gated and .verdict == "PASS")] | length),
@@ -2186,8 +2201,15 @@ execute_run() {
         failed=1
         reasons+=("the process under test exited during the run (logs/$tag.sut.log)")
     fi
+    # The perf runs are reported only (7.5 HITM, C21): a failed one shows in
+    # the perf and C21 reports and the manifest's perf field, and leaves the
+    # session's exit status alone.
     if ((failed)); then
-        failed_runs=$((failed_runs + 1))
+        if [[ "${run_ctx[kind]}" == perf ]]; then
+            log "  $tag: the perf run failed; it is reported only and does not count as a failed run"
+        else
+            failed_runs=$((failed_runs + 1))
+        fi
     fi
     # compare reads the repetitions of S1, S2 and S3; a run it would refuse
     # is rerun here instead of costing the block its comparisons.
@@ -3179,7 +3201,7 @@ evaluate_ramp() {
     pairs="$(jq -sc --arg c "$config" --arg a "$a" --arg b "$b" "$prog_ramp_pairs" "$run_dir/runs.jsonl")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" --arg scope "$scope" \
         --argjson share "$RAMP_TOOL_LIMIT_SHARE" --argjson start "$RAMP_START" --arg step_pct "$RAMP_STEP_PCT" \
-        "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
+        --arg tool_arm "$(tool_ramp_arm "$config")" "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" \
         --argjson cpus "$(cpu_count "$SUT_CPUS")" "$jq_defs$prog_ramp_vcpu" <<<"$pairs")"
 }
@@ -3463,11 +3485,13 @@ def pct2: if . == null then "n/a" else (. * 100 | r2 | tostring) + "%" end;
                                  else ", 3% not ruled out" end)
                               + (if $p.lost == null then "" else " (perf: \($p.lost))" end)
                          end)
-                      + (if .valid then "" else " (in an invalid run)" end)]
+                      + (if .failed then " (the perf run failed: \(.reasons | join("; ")))"
+                         elif .valid then ""
+                         else " (in an invalid run)" end)]
                    | join("; "))
              end)
           + "; the Mutex and futex parts count every lock and condvar of the SUT, which bounds the pool from above"),
-   data: [$recs[] | {arm, valid, c21: .perf.c21}]}
+   data: [$recs[] | {arm, valid, failed, reasons, c21: .perf.c21}]}
 '
 jq_programs+=(prog_c21_report)
 
@@ -3656,7 +3680,7 @@ write_manifest() {
         --argjson evaluation_errors "$evaluation_errors" --argjson patch "$patch" \
         --arg arms "${session_arms[$SESSION]}" --arg key_name "$key_name" --arg key_sha256 "$key_sha256" \
         --arg perf_status "$perf_status" --arg perf_reason "$perf_reason" --arg perf_events "$perf_events" \
-        --arg perf_hitm "$perf_hitm_events" \
+        --arg perf_hitm "$perf_hitm_events" --arg c21_status "$c21_status" --arg c21_reason "$c21_reason" \
         --rawfile knobs "$run_dir/host/knobs.env" --rawfile sync "$run_dir/host/sync-info" \
         --rawfile binaries "$run_dir/host/binaries.txt" \
         --slurpfile runs "$run_dir/runs.jsonl" --slurpfile compares "$run_dir/compares.jsonl" \
