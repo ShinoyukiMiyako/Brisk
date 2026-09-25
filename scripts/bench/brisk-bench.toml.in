@@ -1,0 +1,54 @@
+# Brisk configuration of the M1 benchmark sessions (contract 05, section 6.1).
+#
+# scripts/bench/run-m1.sh renders this template once per Brisk arm and config
+# into <session directory>/brisk/<arm>-<config>.toml and validates every
+# rendering with `brisk check-config` before the first run. The script
+# replaces each placeholder (an upper-case name between two at signs); a
+# placeholder the script has no value for, or a value whose placeholder is
+# missing here, stops the session before anything starts.
+#
+# The rendered name does not end in .local.toml, so the loader refuses an
+# inline api_key value: the channel key comes from the environment the script
+# starts Brisk with, and brisk-mock does not check it. The digest of the
+# virtual key comes from `brisk keygen` at the start of the session; the key
+# itself only reaches brisk-loadgen.
+
+[server]
+# Loopback, so plaintext listening needs no allow_plaintext (configs P and N).
+listen = "@LISTEN@"
+# One worker per CPU of the set the script confines Brisk to with taskset.
+workers = @WORKERS@
+# Config T: inbound TLS with the mock's certificate; empty in P and N.
+@SERVER_TLS_TABLE@
+
+[forwarding]
+# E4 compares "2s" (the default) with "0s" (commit at the 2xx head).
+commit_hold = "@COMMIT_HOLD@"
+
+[experiments]
+# E1: "axum" (the default) or "match".
+router = "@ROUTER@"
+# E2: "segments" (the default) or "concat".
+splice = "@SPLICE@"
+
+[[keys]]
+name = "@KEY_NAME@"
+sha256 = "@KEY_SHA256@"
+
+[[channels]]
+name = "mock"
+# http://<mock>/v1 in config N, https://<mock>/v1 in P and T.
+base_url = "@UPSTREAM_BASE_URL@"
+api_key = { env = "@UPSTREAM_KEY_ENV@" }
+allow_private = true
+# "inject" is the gated product path; the passthrough variant is reported only.
+stream_usage = "@STREAM_USAGE@"
+# E2 maps the load generator's model name to another one, so that every
+# streaming request carries two edits; an empty table elsewhere.
+model_map = @MODEL_MAP@
+# brisk-mock answers HEAD / with a 404 that carries a body, which hyper treats
+# as a broken connection, so the default warmup keeps no connection to it; its
+# model list does.
+warmup = { method = "GET", path = "/v1/models" }
+# Configs P and T: the CA of the mock's self-signed certificate; empty in N.
+@CA_FILE_LINE@

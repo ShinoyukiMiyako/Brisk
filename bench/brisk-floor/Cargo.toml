@@ -1,6 +1,6 @@
 [package]
 name = "brisk-floor"
-description = "floor-A: an empty blind-forwarding proxy that measures the cost of the Brisk connection layer plus the upstream HTTP/1.1 client."
+description = "floor-A and floor-B: empty blind-forwarding proxies that measure the cost of the Brisk connection layer plus an upstream HTTP/1.1 client (reqwest for floor-A, a same-task hyper connection for floor-B)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,11 +14,13 @@ brisk-bench-core = { workspace = true }
 brisk-gateway = { workspace = true }
 clap = { workspace = true }
 http = { workspace = true }
-hyper = { workspace = true, features = ["server", "http1", "http2"] }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 reqwest = { workspace = true, features = ["rustls", "stream"] }
 rustls-pki-types = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros", "time"] }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
