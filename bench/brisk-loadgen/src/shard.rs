@@ -34,6 +34,18 @@
 //! its planned time. These censored samples go to the interval of the
 //! timeout, or to the last interval for the requests open at the end, and
 //! are counted in [`Counters`].
+//!
+//! Sends that fall behind are fired at most [`FIRE_BURST_NS`] per turn of
+//! the event loop, so a shard that cannot keep up still receives responses,
+//! reports ramp steps and sees the stop flag. Once stopped, a shard sends
+//! nothing more (planned sends are dropped, not sent late) and gives the
+//! requests in flight [`DRAIN_NS`] to finish before it censors them.
+//!
+//! In ramp mode a shard reports each step no later than a fixed delay after
+//! the step's planned end, whatever is still open then, and it stops on its
+//! own and tells the coordinator when a send falls further behind its
+//! schedule than the saturation limit: the load generator itself is then
+//! the bottleneck, not the target (see [`RampSpec`]).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -73,6 +85,18 @@ pub(crate) const STALE_RETRY: &str = "stale_retry";
 /// microseconds on loopback and well below a millisecond on a LAN, while a
 /// server that actually processed the request takes longer to fail it.
 pub(crate) const STALE_WINDOW_NS: u64 = 5_000_000;
+/// Longest a turn of the event loop spends firing overdue sends before it
+/// polls again. A shard that has fallen behind its schedule would otherwise
+/// fire its backlog without end: no response would be read, so every send
+/// would open a new connection and fall further behind, and neither step
+/// reports nor the stop flag would be looked at. An on-time loop fires one
+/// send, or a few after a late wakeup, per turn and never gets near it.
+pub(crate) const FIRE_BURST_NS: u64 = 1_000_000;
+/// After a stop, the requests in flight get this long to finish; the rest
+/// are censored. Long enough for any response the target is still
+/// producing at the rates of a benchmark, short enough that a stopped run
+/// ends within seconds.
+pub(crate) const DRAIN_NS: u64 = 1_000_000_000;
 
 /// Where a shard's requests come from.
 #[derive(Debug)]
@@ -146,7 +170,8 @@ pub(crate) struct Live {
     pub(crate) requests: AtomicU64,
     /// Errors so far, retries included.
     pub(crate) errors: AtomicU64,
-    /// Set by the coordinator to end the run early.
+    /// Ends the run early: set by the coordinator, or by a ramp shard that
+    /// found itself saturated.
     pub(crate) stop: AtomicBool,
 }
 
@@ -155,11 +180,36 @@ pub(crate) struct Live {
 pub(crate) struct RampSpec {
     /// The evaluated steps (step number >= 1) in order.
     pub(crate) steps: Vec<RateSegment>,
-    /// A request still open this long after its step ended exceeds the
-    /// stop threshold, so the step can be judged without waiting longer.
-    pub(crate) threshold_ns: u64,
-    /// Where finished steps are reported.
-    pub(crate) reports: Sender<StepReport>,
+    /// Every step is reported this long after its planned end at the
+    /// latest, earlier once all its sends are made and done. What is still
+    /// open then, requests in flight and planned sends not made yet, is
+    /// censored: each counts as a sample of the time since its scheduled
+    /// start, which this delay makes exceed the p99 limit.
+    pub(crate) judge_delay_ns: u64,
+    /// A send the event loop reaches this long after its scheduled time
+    /// means the shard cannot keep up with the schedule: it stops and
+    /// reports [`RampMessage::Saturated`].
+    pub(crate) saturation_lag_ns: u64,
+    /// Where step reports and saturation go.
+    pub(crate) reports: Sender<RampMessage>,
+}
+
+/// What a ramp shard tells the coordinator.
+#[derive(Debug)]
+pub(crate) enum RampMessage {
+    /// This shard's view of one step.
+    Step(StepReport),
+    /// The shard reached a send `lag_ns` after its scheduled time, beyond
+    /// the saturation limit, and stopped. Its reports of the steps it had
+    /// started follow once its requests in flight are settled.
+    Saturated {
+        /// Shard number.
+        shard: usize,
+        /// Step of the late send; 0 for the warmup.
+        step: u32,
+        /// How late the send was, nanoseconds.
+        lag_ns: u64,
+    },
 }
 
 /// One shard's view of one ramp step.
@@ -167,15 +217,23 @@ pub(crate) struct RampSpec {
 pub(crate) struct StepReport {
     /// Step number.
     pub(crate) step: u32,
-    /// Request latencies from the scheduled time; requests still open at
-    /// report time contribute a lower bound.
+    /// Request latencies from the scheduled time; requests still open and
+    /// planned sends not made at report time contribute a lower bound.
     pub(crate) latency: Histogram<u64>,
     /// Requests completed successfully.
     pub(crate) requests: u64,
     /// Requests failed.
     pub(crate) errors: u64,
-    /// Requests still open when the step was reported.
+    /// Requests still open, plus the planned sends not made, when the step
+    /// was reported.
     pub(crate) censored: u64,
+    /// Planned sends of the step not made when it was reported, because
+    /// the shard was behind its schedule or stopped. Part of `censored`;
+    /// they are dropped, never sent.
+    pub(crate) unsent: u64,
+    /// Largest lag of a send of the step behind its scheduled time, taken
+    /// when the event loop reached the send.
+    pub(crate) max_emit_lag_ns: u64,
 }
 
 /// Everything a shard needs.
@@ -406,6 +464,7 @@ struct StepAcc {
     outstanding: u64,
     requests: u64,
     errors: u64,
+    max_emit_lag_ns: u64,
 }
 
 impl StepAcc {
@@ -415,6 +474,7 @@ impl StepAcc {
             outstanding: 0,
             requests: 0,
             errors: 0,
+            max_emit_lag_ns: 0,
         }
     }
 }
@@ -427,13 +487,27 @@ struct RampTracker {
 }
 
 impl RampTracker {
-    fn on_start(&mut self, step: u32) {
-        if step > 0 {
-            self.steps
-                .entry(step)
-                .or_insert_with(StepAcc::new)
-                .outstanding += 1;
+    /// Notes a send of `step` reached `lag_ns` after its scheduled time.
+    fn note_lag(&mut self, step: u32, lag_ns: u64) -> Option<&mut StepAcc> {
+        (step > 0).then(|| {
+            let acc = self.steps.entry(step).or_insert_with(StepAcc::new);
+            acc.max_emit_lag_ns = acc.max_emit_lag_ns.max(lag_ns);
+            acc
+        })
+    }
+
+    fn on_start(&mut self, step: u32, lag_ns: u64) {
+        if let Some(acc) = self.note_lag(step, lag_ns) {
+            acc.outstanding += 1;
         }
+    }
+
+    /// The deadline of the next step to report.
+    fn next_deadline(&self) -> Option<u64> {
+        self.spec
+            .steps
+            .get(self.next_report)
+            .map(|seg| seg.end_ns.saturating_add(self.spec.judge_delay_ns))
     }
 
     /// `latency` is `None` for a failed request.
@@ -545,21 +619,41 @@ impl Shard {
         let mut events = Events::with_capacity(1024);
         let mut next_sample = self.origin_ns;
         let mut next_second = self.origin_ns + SEC_NS;
+        // Once the stop flag is seen: when, and when the drain ends.
+        let mut stopped: Option<(u64, u64)> = None;
         loop {
             let now = now_ns();
-            if self.live.stop.load(Ordering::Relaxed) {
-                self.end_ns = self.end_ns.min(now);
-                return Ok(());
+            if stopped.is_none() && self.live.stop.load(Ordering::Relaxed) {
+                // The drain never outlasts the planned end, where the
+                // requests still open are censored anyway.
+                let drain_end = now.saturating_add(DRAIN_NS).min(self.end_ns.max(now));
+                stopped = Some((now, drain_end));
             }
-            if now >= self.end_ns {
-                return Ok(());
-            }
-            let precise = self.next.map(|a| a.sched_ns);
+            let wake_by = if let Some((stop_ns, drain_end)) = stopped {
+                if self.open == 0 || now >= drain_end {
+                    self.end_ns = self.end_ns.min(now);
+                    return self.report_stopped_steps(stop_ns, now);
+                }
+                drain_end
+            } else {
+                self.report_ramp_steps(now)?;
+                if now >= self.end_ns {
+                    return Ok(());
+                }
+                let report_by = self.ramp.as_ref().and_then(RampTracker::next_deadline);
+                report_by.map_or(self.end_ns, |t| t.min(self.end_ns))
+            };
+            // A stopped shard sends nothing more.
+            let precise = if stopped.is_none() {
+                self.next.map(|a| a.sched_ns)
+            } else {
+                None
+            };
             match precise {
                 Some(deadline) => self.timer.arm(deadline)?,
                 None => self.timer.disarm()?,
             }
-            let coarse = next_sample.min(next_second).min(self.end_ns);
+            let coarse = next_sample.min(next_second).min(wake_by);
             let coarse_wait = Duration::from_nanos(coarse.saturating_sub(now));
             let timeout = self
                 .timer
@@ -587,7 +681,7 @@ impl Shard {
             self.fire_if_due()?;
             let now = now_ns();
             if now >= next_sample {
-                self.sample(now)?;
+                self.sample(now);
                 next_sample = advance(next_sample, SAMPLE_NS, now);
             }
             if now >= next_second {
@@ -598,8 +692,12 @@ impl Shard {
     }
 
     /// Spins to the next scheduled send and fires every due arrival once
-    /// the next one is within the spin window.
+    /// the next one is within the spin window. A stopped shard fires
+    /// nothing.
     fn fire_if_due(&mut self) -> io::Result<()> {
+        if self.live.stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let reached = now_ns();
         if let Some(arrival) = self.next
             && self.timer.is_due(reached, arrival.sched_ns)
@@ -610,20 +708,47 @@ impl Shard {
         Ok(())
     }
 
-    /// Fires every due arrival; `reached` is when the loop found the first
-    /// one due.
+    /// Fires every due arrival, for at most [`FIRE_BURST_NS`] since the
+    /// loop last woke; `reached` is when the loop found the first one due.
+    /// In ramp mode a send reached later than the saturation limit stops
+    /// the shard instead.
     fn fire_due(&mut self, reached: u64) -> io::Result<()> {
+        let burst_end = self.woke_ns.saturating_add(FIRE_BURST_NS);
         while let Some(arrival) = self.next {
-            if arrival.sched_ns > now_ns() {
+            let now = now_ns();
+            if arrival.sched_ns > now || now >= burst_end {
                 break;
+            }
+            let lag_ns = now - arrival.sched_ns;
+            if let Some(ramp) = &mut self.ramp
+                && lag_ns > ramp.spec.saturation_lag_ns
+            {
+                return self.saturated(arrival.step, lag_ns);
             }
             if arrival.sched_ns < reached {
                 self.deadline_missed(arrival.sched_ns, reached);
             }
-            self.fire(arrival)?;
+            self.fire(arrival, lag_ns)?;
             self.next = self.schedule.next_arrival();
         }
         Ok(())
+    }
+
+    /// Stops the shard because a send of `step` was reached `lag_ns` late,
+    /// and tells the coordinator. The send is not made; the step's report
+    /// counts it as unsent.
+    fn saturated(&mut self, step: u32, lag_ns: u64) -> io::Result<()> {
+        self.live.stop.store(true, Ordering::Relaxed);
+        let ramp = self.ramp.as_mut().expect("only ramp shards saturate");
+        ramp.note_lag(step, lag_ns);
+        ramp.spec
+            .reports
+            .send(RampMessage::Saturated {
+                shard: self.index,
+                step,
+                lag_ns,
+            })
+            .map_err(|_| io::Error::other("ramp coordinator is gone"))
     }
 
     /// Classifies a send whose deadline `sched_ns` passed before the loop
@@ -640,7 +765,8 @@ impl Shard {
             .deadline_missed(reached, reached - sched_ns, miss);
     }
 
-    fn fire(&mut self, arrival: Arrival) -> io::Result<()> {
+    /// Starts `arrival`, reached `lag_ns` after its scheduled time.
+    fn fire(&mut self, arrival: Arrival, lag_ns: u64) -> io::Result<()> {
         let request = Request {
             sched_ns: arrival.sched_ns,
             sent_ns: arrival.sched_ns,
@@ -657,7 +783,7 @@ impl Shard {
         self.counters.requests_scheduled += 1;
         // Before dispatching: a synchronous failure reports the step as done.
         if let Some(ramp) = &mut self.ramp {
-            ramp.on_start(arrival.step);
+            ramp.on_start(arrival.step, lag_ns);
         }
         self.dispatch(request)?;
         if let Some((planned, ttft_ns, interval_ns)) = &mut self.planned {
@@ -978,7 +1104,7 @@ impl Shard {
         }
     }
 
-    fn sample(&mut self, now: u64) -> io::Result<()> {
+    fn sample(&mut self, now: u64) {
         self.recorder.observe_concurrency(now, self.open);
         let planned_open = match &mut self.planned {
             Some((planned, ..)) => planned.sample(now),
@@ -993,7 +1119,6 @@ impl Shard {
             .requests
             .store(self.requests_total, Ordering::Relaxed);
         self.live.errors.store(self.errors_total, Ordering::Relaxed);
-        self.report_ramp_steps(now)
     }
 
     fn every_second(&mut self, now: u64) -> io::Result<()> {
@@ -1074,40 +1199,99 @@ impl Shard {
         }
     }
 
-    /// Reports every ramp step that can be judged: it has ended and either
-    /// all its requests are done or the stop threshold has passed since.
+    /// Reports every ramp step whose time has come: its judging deadline
+    /// has passed, or it has ended with all its sends made and done.
     fn report_ramp_steps(&mut self, now: u64) -> io::Result<()> {
-        let Some(ramp) = &mut self.ramp else {
+        let Some(mut ramp) = self.ramp.take() else {
             return Ok(());
         };
+        let reported = self.report_due_steps(&mut ramp, now);
+        self.ramp = Some(ramp);
+        reported
+    }
+
+    fn report_due_steps(&mut self, ramp: &mut RampTracker, now: u64) -> io::Result<()> {
         while let Some(seg) = ramp.spec.steps.get(ramp.next_report).copied() {
+            // Arrivals come in step order, so a later one means every send
+            // of this step was made.
+            let all_sent = self.next.is_none_or(|a| a.step > seg.step);
             let outstanding = ramp.steps.get(&seg.step).map_or(0, |a| a.outstanding);
-            let judged = now >= seg.end_ns
-                && (outstanding == 0 || now >= seg.end_ns + ramp.spec.threshold_ns);
-            if !judged {
+            let due = now >= seg.end_ns.saturating_add(ramp.spec.judge_delay_ns)
+                || (now >= seg.end_ns && all_sent && outstanding == 0);
+            if !due {
                 break;
             }
-            let mut acc = ramp.steps.remove(&seg.step).unwrap_or_else(StepAcc::new);
-            let mut censored = 0;
-            for (_, c) in self.slab.iter() {
-                if let Some(r) = c.request.filter(|r| r.step == seg.step) {
-                    acc.latency
-                        .saturating_record(now.saturating_sub(r.sched_ns));
-                    censored += 1;
-                }
-            }
-            ramp.spec
-                .reports
-                .send(StepReport {
-                    step: seg.step,
-                    latency: acc.latency,
-                    requests: acc.requests,
-                    errors: acc.errors,
-                    censored,
-                })
-                .map_err(|_| io::Error::other("ramp coordinator is gone"))?;
-            ramp.next_report += 1;
+            self.send_step_report(ramp, seg, now, now)?;
         }
+        Ok(())
+    }
+
+    /// After a stop at `stop_ns`, reports as of `now` every step that had
+    /// started by then and was not reported yet. Its planned sends due
+    /// before the stop and not made count as unsent; the later ones were
+    /// never due.
+    fn report_stopped_steps(&mut self, stop_ns: u64, now: u64) -> io::Result<()> {
+        let Some(mut ramp) = self.ramp.take() else {
+            return Ok(());
+        };
+        let mut reported = Ok(());
+        while let Some(seg) = ramp.spec.steps.get(ramp.next_report).copied()
+            && seg.start_ns < stop_ns
+        {
+            reported = self.send_step_report(&mut ramp, seg, now, stop_ns);
+            if reported.is_err() {
+                break;
+            }
+        }
+        self.ramp = Some(ramp);
+        reported
+    }
+
+    /// Sends the report of `seg` as of `now`. Requests of the step still
+    /// open are censored at `now`; so are the step's planned sends
+    /// scheduled before `cutoff` and not made yet, which are dropped from
+    /// the schedule (with any warmup send still pending before them).
+    fn send_step_report(
+        &mut self,
+        ramp: &mut RampTracker,
+        seg: RateSegment,
+        now: u64,
+        cutoff: u64,
+    ) -> io::Result<()> {
+        let mut acc = ramp.steps.remove(&seg.step).unwrap_or_else(StepAcc::new);
+        let mut open = 0;
+        for (_, c) in self.slab.iter() {
+            if let Some(r) = c.request.filter(|r| r.step == seg.step) {
+                acc.latency
+                    .saturating_record(now.saturating_sub(r.sched_ns));
+                open += 1;
+            }
+        }
+        let mut unsent = 0;
+        while let Some(arrival) = self
+            .next
+            .filter(|a| a.step <= seg.step && a.sched_ns < cutoff)
+        {
+            if arrival.step == seg.step {
+                acc.latency
+                    .saturating_record(now.saturating_sub(arrival.sched_ns));
+                unsent += 1;
+            }
+            self.next = self.schedule.next_arrival();
+        }
+        ramp.spec
+            .reports
+            .send(RampMessage::Step(StepReport {
+                step: seg.step,
+                latency: acc.latency,
+                requests: acc.requests,
+                errors: acc.errors,
+                censored: open + unsent,
+                unsent,
+                max_emit_lag_ns: acc.max_emit_lag_ns,
+            }))
+            .map_err(|_| io::Error::other("ramp coordinator is gone"))?;
+        ramp.next_report += 1;
         Ok(())
     }
 

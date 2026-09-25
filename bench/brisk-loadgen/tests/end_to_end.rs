@@ -446,6 +446,67 @@ fn nonstream_ramp_records_request_latency_per_step() {
 }
 
 #[test]
+fn a_failing_ramp_ends_right_after_its_failing_step() {
+    let addr = spawn_responder();
+    let dir = temp_dir("ramp-fail");
+    let out = dir.join("s2.json");
+    // No response comes back within 1 us: the first step fails. The plan
+    // has 20 steps of a second after a second of warmup.
+    let (warmup_s, step_len_s, step_count) = (1, 1, 20);
+    let started = std::time::Instant::now();
+    let output = run(&[
+        "nonstream",
+        &format!("http://{addr}"),
+        "--ramp-start",
+        "100",
+        "--ramp-step-pct",
+        "10",
+        "--ramp-step-s",
+        &step_len_s.to_string(),
+        "--ramp-max-steps",
+        &step_count.to_string(),
+        "--stop-p99-ms",
+        "0.001",
+        "--warmup-s",
+        &warmup_s.to_string(),
+        "--resp-bytes",
+        "256",
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    let elapsed = started.elapsed();
+    assert!(output.status.success());
+    // Warmup, the failing step and a few seconds for startup, judging, the
+    // drain and the result: far below the 21 s planned.
+    assert!(
+        elapsed < Duration::from_secs(warmup_s + step_len_s + 5),
+        "ran {elapsed:?}"
+    );
+    let doc = read_document(&out);
+    let ramp = &doc["loadgen"]["ramp"];
+    let judged = ramp["steps"].as_array().unwrap();
+    assert_eq!(judged.len(), 1, "{ramp}");
+    assert_eq!(judged[0]["verdict"], "p99_exceeded");
+    assert_eq!(judged[0]["passed"], false);
+    assert_eq!(ramp["stop_reason"], "p99_exceeded");
+    assert!(ramp["max_sustainable_rate"].is_null());
+    // 100 warmup sends, 100 of the first step and the few of the second
+    // made before the stop, out of about 5800 planned.
+    let planned: f64 = (0..step_count)
+        .map(|k| 100.0 * 1.1_f64.powi(k))
+        .sum::<f64>()
+        + 100.0;
+    let sent = doc["loadgen"]["counters"]["requests_scheduled"]
+        .as_u64()
+        .unwrap();
+    #[expect(clippy::cast_precision_loss, reason = "small counts")]
+    let share = sent as f64 / planned;
+    assert!((200..=260).contains(&sent), "{sent} sends");
+    assert!(share < 0.05, "{sent} of {planned:.0} planned sends");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn bigbody_writes_one_result_per_size() {
     let addr = spawn_responder();
     let dir = temp_dir("bigbody");
