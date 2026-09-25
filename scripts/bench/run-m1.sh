@@ -47,6 +47,27 @@
 # binding one thread per core), the mocks on 2-3 (2 shards each), loadgen on
 # 0-1 (2 shards), this script on CPU 0.
 #
+# Ramp blocks, their direct tool ramps included, run on a core plan of their
+# own, the ramp plan of the RAMP_ core knobs (M0 report 06, section 5.3):
+# the SUT on CPUs 6-7 with 2 workers, the mocks on 3-5 (3 shards each),
+# loadgen on 0-2 (3 shards), this script still on CPU 0. On the session plan
+# the direct ramp of the calibration session m1-calib-1 sustained about
+# 37.7k req/s in P and floor-A 35.9k, 95% of it, so the gated throughput
+# comparison could only be tool-limited and reported; fewer SUT CPUs and
+# more mock and loadgen shards move the arms under test away from the tool
+# limit. Both arms under test get the same resources, so the ratio rule
+# (>= 0.85 of floor-A) holds as it is, and the rate per vCPU divides by the
+# ramp plan's SUT workers (by the CPUs of RAMP_SUT_CPUS where those are
+# fewer). The selfcheck, S1, S2 with its perf runs and S3 keep the session
+# plan. The SUT and loadgen start and stop with every run, each on the plan
+# of its block. The two scenario mocks serve consecutive blocks of one plan
+# and are stopped and started again on the other plan's CPUs and shards when
+# a block needs it (use_core_plan), so a session restarts them before and
+# after each ramp block; every run opens its own connections to them and
+# resets their statistics, so a restart changes nothing a run measures but
+# the core plan. runs.jsonl records each run's core_plan, manifest.json both
+# plans (core_plans).
+#
 # Scenarios: sc is the selfcheck of run-m0.sh; s1 1000 SSE streams at 30
 # chunks/s; s2 non-streaming requests at a fixed 2000/s; ramp the maximum
 # sustainable S2 throughput (below); s3 large request bodies, one block per
@@ -161,11 +182,11 @@
 # TTFT RAMP_TTFT_US. A ramp's sustainable rate is the last step of its
 # leading run of steps with p99 within the limit and no error, in a valid
 # run. Each ramp block starts with one direct ramp, the tool limit of mock and
-# loadgen; when the baseline arm (floor-A, axum in e1) reaches
-# RAMP_TOOL_LIMIT_SHARE of it, the throughput comparison is tool-limited and
-# only reported. The final step of every ramp saturates something, in the
-# direct ramp the mock itself, so ramps take their own mock write lag limit
-# (RAMP_MOCK_WRITE_LAG_LIMIT_US).
+# loadgen on the ramp plan (see above) of its pairs; when the baseline arm
+# (floor-A, axum in e1) reaches RAMP_TOOL_LIMIT_SHARE of it, the throughput
+# comparison is tool-limited and only reported. The final step of every
+# ramp saturates something, in the direct ramp the mock itself, so ramps
+# take their own mock write lag limit (RAMP_MOCK_WRITE_LAG_LIMIT_US).
 #
 # A ramp step is sustainable (6.1) when its p99 is within the limit, it had
 # no error and loadgen's validity checks hold over the step's own intervals.
@@ -309,6 +330,12 @@ knob_table=(
     "LOADGEN_CPUS|0-1|CPUs of brisk-loadgen"
     "LOADGEN_SHARDS|2|loadgen shard threads"
     "HARNESS_CPUS||CPUs of this script and its helpers (default: first LOADGEN_CPUS entry)"
+    "RAMP_SUT_CPUS|6-7|CPUs of the process under test in ramp blocks (the ramp plan, see above)"
+    "RAMP_SUT_WORKERS||workers of the process under test in ramp blocks (default: one per RAMP_SUT_CPUS entry); the ramp rate per vCPU divides by them"
+    "RAMP_MOCK_CPUS|3-5|CPUs of the mocks in ramp blocks"
+    "RAMP_MOCK_SHARDS|3|shards per mock in ramp blocks"
+    "RAMP_LOADGEN_CPUS|0-2|CPUs of brisk-loadgen in ramp blocks, direct tool ramps included"
+    "RAMP_LOADGEN_SHARDS|3|loadgen shard threads in ramp blocks"
     "MOCK_PLAIN_PORT|19080|plaintext mock (direct in P and N, SUT upstream in N)"
     "MOCK_TLS_PORT|19443|TLS mock (direct in T and the tool ramp of P, SUT upstream in P and T)"
     "SUT_P_PORT|19180|process under test, plaintext inbound (P, N)"
@@ -461,13 +488,14 @@ if [[ ! "$SESSION" =~ ^(gate|e11|e1|e2|e4)$ ]]; then
     echo "run-m1: unknown session '$SESSION'; use gate, e11, e1, e2 or e4" >&2
     exit 2
 fi
-for name in SUT_CPUS MOCK_CPUS LOADGEN_CPUS; do
+for name in SUT_CPUS MOCK_CPUS LOADGEN_CPUS RAMP_SUT_CPUS RAMP_MOCK_CPUS RAMP_LOADGEN_CPUS; do
     valid_cpu_list "${!name}" || die "$name must be a CPU list like 4-7 or 2,3, got '${!name}'"
 done
 : "${RUN_ID:=m1-$SESSION-$(date -u +%Y%m%dT%H%M%SZ)}"
 : "${CONFIGS:=${session_configs[$SESSION]}}"
 : "${SCENARIOS:=${session_scenarios[$SESSION]}}"
 : "${SUT_WORKERS:=$(cpu_count "$SUT_CPUS")}"
+: "${RAMP_SUT_WORKERS:=$(cpu_count "$RAMP_SUT_CPUS")}"
 : "${HARNESS_CPUS:=${LOADGEN_CPUS%%[,-]*}}"
 : "${SC_CONCURRENCY:=$S1_CONCURRENCY}"
 : "${S1_REPS:=${REPS:-5}}" "${S2_REPS:=${REPS:-3}}" "${S3_REPS:=${REPS:-3}}" "${RAMP_REPS:=${REPS:-3}}"
@@ -485,11 +513,12 @@ for name in RETRY_INVALID EXTEND_MAX_REPS SEED SPIN_US S3_SPIN_US MOCK_COMMIT_US
     S2_TTFT_US S2_RESP_BYTES S2_PROMPT_BYTES S2_WARMUP_S S2_MEASURE_S \
     RAMP_STEP_S RAMP_MAX_STEPS RAMP_WARMUP_S RAMP_TTFT_US \
     S3_TTFT_US S3_CHUNKS S3_WARMUP_S S3_MEASURE_S COMPARE_RESAMPLES IDLE_RSS_S READY_TIMEOUT_S \
-    S1_REPS S2_REPS S3_REPS RAMP_REPS SUT_WORKERS; do
+    S1_REPS S2_REPS S3_REPS RAMP_REPS SUT_WORKERS RAMP_SUT_WORKERS RAMP_MOCK_SHARDS RAMP_LOADGEN_SHARDS; do
     [[ "${!name}" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer, got '${!name}'"
 done
 for name in S1_REPS S2_REPS S3_REPS RAMP_REPS SUT_WORKERS MOCK_SHARDS LOADGEN_SHARDS READY_TIMEOUT_S \
-    EXTEND_MAX_REPS RAMP_STEP_S RAMP_MAX_STEPS COMPARE_RESAMPLES S1_CONCURRENCY S1_MAX_SLIP_US; do
+    EXTEND_MAX_REPS RAMP_STEP_S RAMP_MAX_STEPS COMPARE_RESAMPLES S1_CONCURRENCY S1_MAX_SLIP_US \
+    RAMP_SUT_WORKERS RAMP_MOCK_SHARDS RAMP_LOADGEN_SHARDS; do
     ((${!name} >= 1)) || die "$name must be at least 1"
 done
 # The CPU window spans the measurement less a second at each end, and S1
@@ -628,7 +657,7 @@ for arm in ${session_arms[$SESSION]}; do
     [[ "$arm" != floor-* ]] || session_has_floor=1
 done
 
-for name in SUT_CPUS MOCK_CPUS LOADGEN_CPUS HARNESS_CPUS; do
+for name in SUT_CPUS MOCK_CPUS LOADGEN_CPUS HARNESS_CPUS RAMP_SUT_CPUS RAMP_MOCK_CPUS RAMP_LOADGEN_CPUS; do
     valid_cpu_list "${!name}" || die "$name must be a CPU list like 0-1 or 2,3, got '${!name}'"
     # Not in a command substitution, so that a reversed range stops the script.
     expand_cpus "${!name}" >/dev/null
@@ -647,7 +676,20 @@ disjoint SUT_CPUS MOCK_CPUS
 disjoint SUT_CPUS LOADGEN_CPUS
 disjoint MOCK_CPUS LOADGEN_CPUS
 disjoint SUT_CPUS HARNESS_CPUS
-for pair in MOCK_SHARDS:MOCK_CPUS LOADGEN_SHARDS:LOADGEN_CPUS; do
+plan_cpu_knobs=(SUT_CPUS MOCK_CPUS LOADGEN_CPUS HARNESS_CPUS)
+shard_pairs=(MOCK_SHARDS:MOCK_CPUS LOADGEN_SHARDS:LOADGEN_CPUS)
+# The ramp plan serves the ramp blocks alone, never next to the session
+# plan, so it follows the same rules on its own and against the harness,
+# which stays where it is, and only in a session with ramp blocks.
+if has_scenario ramp; then
+    disjoint RAMP_SUT_CPUS RAMP_MOCK_CPUS
+    disjoint RAMP_SUT_CPUS RAMP_LOADGEN_CPUS
+    disjoint RAMP_MOCK_CPUS RAMP_LOADGEN_CPUS
+    disjoint RAMP_SUT_CPUS HARNESS_CPUS
+    plan_cpu_knobs+=(RAMP_SUT_CPUS RAMP_MOCK_CPUS RAMP_LOADGEN_CPUS)
+    shard_pairs+=(RAMP_MOCK_SHARDS:RAMP_MOCK_CPUS RAMP_LOADGEN_SHARDS:RAMP_LOADGEN_CPUS)
+fi
+for pair in "${shard_pairs[@]}"; do
     shards_knob="${pair%%:*}" cpus_knob="${pair#*:}"
     ((${!shards_knob} <= $(cpu_count "${!cpus_knob}"))) ||
         die "$shards_knob (${!shards_knob}) exceeds the $(cpu_count "${!cpus_knob}") CPU(s) of $cpus_knob (${!cpus_knob})"
@@ -675,7 +717,7 @@ fi
 
 [[ -r /sys/devices/system/cpu/online ]] || die "/sys/devices/system/cpu/online is not readable; run-m1.sh needs the Linux benchmark host"
 online=" $(expand_cpus "$(</sys/devices/system/cpu/online)") "
-for name in SUT_CPUS MOCK_CPUS LOADGEN_CPUS HARNESS_CPUS; do
+for name in "${plan_cpu_knobs[@]}"; do
     # An assignment, so that a failed expansion stops the script.
     expanded="$(expand_cpus "${!name}")"
     for c in $expanded; do
@@ -750,6 +792,17 @@ declare -A foreign_pids=()
 declare -A run_ctx=()
 declare -A block_reps=()
 lg_args=()
+# The core plan in effect (use_core_plan) and the one the running scenario
+# mocks were started on.
+plan_name=""
+plan_sut_cpus=""
+plan_sut_workers=""
+plan_mock_cpus=""
+plan_mock_shards=""
+plan_loadgen_cpus=""
+plan_loadgen_shards=""
+mocks_plan=""
+roles_scenario=""
 sampler_pid=""
 certs_dir=""
 ca=""
@@ -1143,7 +1196,9 @@ def ratio_text: if .lo == .hi then .lo | fixed3
    data: {tool: $tool, tool_arm: $tool_arm, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
 '
 
-# Sustainable rate per vCPU of the SUT, from the ramp pairs.
+# Sustainable rate per vCPU of the SUT, from the ramp pairs: over $cpus
+# (ramp_vcpus), the $workers of the ramp plan's SUT on CPUs $cpu_list, or
+# those CPUs where they are fewer.
 # shellcheck disable=SC2016
 prog_ramp_vcpu='
 def per_cpu: if . == null then null else . / $cpus end;
@@ -1151,11 +1206,11 @@ def per_cpu: if . == null then null else . / $cpus end;
 | ([.pairs[] | .b.max_sustainable_rate | numbers] | tint) as $rb
 | {id: "\($block):per-vcpu", block: $block, kind: "report", rule: "7.5 S2 per vCPU", verdict: "REPORT",
  gated: false, extendable: false,
- text: ("\($block): mean sustainable rate per SUT vCPU (\($cpus)): \($b) \($rb.mean | per_cpu | rate), \($a) \($ra.mean | per_cpu | rate) req/s"
+ text: ("\($block): mean sustainable rate per SUT vCPU (divided by \($cpus), the SUT of the ramp plan having \($workers) worker(s) on CPUs \($cpu_list)): \($b) \($rb.mean | per_cpu | rate), \($a) \($ra.mean | per_cpu | rate) req/s"
         + (if $session == "gate"
            then " (reported; 7.5 reference for Brisk: >= 20000 in P, >= 12000 in T; whether a vCPU of the host is a physical core is not confirmed)"
            else " (reported)" end)),
- data: {a: $ra, b: $rb, cpus: $cpus}}
+ data: {a: $ra, b: $rb, cpus: $cpus, workers: $workers, cpu_list: $cpu_list}}
 '
 
 # Connections of a block over the measurement window, by the rules of
@@ -1707,7 +1762,7 @@ def kv: split("\n") | map(select(test("=")) | capture("^(?<k>[^=]+)=(?<v>.*)$") 
 | ([$pc[] | select(.judged)] | pair_outcomes | map(select(.outcome != "clean"))) as $po
 | {run_id: $run_id, session: $session, status: $status, host: $host, started: $started, finished: $finished,
    host_ready: $host_ready, exit_status: ($exit_status | tonumber? // null),
-   source: (($sync | kv) + {patch: $patch}), knobs: ($knobs | kv),
+   source: (($sync | kv) + {patch: $patch}), knobs: ($knobs | kv), core_plans: $core_plans,
    binaries: ($binaries | split("\n") | map(select(length > 0) | split("  ")
               | {sha256: .[0], version: .[1], path: .[2]})),
    arms: ($arms | split(" ")),
@@ -1757,6 +1812,104 @@ preflight_jq() {
         jq -n "${args[@]}" "$jq_defs def _preflight: ${!prog_name}; empty" >/dev/null ||
             die "jq program $prog_name does not compile (jq $(jq --version))"
     done
+}
+
+# ---------------------------------------------------------------- core plans
+
+# A knob of core plan <plan> (see Core plan in the header): main, the
+# session plan, reads the knob itself, ramp, the plan of the ramp blocks,
+# its RAMP_ twin. <knob> is SUT_CPUS, SUT_WORKERS, MOCK_CPUS, MOCK_SHARDS,
+# LOADGEN_CPUS or LOADGEN_SHARDS.
+plan_knob() {
+    local name="$2"
+    case "$1" in
+        main) ;;
+        ramp) name="RAMP_$2" ;;
+        *) die "unknown core plan $1" ;;
+    esac
+    printf '%s\n' "${!name}"
+}
+
+# The core plan of a scenario's blocks.
+scenario_plan() {
+    if [[ "$1" == ramp ]]; then echo ramp; else echo main; fi
+}
+
+core_plan_text() {
+    printf 'SUT %s (%s worker(s)), mocks %s (%s shard(s) each), loadgen %s (%s shard(s)), harness %s\n' \
+        "$(plan_knob "$1" SUT_CPUS)" "$(plan_knob "$1" SUT_WORKERS)" "$(plan_knob "$1" MOCK_CPUS)" \
+        "$(plan_knob "$1" MOCK_SHARDS)" "$(plan_knob "$1" LOADGEN_CPUS)" "$(plan_knob "$1" LOADGEN_SHARDS)" \
+        "$HARNESS_CPUS"
+}
+
+# The divisor of the ramp rate per vCPU: the ramp plan's SUT workers, or
+# the CPUs of RAMP_SUT_CPUS where those are fewer, since workers beyond them
+# share the CPUs.
+ramp_vcpus() {
+    local workers=$((10#$RAMP_SUT_WORKERS)) cpus
+    cpus="$(cpu_count "$RAMP_SUT_CPUS")"
+    echo $((workers < cpus ? workers : cpus))
+}
+
+core_plan_json() {
+    jq -nc --arg blocks "$2" --arg sut "$(plan_knob "$1" SUT_CPUS)" --arg workers "$(plan_knob "$1" SUT_WORKERS)" \
+        --arg mock "$(plan_knob "$1" MOCK_CPUS)" --arg mock_shards "$(plan_knob "$1" MOCK_SHARDS)" \
+        --arg loadgen "$(plan_knob "$1" LOADGEN_CPUS)" --arg loadgen_shards "$(plan_knob "$1" LOADGEN_SHARDS)" \
+        --arg harness "$HARNESS_CPUS" \
+        '{blocks: $blocks, sut_cpus: $sut, sut_workers: ($workers | tonumber), mock_cpus: $mock,
+          mock_shards: ($mock_shards | tonumber), loadgen_cpus: $loadgen,
+          loadgen_shards: ($loadgen_shards | tonumber), harness_cpus: $harness}'
+}
+
+# Both core plans as JSON for the manifest; ramp is null in a session
+# without ramp blocks.
+core_plans_json() {
+    local ramp=null
+    if has_scenario ramp; then
+        ramp="$(core_plan_json ramp "ramp blocks, their direct tool ramps included" |
+            jq -c --argjson d "$(ramp_vcpus)" '. + {per_vcpu_divisor: $d}')"
+    fi
+    jq -nc --argjson main "$(core_plan_json main "the selfcheck and every other block, the S2 perf runs included")" \
+        --argjson ramp "$ramp" '{main: $main, ramp: $ramp}'
+}
+
+# Makes core plan <plan> the one in effect for block <block>: the plan_*
+# values that start_sut, check_sut_affinity and run_arm read, and the CPU
+# roles of the steal summary. The SUT and loadgen start with every run, so
+# they follow at once. The two scenario mocks serve every block of one plan:
+# they are started here for the session's first block, and stopped and
+# started again on this plan's CPUs and shards when the previous block ran
+# on the other plan, which happens before and after each ramp block.
+use_core_plan() {
+    local plan="$1" block="$2"
+    plan_name="$plan"
+    plan_sut_cpus="$(plan_knob "$plan" SUT_CPUS)"
+    plan_sut_workers="$(plan_knob "$plan" SUT_WORKERS)"
+    plan_mock_cpus="$(plan_knob "$plan" MOCK_CPUS)"
+    plan_mock_shards="$(plan_knob "$plan" MOCK_SHARDS)"
+    plan_loadgen_cpus="$(plan_knob "$plan" LOADGEN_CPUS)"
+    plan_loadgen_shards="$(plan_knob "$plan" LOADGEN_SHARDS)"
+    roles_scenario="$(jq -nc --argjson s "$(cpu_array "$plan_sut_cpus")" --argjson m "$(cpu_array "$plan_mock_cpus")" \
+        --argjson l "$(cpu_array "$plan_loadgen_cpus")" '{sut: $s, mock: $m, loadgen: $l}')"
+    [[ "$mocks_plan" != "$plan" ]] || return 0
+    if [[ -n "$mocks_plan" ]]; then
+        log "stopping the mocks of core plan $mocks_plan for $block, which runs on core plan $plan"
+        stop_proc mock-plain
+        stop_proc mock-tls
+    fi
+    log "starting the mocks on core plan $plan for $block: CPUs $plan_mock_cpus, $plan_mock_shards shard(s) each"
+    # A log per start, named after the block it starts for.
+    start_proc mock-plain "$plan_mock_cpus" "$run_dir/logs/mock-plain-$block.log" "$mock" serve \
+        --listen "127.0.0.1:$MOCK_PLAIN_PORT" --shards "$plan_mock_shards" --cpu-list "$plan_mock_cpus" \
+        --spin-us "$SPIN_US" "${mock_emit_args[@]}"
+    start_proc mock-tls "$plan_mock_cpus" "$run_dir/logs/mock-tls-$block.log" "$mock" serve \
+        --listen "127.0.0.1:$MOCK_TLS_PORT" --shards "$plan_mock_shards" --cpu-list "$plan_mock_cpus" \
+        --spin-us "$SPIN_US" "${mock_emit_args[@]}" --tls-cert "$certs_dir/server.pem" --tls-key "$certs_dir/server.key"
+    wait_ready mock-plain "http://127.0.0.1:$MOCK_PLAIN_PORT/v1/models" 10 "logs/mock-plain-$block.log"
+    wait_ready mock-tls "https://127.0.0.1:$MOCK_TLS_PORT/v1/models" 10 "logs/mock-tls-$block.log" --cacert "$ca"
+    fingerprint_proc mock-plain "$block"
+    fingerprint_proc mock-tls "$block"
+    mocks_plan="$plan"
 }
 
 # ---------------------------------------------------------------- processes
@@ -1837,17 +1990,17 @@ fingerprint_proc() {
         >>"$run_dir/processes.jsonl"
 }
 
-# Fails unless every thread of the SUT is confined to SUT_CPUS; a run on the
-# wrong cores must not start. floor checks this itself, Brisk relies on
-# taskset.
+# Fails unless every thread of the SUT is confined to the SUT CPUs of the
+# core plan in effect; a run on the wrong cores must not start. floor checks
+# this itself, Brisk relies on taskset.
 check_sut_affinity() {
     local pid="${pids[sut]}" want task got
-    want="$(expand_cpus "$SUT_CPUS")"
+    want="$(expand_cpus "$plan_sut_cpus")"
     for task in /proc/"$pid"/task/*; do
         got="$(awk '/^Cpus_allowed_list:/ {print $2}' "$task/status" 2>/dev/null)" || continue
         [[ -n "$got" ]] || continue
         [[ "$(expand_cpus "$got")" == "$want" ]] ||
-            die "thread ${task##*/} of the process under test runs on CPUs $got instead of $SUT_CPUS"
+            die "thread ${task##*/} of the process under test runs on CPUs $got instead of $plan_sut_cpus (core plan $plan_name)"
     done
 }
 
@@ -2195,9 +2348,10 @@ record_run() {
         --arg arm "${run_ctx[arm]}" --argjson rep "${run_ctx[rep]}" --argjson attempt "${run_ctx[attempt]}" \
         --argjson order "${run_ctx[order]}" --arg kind "${run_ctx[kind]}" --arg tag "${run_ctx[tag]}" \
         --arg pair "${run_ctx[pair_id]}" --argjson rc "$rc" --arg started "$started" \
+        --arg core_plan "${run_ctx[core_plan]}" \
         '{scen: $scen, config: $config, var: $var, arm: $arm, rep: $rep, attempt: $attempt, order: $order,
           kind: $kind, tag: $tag, pair_id: (if $pair == "" then null else $pair end),
-          loadgen_rc: $rc, started: $started}')"
+          core_plan: $core_plan, loadgen_rc: $rc, started: $started}')"
     if [[ -f "$result" ]]; then
         jq -c --argjson ctx "$ctx" --argjson h "$harness" --arg file "results/${result##*/}" \
             --argjson cpu "$cpu" --argjson net "$net" --argjson mock "$mockstats" \
@@ -2225,7 +2379,7 @@ execute_run() {
     started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     net_snapshot "$logs/$tag.net-a"
     log "run $tag: $(redact "${lg_args[*]}")"
-    taskset -c "$LOADGEN_CPUS" "$loadgen" "${lg_args[@]}" >"$logs/$tag.out" 2>"$logs/$tag.err" &
+    taskset -c "${run_ctx[loadgen_cpus]}" "$loadgen" "${lg_args[@]}" >"$logs/$tag.out" 2>"$logs/$tag.err" &
     pids[loadgen]=$!
     if ((!open)); then
         window=$((measure - 2))
@@ -2428,8 +2582,14 @@ brisk_settings() {
     esac
 }
 
+# The rendered configuration of Brisk arm <arm> under config <config> and
+# core plan <plan>, whose SUT workers it names.
 brisk_config_path() {
-    echo "$run_dir/brisk/$1-$2.toml"
+    if [[ "$3" == main ]]; then
+        echo "$run_dir/brisk/$1-$2.toml"
+    else
+        echo "$run_dir/brisk/$1-$2-$3.toml"
+    fi
 }
 
 # A TOML basic string.
@@ -2440,14 +2600,14 @@ toml_string() {
     printf '"%s"' "$s"
 }
 
-# Renders brisk-bench.toml.in for one Brisk arm and config.
+# Renders brisk-bench.toml.in for one Brisk arm, config and core plan.
 render_brisk_config() {
-    local arm="$1" config="$2" out="$3" template text key router splice usage hold
+    local arm="$1" config="$2" plan="$3" out="$4" template text key router splice usage hold
     local -A vals=()
     read -r router splice usage hold <<<"$(brisk_settings "$arm")"
     template="$(<"$brisk_template")"
     vals[LISTEN]="127.0.0.1:$(sut_port "$config")"
-    vals[WORKERS]="$SUT_WORKERS"
+    vals[WORKERS]="$(plan_knob "$plan" SUT_WORKERS)"
     vals[SERVER_TLS_TABLE]=""
     if [[ "$config" == T ]]; then
         vals[SERVER_TLS_TABLE]="[server.tls]"$'\n'"cert = $(toml_string "$certs_dir/server.pem")"$'\n'"key = $(toml_string "$certs_dir/server.key")"
@@ -2482,7 +2642,8 @@ render_brisk_config() {
     printf '%s\n' "$text" >"$out"
 }
 
-# Starts the process under test of an arm and waits until it is ready.
+# Starts the process under test of an arm on the core plan in effect and
+# waits until it is ready.
 start_sut() {
     local arm="$1" config="$2" tag="$3" log_file="$run_dir/logs/$3.sut.log" scheme=http
     local -a args curl_ca=()
@@ -2491,8 +2652,8 @@ start_sut() {
         curl_ca=(--cacert "$ca")
     fi
     if [[ "$arm" == floor-* ]]; then
-        args=(--mode "${arm#floor-}" --listen "127.0.0.1:$(sut_port "$config")" --cpu-list "$SUT_CPUS"
-            --workers "$SUT_WORKERS")
+        args=(--mode "${arm#floor-}" --listen "127.0.0.1:$(sut_port "$config")" --cpu-list "$plan_sut_cpus"
+            --workers "$plan_sut_workers")
         if [[ "$config" == N ]]; then
             args+=(--upstream "http://127.0.0.1:$MOCK_PLAIN_PORT")
         else
@@ -2501,11 +2662,11 @@ start_sut() {
         if [[ "$config" == T ]]; then
             args+=(--tls-cert "$certs_dir/server.pem" --tls-key "$certs_dir/server.key")
         fi
-        start_proc sut "$SUT_CPUS" "$log_file" "$floor" "${args[@]}"
+        start_proc sut "$plan_sut_cpus" "$log_file" "$floor" "${args[@]}"
         wait_ready sut "$scheme://127.0.0.1:$(sut_port "$config")/v1/models" 10 "logs/$tag.sut.log" "${curl_ca[@]}"
     else
-        start_proc sut "$SUT_CPUS" "$log_file" env "$upstream_key_env=$upstream_key_value" \
-            "$brisk" serve --config "$(brisk_config_path "$arm" "$config")"
+        start_proc sut "$plan_sut_cpus" "$log_file" env "$upstream_key_env=$upstream_key_value" \
+            "$brisk" serve --config "$(brisk_config_path "$arm" "$config" "$plan_name")"
         wait_ready sut "$scheme://127.0.0.1:$(sut_port "$config")/readyz" "$READY_TIMEOUT_S" \
             "logs/$tag.sut.log" "${curl_ca[@]}"
     fi
@@ -2601,13 +2762,15 @@ rep_order() {
     echo "${order[*]}"
 }
 
-# One run of one arm; sets run_ok. kind: run (a repetition), tool (the direct
-# ramp of a ramp block), perf (the extra S2 run under perf stat and the C21
-# profile).
+# One run of one arm on the core plan in effect (use_core_plan); sets run_ok.
+# kind: run (a repetition), tool (the direct ramp of a ramp block), perf (the
+# extra S2 run under perf stat and the C21 profile).
 run_arm() {
     local scen="$1" config="$2" var="$3" arm="$4" rep="$5" attempt="$6" pos="$7" kind="$8"
     local block base pair_id url seed tls=0 spin="$SPIN_US" lag="$MOCK_WRITE_LAG_LIMIT_US"
     local warmup measure open=0 ttft staged
+    [[ "$plan_name" == "$(scenario_plan "$scen")" ]] ||
+        die "a $scen run on core plan '$plan_name' instead of $(scenario_plan "$scen")"
     block="$(block_name "$scen" "$config" "$var")"
     case "$kind" in
         run) base="$block-$arm-r$rep" pair_id="$block-r$rep" ;;
@@ -2657,8 +2820,8 @@ run_arm() {
             warmup="$S3_WARMUP_S" measure="$S3_MEASURE_S" spin="$S3_SPIN_US" lag="$S3_MOCK_WRITE_LAG_LIMIT_US"
             ;;
     esac
-    lg_args+=(--label "$arm-$config" --out "$staged" --seed "$seed" --shards "$LOADGEN_SHARDS"
-        --cpu-list "$LOADGEN_CPUS" --spin-us "$spin" --max-mock-write-lag-us "$lag"
+    lg_args+=(--label "$arm-$config" --out "$staged" --seed "$seed" --shards "$plan_loadgen_shards"
+        --cpu-list "$plan_loadgen_cpus" --spin-us "$spin" --max-mock-write-lag-us "$lag"
         --model "$loadgen_model" --pair-id "$pair_id")
     if ((tls)); then
         lg_args+=(--tls-ca "$ca")
@@ -2674,7 +2837,8 @@ run_arm() {
         [attempt]="$attempt" [order]="$pos" [kind]="$kind" [tag]="$base" [pair_id]="$pair_id"
         [warmup]="$warmup" [measure]="$measure" [open_window]="$open" [perf]=0 [sut_pid]=""
         [idle_rss]="" [check_reuse]=1 [arm_mock]="$(arm_mock "$scen" "$config" "$arm")"
-        [staged]="$staged" [result]="$run_dir/results/$base.json")
+        [staged]="$staged" [result]="$run_dir/results/$base.json"
+        [core_plan]="$plan_name" [loadgen_cpus]="$plan_loadgen_cpus")
     if [[ "$kind" == perf ]]; then
         [[ "$perf_status" != available ]] || run_ctx[perf]=1
         [[ "$c21_status" != available ]] || run_ctx[c21]=1
@@ -3317,7 +3481,8 @@ evaluate_ramp() {
         --argjson share "$RAMP_TOOL_LIMIT_SHARE" --argjson start "$RAMP_START" --arg step_pct "$RAMP_STEP_PCT" \
         --arg tool_arm "$(tool_ramp_arm "$config")" "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" \
-        --argjson cpus "$(cpu_count "$SUT_CPUS")" "$jq_defs$prog_ramp_vcpu" <<<"$pairs")"
+        --argjson cpus "$(ramp_vcpus)" --argjson workers "$((10#$RAMP_SUT_WORKERS))" --arg cpu_list "$RAMP_SUT_CPUS" \
+        "$jq_defs$prog_ramp_vcpu" <<<"$pairs")"
 }
 
 # Compares a block and records its verdicts and reports.
@@ -3385,16 +3550,18 @@ block_extendable() {
         "$run_dir/verdicts.jsonl" >/dev/null
 }
 
-# Runs one block (scenario, config, variant): its repetitions, the perf runs
-# after S2, then the comparisons and verdicts, extending the block while a
-# gated verdict is UNCERTAIN.
+# Runs one block (scenario, config, variant) on its core plan: its
+# repetitions, the perf runs after S2, then the comparisons and verdicts,
+# extending the block while a gated verdict is UNCERTAIN.
 run_block() {
-    local scen="$1" config="$2" var="$3" block reps rep
+    local scen="$1" config="$2" var="$3" block reps rep plan
     local -a arms
     block="$(block_name "$scen" "$config" "$var")"
     read -r -a arms <<<"$(block_arms "$scen" "$config")"
     reps="$(planned_reps "$scen")"
-    log "== block $block: arms ${arms[*]}, $reps repetition(s)"
+    plan="$(scenario_plan "$scen")"
+    use_core_plan "$plan" "$block"
+    log "== block $block: arms ${arms[*]}, $reps repetition(s); core plan $plan: $(core_plan_text "$plan")"
     if [[ "$scen" == ramp ]]; then
         run_tool_ramp "$config"
     fi
@@ -3767,7 +3934,8 @@ selfcheck_one() {
     run_ctx=([scen]=sc [config]="$config" [var]="" [arm]=direct [rep]=1 [attempt]=0 [order]=1 [kind]=sc
         [tag]="$tag" [pair_id]="" [warmup]="$SC_WARMUP_S" [measure]="$SC_MEASURE_S" [open_window]=0
         [perf]=0 [sut_pid]="" [idle_rss]="" [check_reuse]=0 [arm_mock]=mock-sc
-        [staged]="$stage_dir/$tag.json" [result]="$run_dir/results/$tag.json")
+        [staged]="$stage_dir/$tag.json" [result]="$run_dir/results/$tag.json"
+        [core_plan]=main [loadgen_cpus]="$LOADGEN_CPUS")
     execute_run
     stop_proc mock-sc
     sc_tls=0
@@ -3808,6 +3976,7 @@ write_manifest() {
         --arg arms "${session_arms[$SESSION]}" --arg key_name "$key_name" --arg key_sha256 "$key_sha256" \
         --arg perf_status "$perf_status" --arg perf_reason "$perf_reason" --arg perf_events "$perf_events" \
         --arg perf_hitm "$perf_hitm_events" --arg c21_status "$c21_status" --arg c21_reason "$c21_reason" \
+        --argjson core_plans "$(core_plans_json)" \
         --rawfile knobs "$run_dir/host/knobs.env" --rawfile sync "$run_dir/host/sync-info" \
         --rawfile binaries "$run_dir/host/binaries.txt" \
         --slurpfile runs "$run_dir/runs.jsonl" --slurpfile compares "$run_dir/compares.jsonl" \
@@ -3859,7 +4028,10 @@ preflight_jq
 
 log "session $SESSION ($RUN_ID) in $run_dir"
 log "arms: ${session_arms[$SESSION]}; configs: $CONFIGS; scenarios: $SCENARIOS"
-log "core plan: SUT $SUT_CPUS ($SUT_WORKERS worker(s)), mocks $MOCK_CPUS ($MOCK_SHARDS shard(s)), loadgen $LOADGEN_CPUS ($LOADGEN_SHARDS shard(s)), harness $HARNESS_CPUS"
+log "core plan main (the selfcheck and every block but ramp): $(core_plan_text main)"
+if has_scenario ramp; then
+    log "core plan ramp (ramp blocks, their tool ramps included): $(core_plan_text ramp); ramp rate per vCPU divided by $(ramp_vcpus)"
+fi
 log "mock emission policy $MOCK_EMIT_POLICY (commit window $MOCK_COMMIT_US us); mock write lag p99 limit $MOCK_WRITE_LAG_LIMIT_US us (S3 $S3_MOCK_WRITE_LAG_LIMIT_US us, ramp $RAMP_MOCK_WRITE_LAG_LIMIT_US us); new upstream connections at most $MAX_NEW_CONN_RATE/s per run, arms of one pool policy within max($PAIR_CONN_SLACK_MIN, $PAIR_CONN_SLACK_FRAC x window requests) of each other per leg"
 if [[ -f "$repo_root/.sync-info" ]]; then
     cp "$repo_root/.sync-info" "$run_dir/host/sync-info"
@@ -3951,8 +4123,8 @@ for port in "${reserved_ports[@]}"; do
     fi
 done
 
-roles_scenario="$(jq -nc --argjson s "$(cpu_array "$SUT_CPUS")" --argjson m "$(cpu_array "$MOCK_CPUS")" \
-    --argjson l "$(cpu_array "$LOADGEN_CPUS")" '{sut: $s, mock: $m, loadgen: $l}')"
+# The CPU roles of the selfcheck; those of the scenario runs follow their
+# core plan (use_core_plan).
 roles_sc="$(jq -nc --argjson m "$(cpu_array "$MOCK_CPUS")" --argjson l "$(cpu_array "$LOADGEN_CPUS")" \
     '{mock: $m, loadgen: $l}')"
 
@@ -4012,19 +4184,22 @@ if ((session_has_brisk)); then
     bench_key="${keygen_lines[0]}"
     unset keygen_lines
     log "virtual key $key_name: sha256 $key_sha256"
-    # Every Brisk configuration of the session, validated before the first run.
+    # Every Brisk configuration of the session, one per arm, config and core
+    # plan, validated before the first run.
     declare -A rendered=()
     for config in $CONFIGS; do
         for scen in "${scenario_list[@]}"; do
+            plan="$(scenario_plan "$scen")"
             for arm in $(block_arms "$scen" "$config"); do
-                [[ "$arm" == brisk* && -z "${rendered[$arm-$config]:-}" ]] || continue
-                cfg="$(brisk_config_path "$arm" "$config")"
-                render_brisk_config "$arm" "$config" "$cfg"
+                [[ "$arm" == brisk* && -z "${rendered[$arm-$config-$plan]:-}" ]] || continue
+                cfg="$(brisk_config_path "$arm" "$config" "$plan")"
+                render_brisk_config "$arm" "$config" "$plan" "$cfg"
+                cfg_log="logs/check-config-$(basename "$cfg" .toml).log"
                 env "$upstream_key_env=$upstream_key_value" "$brisk" check-config --config "$cfg" \
-                    >"$run_dir/logs/check-config-$arm-$config.log" 2>&1 ||
-                    die "brisk check-config rejects brisk/${cfg##*/}; see logs/check-config-$arm-$config.log"
-                rendered[$arm-$config]=1
-                log "configuration brisk/${cfg##*/} checked"
+                    >"$run_dir/$cfg_log" 2>&1 ||
+                    die "brisk check-config rejects brisk/${cfg##*/}; see $cfg_log"
+                rendered[$arm-$config-$plan]=1
+                log "configuration brisk/${cfg##*/} checked (core plan $plan, $(plan_knob "$plan" SUT_WORKERS) worker(s))"
             done
         done
     done
@@ -4040,17 +4215,8 @@ if has_scenario sc; then
 fi
 
 if ((${#scenario_list[@]} > 0)); then
-    start_proc mock-plain "$MOCK_CPUS" "$run_dir/logs/mock-plain.log" "$mock" serve \
-        --listen "127.0.0.1:$MOCK_PLAIN_PORT" --shards "$MOCK_SHARDS" --cpu-list "$MOCK_CPUS" --spin-us "$SPIN_US" \
-        "${mock_emit_args[@]}"
-    start_proc mock-tls "$MOCK_CPUS" "$run_dir/logs/mock-tls.log" "$mock" serve \
-        --listen "127.0.0.1:$MOCK_TLS_PORT" --shards "$MOCK_SHARDS" --cpu-list "$MOCK_CPUS" --spin-us "$SPIN_US" \
-        "${mock_emit_args[@]}" --tls-cert "$certs_dir/server.pem" --tls-key "$certs_dir/server.key"
-    wait_ready mock-plain "http://127.0.0.1:$MOCK_PLAIN_PORT/v1/models" 10 logs/mock-plain.log
-    wait_ready mock-tls "https://127.0.0.1:$MOCK_TLS_PORT/v1/models" 10 logs/mock-tls.log --cacert "$ca"
-    fingerprint_proc mock-plain session
-    fingerprint_proc mock-tls session
-
+    # Each block starts the scenario mocks on its core plan, or keeps them
+    # running when the previous block ran on the same plan (use_core_plan).
     for config in $CONFIGS; do
         for scen in "${scenario_list[@]}"; do
             mapfile -t vars < <(block_vars "$scen")
