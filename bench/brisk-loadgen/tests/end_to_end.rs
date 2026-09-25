@@ -450,8 +450,9 @@ fn a_failing_ramp_ends_right_after_its_failing_step() {
     let addr = spawn_responder();
     let dir = temp_dir("ramp-fail");
     let out = dir.join("s2.json");
-    // No response comes back within 1 us: the first step fails. The plan
-    // has 20 steps of a second after a second of warmup.
+    // The responder takes 100 ms per request against a 50 ms p99 limit:
+    // the first step fails, and the target, not the load generator, is to
+    // blame. The plan has 20 steps of a second after a second of warmup.
     let (warmup_s, step_len_s, step_count) = (1, 1, 20);
     let started = std::time::Instant::now();
     let output = run(&[
@@ -466,7 +467,9 @@ fn a_failing_ramp_ends_right_after_its_failing_step() {
         "--ramp-max-steps",
         &step_count.to_string(),
         "--stop-p99-ms",
-        "0.001",
+        "50",
+        "--ttft-us",
+        "100000",
         "--warmup-s",
         &warmup_s.to_string(),
         "--resp-bytes",

@@ -590,6 +590,8 @@ fn stalled_streams_leave_lower_bounds_for_their_overdue_chunks() {
 
 /// Judging delay of the ramp tests.
 const JUDGE_DELAY_NS: u64 = 50_000_000;
+/// p99 limit of the ramp tests.
+const STOP_P99_NS: u64 = 2_000_000;
 
 /// A ramp spec with the test judging delay.
 fn ramp_spec(
@@ -601,6 +603,7 @@ fn ramp_spec(
         steps: steps.iter().copied().filter(|s| s.step > 0).collect(),
         judge_delay_ns: JUDGE_DELAY_NS,
         saturation_lag_ns,
+        stop_p99_ns: STOP_P99_NS,
         reports,
     }
 }
@@ -736,6 +739,10 @@ fn sends_still_unmade_at_a_steps_deadline_are_censored_and_dropped() {
         "{}",
         second.max_emit_lag_ns
     );
+    // About 40 of them were overdue when the shard started, nearly all by
+    // more than the p99 limit; coarse timers off Linux make more late.
+    assert!((38..=60).contains(&second.late_sends), "{second:?}");
+    assert_eq!(first.late_sends, 0);
     // The dropped sends of step 1 never went out.
     assert_eq!(run.output.counters.requests_scheduled, 60);
     assert!(run.errors.is_empty(), "{:?}", run.errors);

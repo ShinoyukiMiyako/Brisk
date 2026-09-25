@@ -203,7 +203,7 @@ fn ramp_table(out: &mut String, ramp: &RampOutcome) {
         put!(
             out,
             "  step {:>3}  {:>10.1} req/s  p50 {:>9.1} us  p99 {:>9.1} us  errors {}/{}  \
-             censored {} (unsent {})  max emit lag {:.1} us  {}",
+             censored {} (unsent {})  late sends {}  max emit lag {:.1} us  {}",
             step.step,
             step.rate,
             micros(step.p50_ns),
@@ -212,6 +212,7 @@ fn ramp_table(out: &mut String, ramp: &RampOutcome) {
             step.requests + step.errors,
             step.censored,
             step.unsent,
+            step.late_sends,
             micros(step.max_emit_lag_ns),
             match step.verdict {
                 StepVerdict::Passed => "ok",

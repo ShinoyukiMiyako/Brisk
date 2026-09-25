@@ -190,6 +190,10 @@ pub(crate) struct RampSpec {
     /// means the shard cannot keep up with the schedule: it stops and
     /// reports [`RampMessage::Saturated`].
     pub(crate) saturation_lag_ns: u64,
+    /// The p99 limit: a send reached later than this is counted in
+    /// [`StepReport::late_sends`], its request over the limit on the load
+    /// generator's lag alone.
+    pub(crate) stop_p99_ns: u64,
     /// Where step reports and saturation go.
     pub(crate) reports: Sender<RampMessage>,
 }
@@ -234,6 +238,9 @@ pub(crate) struct StepReport {
     /// Largest lag of a send of the step behind its scheduled time, taken
     /// when the event loop reached the send.
     pub(crate) max_emit_lag_ns: u64,
+    /// Sends of the step made more than the p99 limit after their
+    /// scheduled time.
+    pub(crate) late_sends: u64,
 }
 
 /// Everything a shard needs.
@@ -465,6 +472,7 @@ struct StepAcc {
     requests: u64,
     errors: u64,
     max_emit_lag_ns: u64,
+    late_sends: u64,
 }
 
 impl StepAcc {
@@ -475,6 +483,7 @@ impl StepAcc {
             requests: 0,
             errors: 0,
             max_emit_lag_ns: 0,
+            late_sends: 0,
         }
     }
 }
@@ -497,8 +506,10 @@ impl RampTracker {
     }
 
     fn on_start(&mut self, step: u32, lag_ns: u64) {
+        let late = lag_ns > self.spec.stop_p99_ns;
         if let Some(acc) = self.note_lag(step, lag_ns) {
             acc.outstanding += 1;
+            acc.late_sends += u64::from(late);
         }
     }
 
@@ -1289,6 +1300,7 @@ impl Shard {
                 censored: open + unsent,
                 unsent,
                 max_emit_lag_ns: acc.max_emit_lag_ns,
+                late_sends: acc.late_sends,
             }))
             .map_err(|_| io::Error::other("ramp coordinator is gone"))?;
         ramp.next_report += 1;

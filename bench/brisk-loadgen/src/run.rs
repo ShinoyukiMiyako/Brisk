@@ -45,6 +45,11 @@ const STARTUP_LEAD_NS: u64 = 200_000_000;
 const FD_HEADROOM: u64 = 256;
 /// Ramp steps with more failures than this share fail.
 const RAMP_MAX_ERROR_SHARE: f64 = 0.01;
+/// Share of a step's samples above its p99. When more of its sends than
+/// this went out later than the p99 limit, each of them over the limit on
+/// the load generator's lag alone, the step's p99 exceeds the limit whatever
+/// the target does: the failure is the tool's.
+const RAMP_TAIL_SHARE: f64 = 0.01;
 /// Least time a ramp waits after a step's planned end before judging it,
 /// beyond the p99 limit. A request of the step still open by then is
 /// counted as a sample above the limit, and 50 ms leaves room for a late
@@ -407,8 +412,10 @@ pub(crate) enum StepVerdict {
     /// The step's p99, censored samples included, exceeded the limit.
     P99Exceeded,
     /// The load generator could not deliver the step's schedule: a shard's
-    /// sends fell behind by more than the saturation limit, or a shard did
-    /// not report the step in time. Says nothing about the target.
+    /// sends fell behind by more than the saturation limit, a shard did not
+    /// report the step in time, or the step's p99 exceeded the limit with
+    /// more than [`RAMP_TAIL_SHARE`] of its sends made later than the limit.
+    /// Says nothing about the target.
     ToolSaturated,
 }
 
@@ -436,6 +443,8 @@ pub(crate) struct RampStep {
     /// Largest lag of a send behind its scheduled time, as the shards'
     /// event loops reached the sends, nanoseconds.
     pub(crate) max_emit_lag_ns: u64,
+    /// Sends made more than the p99 limit after their scheduled time.
+    pub(crate) late_sends: u64,
     /// Within the p99 limit and the error limit.
     pub(crate) passed: bool,
     /// Why the step passed or failed.
@@ -472,6 +481,8 @@ pub(crate) struct RampOutcome {
     reason = "times are u64 nanoseconds named `_ns` throughout the crate"
 )]
 struct RampLimits {
+    /// The p99 limit of a sustainable step.
+    stop_p99_ns: u64,
     /// Delay after a step's planned end by which every shard reports it:
     /// the p99 limit plus a margin of twice the limit, the margin at least
     /// [`RAMP_JUDGE_MARGIN_NS`].
@@ -490,6 +501,7 @@ impl RampLimits {
             .saturating_mul(RAMP_TIMEOUT_P99_FACTOR)
             .max(RAMP_MIN_REQUEST_TIMEOUT_NS);
         Self {
+            stop_p99_ns,
             judge_delay_ns: stop_p99_ns.saturating_add(margin),
             saturation_lag_ns: RAMP_SATURATION_LAG_NS.min(step_ns / RAMP_SATURATION_STEP_DIVISOR),
             request_timeout_ns: configured_timeout_ns.min(timeout),
@@ -515,7 +527,6 @@ struct Saturation {
 struct RampCoordinator {
     reports: Receiver<RampMessage>,
     shards: usize,
-    stop_p99_ns: u64,
     limits: RampLimits,
     /// The evaluated steps (step >= 1) in order.
     segments: Vec<RateSegment>,
@@ -534,14 +545,12 @@ impl RampCoordinator {
     fn new(
         reports: Receiver<RampMessage>,
         shards: usize,
-        stop_p99_ns: u64,
         limits: RampLimits,
         segments: &[RateSegment],
     ) -> Self {
         Self {
             reports,
             shards,
-            stop_p99_ns,
             limits,
             segments: segments.iter().copied().filter(|s| s.step > 0).collect(),
             received: BTreeMap::new(),
@@ -656,8 +665,11 @@ impl RampCoordinator {
         }
     }
 
-    /// Judges a step every shard reported; returns whether it passed.
+    /// Judges a step every shard reported; returns whether it passed. A p99
+    /// over the limit is the tool's when the sends the load generator made
+    /// later than the limit decide it on their own (see [`RAMP_TAIL_SHARE`]).
     fn judge(&mut self, seg: RateSegment, acc: &StepReport) -> bool {
+        let limit = self.limits.stop_p99_ns;
         let total = acc.requests + acc.errors;
         let p99_ns = acc.latency.value_at_quantile(0.99);
         #[expect(clippy::cast_precision_loss, reason = "request counts are small")]
@@ -670,15 +682,17 @@ impl RampCoordinator {
             StepVerdict::NoRequests
         } else if error_share > RAMP_MAX_ERROR_SHARE {
             StepVerdict::Errors
-        } else if p99_ns > self.stop_p99_ns {
-            StepVerdict::P99Exceeded
-        } else {
+        } else if p99_ns <= limit {
             StepVerdict::Passed
+        } else if late_share(acc) > RAMP_TAIL_SHARE {
+            StepVerdict::ToolSaturated
+        } else {
+            StepVerdict::P99Exceeded
         };
         let passed = verdict == StepVerdict::Passed;
         eprintln!(
             "ramp step {}: {:.1} req/s  p99 {:.3} ms  errors {}/{}  censored {} (unsent {})  \
-             max emit lag {:.3} ms  -> {}",
+             late sends {}  max emit lag {:.3} ms  -> {}",
             seg.step,
             seg.rate,
             millis(p99_ns),
@@ -686,6 +700,7 @@ impl RampCoordinator {
             total,
             acc.censored,
             acc.unsent,
+            acc.late_sends,
             millis(acc.max_emit_lag_ns),
             if passed { "ok" } else { "stop" }
         );
@@ -698,9 +713,13 @@ impl RampCoordinator {
                 "step {step} failed {:.2}% of its requests",
                 error_share * 100.0
             ),
-            StepVerdict::P99Exceeded | StepVerdict::ToolSaturated => {
-                format!("step {step} p99 exceeded the limit")
-            }
+            StepVerdict::P99Exceeded => format!("step {step} p99 exceeded the limit"),
+            StepVerdict::ToolSaturated => format!(
+                "step {step}: p99 exceeded the limit, and {:.2}% of its sends went out more than \
+                 the {:.3} ms limit after their scheduled time: loadgen emit lag, tool saturated",
+                late_share(acc) * 100.0,
+                millis(limit)
+            ),
         };
         self.stop = Some((verdict, stopped_by));
         false
@@ -727,6 +746,7 @@ impl RampCoordinator {
                 censored: 0,
                 unsent: 0,
                 max_emit_lag_ns: 0,
+                late_sends: 0,
             },
             |(_, acc)| acc,
         );
@@ -757,6 +777,7 @@ impl RampCoordinator {
             p50_ns: acc.latency.value_at_quantile(0.5),
             p99_ns: acc.latency.value_at_quantile(0.99),
             max_emit_lag_ns: lag_ns.map_or(acc.max_emit_lag_ns, |lag| lag.max(acc.max_emit_lag_ns)),
+            late_sends: acc.late_sends,
             passed: verdict == StepVerdict::Passed,
             verdict,
         });
@@ -783,7 +804,7 @@ impl RampCoordinator {
             .last()
             .map(|s| s.rate);
         Ok(RampOutcome {
-            stop_p99_ns: self.stop_p99_ns,
+            stop_p99_ns: self.limits.stop_p99_ns,
             judge_delay_ns: self.limits.judge_delay_ns,
             saturation_lag_ns: self.limits.saturation_lag_ns,
             request_timeout_ns: self.limits.request_timeout_ns,
@@ -805,6 +826,15 @@ fn merge(acc: &mut StepReport, report: &StepReport) {
     acc.censored += report.censored;
     acc.unsent += report.unsent;
     acc.max_emit_lag_ns = acc.max_emit_lag_ns.max(report.max_emit_lag_ns);
+    acc.late_sends += report.late_sends;
+}
+
+/// Share of a step's sends made later than the p99 limit, the unsent ones
+/// included; `acc` holds at least one send.
+#[expect(clippy::cast_precision_loss, reason = "request counts are small")]
+fn late_share(acc: &StepReport) -> f64 {
+    let sends = acc.requests + acc.errors + acc.censored;
+    (acc.late_sends + acc.unsent) as f64 / sends as f64
 }
 
 /// "warmup" for step 0, "step N" otherwise.
@@ -1066,6 +1096,7 @@ impl FixedPhase<'_> {
                     steps: steps.clone(),
                     judge_delay_ns: limits.judge_delay_ns,
                     saturation_lag_ns: limits.saturation_lag_ns,
+                    stop_p99_ns: limits.stop_p99_ns,
                     reports: tx.clone(),
                 }),
             })
@@ -1168,8 +1199,7 @@ pub(crate) fn nonstream(cmd: &NonstreamCmd) -> anyhow::Result<()> {
         ramp: ramp.as_ref().map(|(tx, _)| (tx, limits)),
     }
     .specs();
-    let coordinator =
-        ramp.map(|(_, rx)| RampCoordinator::new(rx, specs.len(), stop_p99_ns, limits, &segments));
+    let coordinator = ramp.map(|(_, rx)| RampCoordinator::new(rx, specs.len(), limits, &segments));
     eprintln!(
         "nonstream: {description} against {} ({} shard(s)); warmup {} s",
         common.url,
@@ -1339,6 +1369,7 @@ mod tests {
             censored: 0,
             unsent: 0,
             max_emit_lag_ns: 1_000,
+            late_sends: 0,
         }
     }
 
@@ -1360,10 +1391,7 @@ mod tests {
         let segments = ramp_segments(0, 0, 100.0, 50.0, SEC_NS, steps);
         let limits = RampLimits::new(LIMIT_NS, SEC_NS, 300 * SEC_NS);
         let lives = (0..shards).map(|_| Arc::new(Live::default())).collect();
-        (
-            RampCoordinator::new(rx, shards, LIMIT_NS, limits, &segments),
-            lives,
-        )
+        (RampCoordinator::new(rx, shards, limits, &segments), lives)
     }
 
     /// Delivers a message as the running phase does, well before any
@@ -1495,6 +1523,41 @@ mod tests {
     }
 
     #[test]
+    fn a_p99_decided_by_late_sends_is_the_tools() {
+        // Steps failing their p99 alike, 3 ms at the tail of 100 sends:
+        // where the load generator made more than 1% of the sends later
+        // than the limit the tail is its own; at 1% the target's latency
+        // had to add to it.
+        let mut values = vec![500_000; 97];
+        values.extend([3_000_000; 3]);
+        for (late_sends, unsent, verdict) in [
+            (2, 0, StepVerdict::ToolSaturated),
+            (1, 1, StepVerdict::ToolSaturated),
+            (1, 0, StepVerdict::P99Exceeded),
+        ] {
+            let (mut coordinator, lives) = coordinator(1, 2);
+            let mut only = report(1, &values, 0);
+            only.late_sends = late_sends;
+            only.unsent = unsent;
+            only.censored = unsent;
+            step(&mut coordinator, only, &lives);
+            assert!(all_stopped(&lives));
+            let outcome = coordinator.finish(&lives).unwrap();
+            assert_eq!(verdicts(&outcome), [verdict]);
+            assert_eq!(outcome.steps[0].late_sends, late_sends);
+            assert_eq!(outcome.stop_reason, Some(verdict));
+            assert_eq!(
+                outcome
+                    .stopped_by
+                    .contains("loadgen emit lag, tool saturated"),
+                verdict == StepVerdict::ToolSaturated,
+                "{}",
+                outcome.stopped_by
+            );
+        }
+    }
+
+    #[test]
     fn saturation_in_the_warmup_leaves_no_sustainable_rate() {
         let (mut coordinator, lives) = coordinator(2, 3);
         let saturated = RampMessage::Saturated {
@@ -1590,6 +1653,7 @@ mod tests {
         assert_eq!(
             RampLimits::new(2 * ms, 20 * SEC_NS, 300 * SEC_NS),
             RampLimits {
+                stop_p99_ns: 2 * ms,
                 judge_delay_ns: 52 * ms,
                 saturation_lag_ns: 100 * ms,
                 request_timeout_ns: SEC_NS,
@@ -1598,6 +1662,7 @@ mod tests {
         assert_eq!(
             RampLimits::new(100 * ms, 20 * SEC_NS, 300 * SEC_NS),
             RampLimits {
+                stop_p99_ns: 100 * ms,
                 judge_delay_ns: 300 * ms,
                 saturation_lag_ns: 100 * ms,
                 request_timeout_ns: 10 * SEC_NS,
@@ -1607,6 +1672,7 @@ mod tests {
         assert_eq!(
             RampLimits::new(2 * ms, 300 * ms, 500 * ms),
             RampLimits {
+                stop_p99_ns: 2 * ms,
                 judge_delay_ns: 52 * ms,
                 saturation_lag_ns: 30 * ms,
                 request_timeout_ns: 500 * ms,
