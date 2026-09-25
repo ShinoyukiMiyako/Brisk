@@ -1630,3 +1630,64 @@ async fn floor_b_serves_h2_inbound_and_pools_the_upstream_connection() {
     assert_eq!(stats.accepts.load(Ordering::SeqCst), 1);
     assert_eq!(floor.forwarder.idle_connections(), 1);
 }
+
+#[tokio::test]
+async fn floor_b_forwards_trailers_and_pools_the_connection() {
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<Seen>();
+    let (upstream, stats, _) = spawn_counting_upstream(
+        move |req: Request<Incoming>| {
+            let seen_tx = seen_tx.clone();
+            async move {
+                seen_tx.send(Seen::of(&req.into_parts().0)).unwrap();
+                let (mut sender, body) = channel();
+                tokio::spawn(async move {
+                    sender
+                        .send_data(Bytes::from_static(b"payload"))
+                        .await
+                        .unwrap();
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-checksum", HeaderValue::from_static("abc123"));
+                    sender.send_trailers(trailers).await.unwrap();
+                });
+                Response::builder()
+                    .header("trailer", "x-checksum")
+                    .body(body)
+                    .unwrap()
+            }
+        },
+        None,
+    )
+    .await;
+    let floor = spawn_floor_b(&format!("http://{upstream}"), None);
+    let mut sender = h1_connect(floor.addr).await;
+
+    // hyper stops polling a body once it has returned the trailers, so they
+    // are its end: the connection must be pooled by the time they arrive.
+    for _ in 0..3 {
+        let request = Request::get("/v1/stream")
+            .header("host", "floor.example")
+            .header("te", "trailers")
+            .body(empty())
+            .unwrap();
+        let response = within("response", sender.send_request(request))
+            .await
+            .unwrap();
+        let seen = within("upstream request", seen_rx.recv()).await.unwrap();
+        assert_eq!(seen.headers["te"], "trailers");
+        assert_eq!(response.headers()["trailer"], "x-checksum");
+
+        let collected = within("body", response.into_body().collect())
+            .await
+            .unwrap();
+        let trailers = collected.trailers().cloned().expect("trailers dropped");
+        assert_eq!(trailers["x-checksum"], "abc123");
+        assert_eq!(collected.to_bytes(), "payload");
+        assert_eq!(floor.forwarder.idle_connections(), 1);
+    }
+    assert_eq!(
+        stats.accepts.load(Ordering::SeqCst),
+        1,
+        "a response with trailers left its upstream connection unpooled"
+    );
+    assert_eq!(stats.closed.load(Ordering::SeqCst), 0);
+}

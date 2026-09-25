@@ -82,12 +82,12 @@
 //! `retry_canceled_requests` does; a failure on a fresh connection is final.
 //!
 //! A connection returns to the pool once its response body has been read to
-//! the end and its [`SendRequest`] is ready again; a body dropped before its
-//! end closes the connection. Readiness normally comes in the same poll as
-//! the end of the body. It waits for the rest of the request body when the
-//! upstream answered before reading all of it, and the end of the response
-//! (for a response without a body, its head) is held back until then; see
-//! [`SameTaskBody`].
+//! the end (trailers included) and its [`SendRequest`] is ready again; a body
+//! dropped before its end closes the connection. Readiness normally comes in
+//! the same poll as the end of the body. It waits for the rest of the request
+//! body when the upstream answered before reading all of it, and the end of
+//! the response (for a response without a body, its head) is held back until
+//! then; see [`SameTaskBody`].
 //!
 //! # Deliberate differences from floor-A
 //!
@@ -626,11 +626,12 @@ enum BodyState {
 /// At the end of the body the connection goes back to the pool once its
 /// [`SendRequest`] is ready; dropping the body earlier closes it. hyper stops
 /// polling a response body as soon as it reports
-/// [`is_end_stream`](Body::is_end_stream), or once its `Content-Length` has
-/// been written, without asking for the end of the stream. So when the
-/// upstream body is complete with a frame (a known length that has been read
-/// in full), that frame is held back until the connection is pooled and only
-/// then returned, with `is_end_stream` already true. The connection is
+/// [`is_end_stream`](Body::is_end_stream), once its `Content-Length` has been
+/// written, or once it has returned trailers, without asking for the end of
+/// the stream. So when the upstream body is complete with a frame (the last
+/// bytes of a known length, or the trailers, which come only after all data),
+/// that frame is held back until the connection is pooled and only then
+/// returned, with `is_end_stream` already true. The connection is
 /// normally ready in the same poll: the connection's dispatcher returns to
 /// idle and asks for the next request while it reads the body's last bytes.
 /// It is not while the request body is still being written, which delays
@@ -707,7 +708,9 @@ impl Body for SameTaskBody {
             }
             match Pin::new(&mut this.body).poll_frame(cx) {
                 Poll::Ready(None) => this.state = BodyState::Releasing(None),
-                Poll::Ready(Some(Ok(frame))) if this.body.is_end_stream() => {
+                Poll::Ready(Some(Ok(frame)))
+                    if frame.is_trailers() || this.body.is_end_stream() =>
+                {
                     this.state = BodyState::Releasing(Some(frame));
                 }
                 other => return other,
