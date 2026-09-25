@@ -228,7 +228,7 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
 }
 
 /// Whether any `TE` field lists the `trailers` token.
-fn te_accepts_trailers(headers: &HeaderMap) -> bool {
+pub(crate) fn te_accepts_trailers(headers: &HeaderMap) -> bool {
     headers
         .get_all(TE)
         .iter()
@@ -242,7 +242,7 @@ fn te_accepts_trailers(headers: &HeaderMap) -> bool {
 
 /// Joins multiple `Cookie` fields into one, separated by `"; "`, as RFC 9113
 /// (section 8.2.3) requires before forwarding HTTP/2 cookies over HTTP/1.1.
-fn join_cookies(headers: &mut HeaderMap) {
+pub(crate) fn join_cookies(headers: &mut HeaderMap) {
     let mut values = headers.get_all(COOKIE).iter();
     let Some(first) = values.next() else {
         return;

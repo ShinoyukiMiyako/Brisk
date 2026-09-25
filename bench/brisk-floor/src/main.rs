@@ -1,7 +1,7 @@
-//! `brisk-floor`: floor-A, the empty blind-forwarding proxy.
+//! `brisk-floor`: floor-A and floor-B, the empty blind-forwarding proxies.
 //!
 //! ```text
-//! brisk-floor --listen <addr> --upstream <base-url> [--upstream-ca <pem>]
+//! brisk-floor --listen <addr> --upstream <base-url> [--mode a|b] [--upstream-ca <pem>]
 //!             [--tls-cert <pem> --tls-key <pem>] [--workers N] [--cpu-list 0-1]
 //! ```
 //!
@@ -13,7 +13,9 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use brisk_bench_core::cpu;
+use brisk_bench_core::transport::tls as bench_tls;
 use brisk_floor::forward::{self, Forwarder};
+use brisk_floor::same_task::{self, SameTaskForwarder};
 use brisk_floor::tls;
 use brisk_gateway::net::raise_nofile_soft_limit;
 use brisk_gateway::server::{self, ServerConfig};
@@ -29,9 +31,9 @@ use tracing_subscriber::filter::LevelFilter;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// floor-A: forwards every request unmodified to one upstream, streaming both
-/// bodies, to measure the cost of the gateway's connection layer and upstream
-/// client alone.
+/// floor-A and floor-B: forward every request unmodified to one upstream,
+/// streaming both bodies, to measure the cost of the gateway's connection
+/// layer and an upstream client alone.
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -44,8 +46,14 @@ struct Cli {
     #[arg(long)]
     upstream: String,
 
-    /// PEM file with CA certificates trusted for the upstream in addition to
-    /// the platform roots (for the mock's self-signed CA).
+    /// Upstream client: `a` is floor-A (the gateway's reqwest client), `b` is
+    /// floor-B (hyper HTTP/1.1 connections driven in the forwarding task).
+    #[arg(long, value_enum, default_value_t = Mode::A)]
+    mode: Mode,
+
+    /// PEM file with CA certificates trusted for the upstream: in addition to
+    /// the platform roots in mode `a`, as the only roots in mode `b`, where it
+    /// is required for an `https` upstream.
     #[arg(long)]
     upstream_ca: Option<PathBuf>,
 
@@ -66,6 +74,71 @@ struct Cli {
     /// with a warning elsewhere).
     #[arg(long, value_parser = parse_cpu_list)]
     cpu_list: Option<CpuList>,
+}
+
+/// Which upstream client forwards the requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Mode {
+    /// floor-A: the gateway's reqwest client, which runs each upstream
+    /// connection in a task of its own.
+    A,
+    /// floor-B: pooled hyper HTTP/1.1 connections polled by the task that
+    /// forwards the request and its response.
+    B,
+}
+
+impl Mode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+        }
+    }
+}
+
+/// The forwarder of the selected mode.
+enum Floor {
+    A(Forwarder),
+    B(SameTaskForwarder),
+}
+
+impl Floor {
+    fn build(cli: &Cli) -> anyhow::Result<Self> {
+        match cli.mode {
+            Mode::A => {
+                let mut upstream_config = UpstreamClientConfig {
+                    // Every benchmark topology puts the upstream on loopback or
+                    // the internal network, and a host name there must resolve.
+                    allow_private: true,
+                    ..UpstreamClientConfig::default()
+                };
+                if let Some(ca) = &cli.upstream_ca {
+                    upstream_config.extra_root_certs = tls::load_ca_certs(ca)
+                        .with_context(|| format!("loading upstream CA {}", ca.display()))?;
+                }
+                let client = build_client(&upstream_config).context("building upstream client")?;
+                Ok(Self::A(Forwarder::new(client, &cli.upstream)?))
+            }
+            Mode::B => {
+                let tls = cli
+                    .upstream_ca
+                    .as_deref()
+                    .map(|ca| {
+                        bench_tls::client_config(ca)
+                            .with_context(|| format!("loading upstream CA {}", ca.display()))
+                    })
+                    .transpose()?;
+                Ok(Self::B(SameTaskForwarder::new(&cli.upstream, tls)?))
+            }
+        }
+    }
+
+    fn upstream_base(&self) -> &str {
+        match self {
+            Self::A(forwarder) => forwarder.upstream_base(),
+            Self::B(forwarder) => forwarder.upstream_base(),
+        }
+    }
 }
 
 /// A parsed `--cpu-list`, wrapped so clap treats it as one value.
@@ -91,18 +164,8 @@ fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
-    let mut upstream_config = UpstreamClientConfig {
-        // Every benchmark topology puts the upstream on loopback or the
-        // internal network, and a host name there must resolve.
-        allow_private: true,
-        ..UpstreamClientConfig::default()
-    };
-    if let Some(ca) = &cli.upstream_ca {
-        upstream_config.extra_root_certs = tls::load_ca_certs(ca)
-            .with_context(|| format!("loading upstream CA {}", ca.display()))?;
-    }
-    let client = build_client(&upstream_config).context("building upstream client")?;
-    let forwarder = Forwarder::new(client, &cli.upstream)?;
+    let floor = Floor::build(&cli)?;
+    let mode = cli.mode;
 
     let cpus = cli.cpu_list.map(|list| list.0);
     let workers = match (cli.workers, &cpus) {
@@ -124,7 +187,8 @@ fn main() -> anyhow::Result<()> {
             .with_context(|| format!("binding {}", cli.listen))?;
         tracing::info!(
             listen = %listener.local_addr()?,
-            upstream = forwarder.upstream_base(),
+            upstream = floor.upstream_base(),
+            mode = mode.name(),
             tls = tls.is_some(),
             workers,
             cpus = cpus.as_deref().map(cpu::format_cpu_list),
@@ -132,18 +196,24 @@ fn main() -> anyhow::Result<()> {
             "brisk-floor ready"
         );
         let (begin_drain, drain) = oneshot::channel::<()>();
+        let stop = async move {
+            // A dropped sender means the same as a sent one: stop.
+            let _ = drain.await;
+        };
         // Spawned so the accept loop runs on the (pinned) workers rather than
         // on the main thread, which only waits here.
-        let mut serving = tokio::spawn(forward::run(
-            listener,
-            tls,
-            server_config,
-            forwarder,
-            async move {
-                // A dropped sender means the same as a sent one: stop.
-                let _ = drain.await;
-            },
-        ));
+        let mut serving = match floor {
+            Floor::A(forwarder) => {
+                tokio::spawn(forward::run(listener, tls, server_config, forwarder, stop))
+            }
+            Floor::B(forwarder) => tokio::spawn(same_task::run(
+                listener,
+                tls,
+                server_config,
+                forwarder,
+                stop,
+            )),
+        };
 
         let signal = tokio::select! {
             served = &mut serving => return serve_outcome(served),
@@ -328,6 +398,74 @@ mod tests {
         let both = ["--tls-cert", "c.pem", "--tls-key", "k.pem"];
         let cli = Cli::try_parse_from(base.iter().chain(&both)).unwrap();
         assert!(cli.tls_cert.is_some() && cli.tls_key.is_some());
+    }
+
+    #[test]
+    fn mode_defaults_to_floor_a() {
+        let base = [
+            "brisk-floor",
+            "--listen",
+            "127.0.0.1:0",
+            "--upstream",
+            "http://h",
+        ];
+        assert_eq!(Cli::try_parse_from(base).unwrap().mode, Mode::A);
+        let cli = Cli::try_parse_from(base.iter().chain(&["--mode", "b"])).unwrap();
+        assert_eq!(cli.mode, Mode::B);
+        assert!(Cli::try_parse_from(base.iter().chain(&["--mode", "c"])).is_err());
+    }
+
+    #[test]
+    fn floor_b_refuses_an_https_upstream_without_ca() {
+        let cli = Cli::try_parse_from([
+            "brisk-floor",
+            "--listen",
+            "127.0.0.1:0",
+            "--upstream",
+            "https://127.0.0.1:19443",
+            "--mode",
+            "b",
+        ])
+        .unwrap();
+        let err = Floor::build(&cli).err().expect("accepted without a CA");
+        assert!(err.to_string().contains("--upstream-ca"), "{err:#}");
+    }
+
+    #[test]
+    fn https_upstream_builds_with_a_ca_in_mode_b_and_without_one_in_mode_a() {
+        use brisk_bench_core::transport::certs::{CA_CERT_FILE, CertBundle};
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "brisk-floor-main-test-{}-{nanos}",
+            std::process::id()
+        ));
+        CertBundle::generate(&["localhost".to_owned()])
+            .unwrap()
+            .write_to(&dir)
+            .unwrap();
+        let ca = dir.join(CA_CERT_FILE);
+        let base = [
+            "brisk-floor",
+            "--listen",
+            "127.0.0.1:0",
+            "--upstream",
+            "https://localhost:19443",
+        ];
+
+        let with_ca = ["--mode", "b", "--upstream-ca", ca.to_str().unwrap()];
+        let cli = Cli::try_parse_from(base.iter().chain(&with_ca)).unwrap();
+        let built = Floor::build(&cli);
+        // floor-A trusts the platform roots as well and needs no CA.
+        let cli = Cli::try_parse_from(base).unwrap();
+        let floor_a = Floor::build(&cli);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(matches!(built.unwrap(), Floor::B(_)));
+        assert!(matches!(floor_a.unwrap(), Floor::A(_)));
     }
 
     #[test]
