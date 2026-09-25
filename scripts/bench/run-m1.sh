@@ -68,6 +68,13 @@
 # verdict never read brisk-pt, and Brisk against brisk-pt uses the latest
 # attempt of each repetition in which the two are valid together.
 #
+# Besides loadgen's validity, a run of S1, S2 or S3 is invalid when more of
+# its requests failed after the warmup (stale retries aside) than a tenth of
+# the tail above its highest compared quantile (COMPARE_QUANTILES,
+# S3_COMPARE_QUANTILES; 0.01% at p99.9): brisk-loadgen compare refuses such
+# a run, which would cost the block its comparisons, while loadgen's validity
+# tolerates 0.1%.
+#
 # Brisk: at the start of the session `brisk keygen` makes a virtual key, read
 # by its frozen output format (contract 05, section 1.5). Its digest goes into
 # the rendered configurations (one per Brisk arm and config, validated with
@@ -1776,6 +1783,15 @@ execute_run() {
     if ((failed)); then
         failed_runs=$((failed_runs + 1))
     fi
+    # compare reads the repetitions of S1, S2 and S3; a run it would refuse
+    # is rerun here instead of costing the block its comparisons.
+    if [[ "${run_ctx[kind]}" == run && "$scen" != ramp && -f "$result" ]]; then
+        local tail_reason
+        tail_reason="$(tail_screen_reason "$scen" "$result")"
+        if [[ -n "$tail_reason" ]]; then
+            reasons+=("$tail_reason")
+        fi
+    fi
     if [[ -n "${run_ctx[sut_pid]}" ]]; then
         sut="$(sut_evidence "$tag" "$result")"
         if [[ "$(jq -r '.cpu_s' <<<"$sut")" == null ]]; then
@@ -2283,6 +2299,38 @@ pt_pair_selection() {
 # repetitions with brisk-pt's runs of .pt added.
 pt_report_selection() {
     jq -c 'if .pt == null then . else .runs["brisk-pt"] = .pt.runs["brisk-pt"] end | del(.pt)' <<<"$1"
+}
+
+# Why a result fails the tail screen of brisk-loadgen compare, or nothing.
+# Failed requests have no latency, so compare refuses a run (short of
+# --allow-invalid) whose requests after the warmup failed, stale retries
+# aside, in a larger share than a tenth of the tail above the highest
+# compared quantile: 1e-4 at p99.9, where loadgen's validity allows 1e-3.
+# The percentages are read as compare reads them (cli.rs parse_percent moves
+# the decimal point in the text), so the limit is the same double. Input: a
+# result file.
+# shellcheck disable=SC2016
+prog_tail_screen='
+def compare_fraction:
+    gsub(" "; "") | split(".") as $p
+    | ($p[0] | if length < 2 then ("00" + .)[-2:] else . end) as $int
+    | (($int[:-2] | if . == "" then "0" else . end) + "." + $int[-2:] + ($p[1:] | join(""))) | tonumber;
+([$quantiles | split(",")[] | compare_fraction] | max) as $qmax
+| ((1 - $qmax) * 0.1) as $limit
+| .warmup_intervals as $w
+| reduce (.intervals[] | select(.index >= $w)) as $iv ({requests: 0, failures: 0};
+      .requests += $iv.requests
+      | reduce ($iv.errors | to_entries[] | select(.key != "stale_retry") | .value) as $n (.; .failures += $n))
+| (.requests + .failures) as $total
+| if $total > 0 and .failures / $total > $limit
+  then "\(.failures) of \($total) requests after the warmup failed, more than \($limit | pct4) for the \($qmax | qlabel) tail; brisk-loadgen compare would refuse the run"
+  else empty end
+'
+jq_programs+=(prog_tail_screen)
+
+# The tail screen of one result of scenario <scen> (prog_tail_screen).
+tail_screen_reason() {
+    jq -r --arg quantiles "$(compare_quantiles "$1")" "$jq_defs$prog_tail_screen" "$2"
 }
 
 # Compares arm B against arm A over the block's selected repetitions; writes
