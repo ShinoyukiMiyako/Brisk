@@ -178,24 +178,54 @@
 #
 # Ramp (contract 05, section 6.1): nonstream from RAMP_START req/s, up
 # RAMP_STEP_PCT percent every RAMP_STEP_S seconds for at most RAMP_MAX_STEPS
-# steps, stopping at the first step whose p99 exceeds RAMP_STOP_P99_MS, mock
-# TTFT RAMP_TTFT_US. A ramp's sustainable rate is the last step of its
-# leading run of steps with p99 within the limit and no error, in a valid
-# run. Each ramp block starts with one direct ramp, the tool limit of mock and
-# loadgen on the ramp plan (see above) of its pairs; when the baseline arm
-# (floor-A, axum in e1) reaches RAMP_TOOL_LIMIT_SHARE of it, the throughput
-# comparison is tool-limited and only reported. The final step of every
-# ramp saturates something, in the direct ramp the mock itself, so ramps
-# take their own mock write lag limit (RAMP_MOCK_WRITE_LAG_LIMIT_US).
+# steps, stopping at the first step that does not pass (below; p99 limit
+# RAMP_STOP_P99_MS), mock TTFT RAMP_TTFT_US. A ramp's sustainable rate is
+# the last step before its first step that is not sustainable (below), in a
+# valid run. Each ramp block starts with one direct ramp, the tool limit of
+# mock and loadgen on the ramp plan (see above) of its pairs; when the
+# baseline arm (floor-A, axum in e1) reaches RAMP_TOOL_LIMIT_SHARE of it,
+# the throughput comparison is tool-limited and only reported. The final
+# step of every ramp saturates something, in the direct ramp the mock
+# itself, so ramps take their own mock write lag limit
+# (RAMP_MOCK_WRITE_LAG_LIMIT_US).
 #
-# A ramp step is sustainable (6.1) when its p99 is within the limit, it had
-# no error and loadgen's validity checks hold over the step's own intervals.
-# loadgen checks validity once over the whole ramp, saturating last step
-# included, so its emit lag, mock write lag, failure and stale retry rules
-# are applied again per step from the intervals of the result, and only a
-# reason no step can own (a clock step, say) voids a ramp. The saturation
-# that ends a ramp thus ends its run of sustainable steps instead of voiding
-# it; in the direct ramp, loadgen falling behind marks the tool limit.
+# A ramp step is sustainable (6.1) when loadgen's verdict on it is passed,
+# its p99 is within the limit, it had no error and loadgen's validity checks
+# hold over the step's own intervals. loadgen judges every step (passed,
+# no_requests, errors, p99_exceeded or tool_saturated) and stops the ramp at
+# the first that does not pass, whose verdict is the ramp's stop_reason (null
+# when every step passed). It checks validity once over the whole ramp,
+# failing last step included, so its emit lag, mock write lag, failure and
+# stale retry rules are applied again per step from the intervals of the
+# result, and only a reason no step can own (a clock step, say) voids a
+# ramp. The failure that ends a ramp thus ends its run of sustainable steps
+# instead of voiding it; in the direct ramp it marks the tool limit.
+#
+# How a ramp ended bounds its rate. tool_saturated says loadgen could not
+# keep its own schedule (a shard's sends 100 ms late, a shard's step report
+# missing, or more than 1% of a step's sends later than the p99 limit): the
+# tool got there first, so the sustainable rate is only a lower bound of the
+# arm's, never the limit of the arm under test. A ramp that passed all
+# RAMP_MAX_STEPS steps is a lower bound too, capped by the ramp's length. A
+# stall of the VM saturates the tool early: in an m1-calib session a single
+# 52.5 ms stall made a ramp judge the tool saturated at about 29.5k req/s.
+# So a valid ramp that ended tool_saturated at a step whose rate is at most
+# the block's tool limit (the direct ramp itself whenever it ended so) runs
+# again, same seed and position, up to RAMP_TOOL_RETRIES times, and the run
+# with the highest sustainable rate counts; runs.jsonl records every run with
+# its saturation_retry (0 for the first) and the reason of the rerun, and
+# the session log says why. An invalid ramp, which a tool saturated in the
+# warmup leaves, is rerun by RETRY_INVALID instead. The tool limit is the
+# highest sustainable rate of the block's valid direct ramps. An arm under
+# test whose counted ramp ended tool_saturated all the same (rerun in vain,
+# or not rerun: saturated above the tool limit, or the block has none)
+# makes its block's throughput comparison tool-limited: reported, never
+# gated, so never FAIL. A direct ramp that passed all RAMP_MAX_STEPS
+# steps gives only a lower bound of the tool limit: the RAMP_TOOL_LIMIT_SHARE
+# rule then holds the baseline arm to that lower bound, which can turn a
+# gated comparison into a reported one too early but never lets the tool cap
+# a gated result, and the text says so; when the baseline arm passed every
+# step as well, the text asks for a larger RAMP_MAX_STEPS or RAMP_START.
 #
 # Verdicts (contract 05, 7.5 and 6.3) on the 95% t interval of each paired
 # delta: FAIL when its low end exceeds the limit, PASS when the estimate and
@@ -206,9 +236,10 @@
 # repetition at a time, up to EXTEND_MAX_REPS (EXTEND_UNCERTAIN). The ramp
 # ratio Brisk / floor-A over at least 3 pairs: all >= 0.85 PASS, mean < 0.85
 # FAIL, else UNCERTAIN; a ramp without a sustainable step lies below
-# RAMP_START, which bounds its pair's ratio, and a tool-limited block is
-# only reported. The reuse verdict (Connections, above) is gated like them,
-# but reported in S3. The e-sessions print their
+# RAMP_START, and a rate that is only a lower bound (Ramp, above) lies above
+# its value, each of which bounds its pair's ratio from one side, and a
+# tool-limited block is only reported. The reuse verdict (Connections,
+# above) is gated like them, but reported in S3. The e-sessions print their
 # rules as MET or NOT_MET (TRIGGERED or not in e11) and a decision; a rule
 # on the within-run interval of a single repetition is UNDECIDED (UNCERTAIN
 # in e11) and changes no default. Memory, idle RSS, CPU per chunk
@@ -373,6 +404,7 @@ knob_table=(
     "RAMP_TTFT_US|0|ramp mock delay, microseconds"
     "RAMP_MOCK_WRITE_LAG_LIMIT_US|5000|ramp mock write lag p99 limit, microseconds; a ramp ends by saturating, so here the limit only catches a stalled mock"
     "RAMP_TOOL_LIMIT_SHARE|0.9|share of the direct ramp's rate at which the baseline arm makes a throughput comparison tool-limited"
+    "RAMP_TOOL_RETRIES|2|reruns, same seed, of a valid ramp that ended tool-saturated at a rate within the block's tool limit (a direct ramp: whenever it ended tool-saturated); the highest sustainable rate counts"
     "S3_SIZES|100k,1m,10m|S3 request body sizes, one block each"
     "S3_RATE|5|S3 request rate per second"
     "S3_TTFT_US|2000|S3 mock TTFT, microseconds"
@@ -511,7 +543,7 @@ for name in RETRY_INVALID EXTEND_MAX_REPS SEED SPIN_US S3_SPIN_US MOCK_COMMIT_US
     MOCK_PLAIN_PORT MOCK_TLS_PORT SUT_P_PORT SUT_T_PORT SC_PORT SC_CONCURRENCY SC_WARMUP_S SC_MEASURE_S \
     S1_CONCURRENCY S1_TTFT_US S1_CHUNK_BYTES S1_MAX_SLIP_US S1_WARMUP_S S1_MEASURE_S \
     S2_TTFT_US S2_RESP_BYTES S2_PROMPT_BYTES S2_WARMUP_S S2_MEASURE_S \
-    RAMP_STEP_S RAMP_MAX_STEPS RAMP_WARMUP_S RAMP_TTFT_US \
+    RAMP_STEP_S RAMP_MAX_STEPS RAMP_WARMUP_S RAMP_TTFT_US RAMP_TOOL_RETRIES \
     S3_TTFT_US S3_CHUNKS S3_WARMUP_S S3_MEASURE_S COMPARE_RESAMPLES IDLE_RSS_S READY_TIMEOUT_S \
     S1_REPS S2_REPS S3_REPS RAMP_REPS SUT_WORKERS RAMP_SUT_WORKERS RAMP_MOCK_SHARDS RAMP_LOADGEN_SHARDS; do
     [[ "${!name}" =~ ^[0-9]+$ ]] || die "$name must be a non-negative integer, got '${!name}'"
@@ -825,6 +857,9 @@ rule_b_voided=0
 failed_runs=0
 evaluation_errors=0
 retries=0
+# Ramps run again after a tool saturation (RAMP_TOOL_RETRIES), not counted
+# in retries.
+ramp_reruns=0
 extensions=0
 host_ready=unknown
 selfcheck_status=not_run
@@ -915,6 +950,18 @@ def pair_outcomes:
     group_by([.block, .rep, .a, .b])
     | map({block: .[0].block, rep: .[0].rep, a: .[0].a, b: .[0].b, judged: .[0].judged,
            outcome: ([.[] | select(.ok != null) | .ok == false] | recheck)});
+# The run that counts among runs.jsonl records of one ramp and its
+# saturation reruns: the valid one with the highest sustainable rate, of
+# equal rates one that did not end tool-saturated, then the earliest; null
+# without a valid one.
+def ramp_best:
+    map(select(.valid == true))
+    | if length == 0 then null
+      else max_by([(.ramp.max_sustainable_rate // -1), (if .ramp.end == "tool_saturated" then 0 else 1 end),
+                   (0 - (.saturation_retry // 0))])
+      end;
+# Where a ramp saturated, from the saturated field of its evidence.
+def ramp_where: if .step == 0 then "the warmup (\(.rate | rate) req/s)" else "step \(.step) (\(.rate | rate) req/s)" end;
 '
 
 # Decoding of loadgen's interval histograms (base64 of an uncompressed HDR V2
@@ -1091,44 +1138,76 @@ prog_check_delta='
           ci_ns: [$v.lo, $v.hi], pairs: $pairs, single_repetition: $single}}
 '
 
-# The ramp pairs of one config and its direct tool limit. Input: runs.jsonl,
-# slurped.
+# The ramp pairs of one config and its direct tool limit. Of each arm in an
+# attempt of a repetition, and of the direct ramps, the run that counts is
+# ramp_best of it and its saturation reruns; a pair is the latest attempt of
+# a repetition in which both arms have one. The tool limit is the highest
+# sustainable rate of the valid direct ramps, which tool_ramp describes;
+# reruns counts the saturation reruns of an arm in its attempt. Input:
+# runs.jsonl, slurped.
 # shellcheck disable=SC2016
 prog_ramp_pairs='
+def counted: ramp_best as $r
+    | if $r == null then null
+      else $r.ramp + {tag: $r.tag, pair_id: $r.pair_id, saturation_retry: $r.saturation_retry,
+                      reruns: (length - 1)} end;
 [.[] | select(.scen == "ramp" and .config == $c)] as $all
-| {tool: ([$all[] | select(.kind == "tool" and .valid == true)] | last | .ramp.max_sustainable_rate),
+| ([$all[] | select(.kind == "tool")] | ramp_best) as $tool
+| {tool: $tool.ramp.max_sustainable_rate,
+   tool_ramp: (if $tool == null then null
+               else {tag: $tool.tag, end: $tool.ramp.end, last_step: $tool.ramp.last_step,
+                     max_steps: $tool.ramp.max_steps, saturated: $tool.ramp.saturated,
+                     stopped_by: $tool.ramp.stopped_by,
+                     valid_ramps: ([$all[] | select(.kind == "tool" and .valid == true)] | length)} end),
    pairs: ([$all[] | select(.kind == "run")]
            | [group_by(.rep)[]
               | [group_by(.attempt)[]
-                 | select(length == 2 and all(.[]; .valid == true)
-                          and ((map(.arm) | sort) == ([$a, $b] | sort)))]
+                 | {a: (map(select(.arm == $a)) | counted), b: (map(select(.arm == $b)) | counted)}
+                 | select(.a != null and .b != null)]
               | last
               | select(. != null)
-              | {pair_id: .[0].pair_id,
-                 a: (map(select(.arm == $a)) | .[0].ramp),
-                 b: (map(select(.arm == $b)) | .[0].ramp)}])}
+              | {pair_id: .a.pair_id, a, b}])}
 '
 
-# The throughput verdict of a ramp block: 7.5 (gate) or the E1 rule. A ramp
-# without a sustainable step failed its first step, so its rate lies below
-# RAMP_START ($start), and its pair gets bounds of the ratio B / A instead
-# of a value: [0, RAMP_START / A] when B has no rate, [B / RAMP_START, none]
-# when A has none, no bound when neither has. The 7.5 rule over at least 3
-# pairs: PASS when every ratio is at least 0.85 (every low bound), FAIL when
-# their mean is below 0.85 (the mean of the high bounds), else UNCERTAIN,
-# which more pairs can settle unless a pair has no bound or B has no rate in
-# any pair: its high bounds then come from RAMP_START, not from B, and stay
-# at 0.85 or more while A stays close to RAMP_START. A tool-limited block is
-# reported only, whatever its ratios. $tool_arm names the direct arm whose
-# ramp gave the tool limit (tool_ramp_arm).
+# The throughput verdict of a ramp block: 7.5 (gate) or the E1 rule. Each
+# pair gets bounds of the ratio B / A from where either arm's true rate lies
+# (span): at its rate; below RAMP_START ($start) for a ramp without a
+# sustainable step, which failed its first step; at or above its rate (0
+# without one) for a ramp whose rate is only a lower bound, since it ended
+# tool-saturated or passed all its steps. So [0, RAMP_START / A] when B has
+# no rate, [B / RAMP_START, none] when A has none, no bound when neither
+# has, [B / A, none] when B is a lower bound and [0, B / A] when A is. The
+# 7.5 rule over at least 3 pairs: PASS when every ratio is at least 0.85
+# (every low bound), FAIL when their mean is below 0.85 (the mean of the high
+# bounds), else UNCERTAIN, which more pairs can settle unless a pair has no
+# bound or B has no rate in any pair: its high bounds then come from
+# RAMP_START, not from B, and stay at 0.85 or more while A stays close to
+# RAMP_START. A block is tool-limited, reported only whatever its ratios
+# (TOOL_LIMITED in e1), when an arm of a pair ended tool-saturated or A
+# reached $share of the tool limit; a tool ramp that passed all its steps
+# gives only a lower bound of that limit, which the share is then taken of,
+# and the text says so. $tool_arm names the direct arm whose ramp gave the
+# tool limit (tool_ramp_arm). Input: prog_ramp_pairs.
 # shellcheck disable=SC2016
 prog_ramp_verdict='
-def ramp_rate: if . == null then "<" + ($start | rate) else rate end;
+def lower: .end == "tool_saturated" or .end == "max_steps";
+def span: .max_sustainable_rate as $r
+    | if lower then {lo: ($r // 0), hi: null}
+      elif $r == null then {lo: 0, hi: $start}
+      else {lo: $r, hi: $r} end;
+def ramp_rate: .max_sustainable_rate as $r
+    | if .end == "tool_saturated" then (if $r == null then "none" else ">=" + ($r | rate) end) + " (tool-saturated)"
+      elif .end == "max_steps" then ">=" + ($r | rate) + " (all steps)"
+      elif $r == null then "<" + ($start | rate)
+      else $r | rate end;
 def ratio_text: if .lo == .hi then .lo | fixed3
-                elif .hi != null then "<" + (.hi | fixed3)
+                elif .hi != null and .lo == 0 then "<" + (.hi | fixed3)
+                elif .hi != null then (.lo | fixed3) + " to " + (.hi | fixed3)
                 elif .lo > 0 then ">" + (.lo | fixed3)
                 else "n/a" end;
 .tool as $tool
+| .tool_ramp as $tr
+| ($tr != null and $tr.end == "max_steps") as $tool_capped
 | .pairs as $pairs
 | ($pairs | length) as $n
 | ([$pairs[] | .a.max_sustainable_rate | numbers] | max) as $amax
@@ -1138,29 +1217,39 @@ def ratio_text: if .lo == .hi then .lo | fixed3
    elif $amax != null then ($amax >= $share * $tool)
    elif $share * $tool >= $start then false
    else null end) as $limited
-| [$pairs[] | .a.max_sustainable_rate as $ra | .b.max_sustainable_rate as $rb
-   | if $ra != null and $rb != null then {lo: ($rb / $ra), hi: ($rb / $ra)}
-     elif $ra != null then {lo: 0, hi: ($start / $ra)}
-     elif $rb != null then {lo: ($rb / $start), hi: null}
-     else {lo: 0, hi: null} end] as $bounds
+| [$pairs[] | .pair_id as $p
+   | ({arm: $a} + .a), ({arm: $b} + .b)
+   | select(.end == "tool_saturated")
+   | "\(.arm) in \($p) (at \(.saturated | ramp_where), after \(.reruns) saturation rerun(s))"] as $saturated
+| [$pairs[] | select(.a.end == "max_steps") | {pair_id, steps: .a.max_steps}] as $a_capped
+| [$pairs[] | (.a | span) as $sa | (.b | span) as $sb
+   | {lo: (if $sa.hi == null then 0 else $sb.lo / $sa.hi end),
+      hi: (if $sb.hi == null or $sa.lo == 0 then null else $sb.hi / $sa.lo end)}] as $bounds
 | [$bounds[] | if .lo == .hi then .lo else null end] as $ratios
 | ([$bounds[] | select(.lo == 0 and .hi == null)] | length) as $unbounded
+| ("tool-limited: \($saturated | join(", ")) ended tool-saturated, so the rate counted is only a lower bound, set by the tool rather than by the arm")
+  as $saturated_note
+| ("tool-limited: \($a) reached \($amax / $tool | pct) of the \($tool_arm) ramp"
+   + (if $tool_capped
+      then ", whose rate is only a lower bound of the tool limit (it passed all \($tr.max_steps) steps), so \($a) was held to \($share) of that lower bound"
+      else "" end)) as $limited_note
 | (if $session == "e1" then
-     {rule: "e1-throughput", counts: false, statistical: false,
-      rule_text: "rule: at least 3 pairs, \($b) never a step below \($a) and a step (\($step_pct)%) above it in 2",
-      verdict: (if $n == 0 then "MISSING"
-                elif $limited == true then "TOOL_LIMITED"
-                elif $limited == null then "TOOL_LIMIT_UNKNOWN"
-                elif $n >= 3
-                     and all($pairs[]; .a.last_step != null and .b.last_step != null
-                                       and .b.last_step >= .a.last_step)
-                     and ([$pairs[] | select(.a.last_step != null and .b.last_step != null
-                                             and .b.last_step >= .a.last_step + 1)] | length) >= 2
-                then "MET" else "NOT_MET" end)}
+     (if $n == 0 then {verdict: "MISSING"}
+      elif ($saturated | length) > 0 then {verdict: "TOOL_LIMITED", note: $saturated_note}
+      elif $limited == true then {verdict: "TOOL_LIMITED", note: $limited_note}
+      elif $limited == null then {verdict: "TOOL_LIMIT_UNKNOWN"}
+      elif $n >= 3
+           and all($pairs[]; .a.last_step != null and .b.last_step != null and .b.last_step >= .a.last_step)
+           and ([$pairs[] | select(.a.last_step != null and .b.last_step != null
+                                   and .b.last_step >= .a.last_step + 1)] | length) >= 2
+      then {verdict: "MET"} else {verdict: "NOT_MET"} end)
+     | . + {rule: "e1-throughput", counts: false, statistical: false,
+            rule_text: "rule: at least 3 pairs, \($b) never a step below \($a) and a step (\($step_pct)%) above it in 2"}
    else
      # Tool-limited first: such a block is reported only, whatever else holds.
      (if $n == 0 then {verdict: "MISSING", note: "no pair of valid ramps"}
-      elif $limited == true then {verdict: "REPORT", note: "tool-limited: \($a) reached \($amax / $tool | pct) of the \($tool_arm) ramp"}
+      elif ($saturated | length) > 0 then {verdict: "REPORT", note: $saturated_note}
+      elif $limited == true then {verdict: "REPORT", note: $limited_note}
       elif $limited == null and $tool != null
       then {verdict: "UNCERTAIN",
             note: "\($a) has no sustainable step in any pair, and RAMP_START exceeds \($share) of the tool limit, so whether the block is tool-limited is unknown"}
@@ -1183,30 +1272,52 @@ def ratio_text: if .lo == .hi then .lo | fixed3
             rule_text: "rule: at least 3 pairs, every ratio >= 0.85 PASS, their mean < 0.85 FAIL"}
      | .counts = ($scope == "gated" and .verdict != "REPORT")
    end) as $v
-| ([$pairs[] | "\(.b.max_sustainable_rate | ramp_rate)/\(.a.max_sustainable_rate | ramp_rate)"] | join(", ")) as $rates
+| ([$pairs[] | "\(.b | ramp_rate)/\(.a | ramp_rate)"] | join(", ")) as $rates
+| ("\($tool_arm) tool limit "
+   + (if $tr == null then "unknown (no valid ramp)"
+      elif $tool == null then "below \($start | rate) req/s (no sustainable step)"
+      elif $tool_capped then ">=\($tool | rate) req/s, only a lower bound: its ramp passed all \($tr.max_steps) steps"
+      elif $tr.end == "tool_saturated" then "\($tool | rate) req/s (tool-saturated at \($tr.saturated | ramp_where))"
+      else "\($tool | rate) req/s" end)
+   + (if $tr != null and $tr.valid_ramps > 1 then ", the best of \($tr.valid_ramps) valid ramps" else "" end))
+  as $tool_text
+| (if ($a_capped | length) == 0 then ""
+   else "; \($a) passed all \($a_capped[0].steps) steps in \([$a_capped[].pair_id] | join(", "))"
+        + (if $tool_capped then ", as the \($tool_arm) ramp did" else "" end)
+        + ": raise RAMP_MAX_STEPS or RAMP_START so that the ramps end within their steps" end) as $hint
 | (if $v.note == null then "" else ": \($v.note)" end) as $note
 | {id: "\($block):ramp", block: $block, kind: "ramp", rule: $v.rule, verdict: $v.verdict, gated: $v.counts,
    extendable: ($v.counts and $v.verdict == "UNCERTAIN" and $v.statistical == true),
    text: ("\($block): max sustainable rate \($b)/\($a) per pair [\($rates)] req/s, ratios ["
           + ([$bounds[] | ratio_text] | join(", "))
-          + "]; \($tool_arm) tool limit \($tool | rate) req/s; \($v.rule_text): \($v.verdict)"
+          + "]; \($tool_text); \($v.rule_text): \($v.verdict)"
           + (if $v.counts then " (gated\($note))"
-             elif $session == "e1" then ""
-             else " (reported\($note))" end)),
-   data: {tool: $tool, tool_arm: $tool_arm, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
+             elif $session == "e1" then (if $v.note == null then "" else " (\($v.note))" end)
+             else " (reported\($note))" end)
+          + $hint),
+   data: {tool: $tool, tool_arm: $tool_arm, tool_ramp: $tr, tool_lower_bound: $tool_capped, limited: $limited,
+          saturated: $saturated, a_all_steps: [$a_capped[].pair_id], ratios: $ratios, ratio_bounds: $bounds,
+          pairs: $pairs}}
 '
 
 # Sustainable rate per vCPU of the SUT, from the ramp pairs: over $cpus
 # (ramp_vcpus), the $workers of the ramp plan's SUT on CPUs $cpu_list, or
-# those CPUs where they are fewer.
+# those CPUs where they are fewer. A mean over a rate that is only a lower
+# bound (tool-saturated, or all steps passed) is one too, which the text
+# names.
 # shellcheck disable=SC2016
 prog_ramp_vcpu='
 def per_cpu: if . == null then null else . / $cpus end;
+def lower_bounds($arm): [.[] | select(.end == "tool_saturated" or .end == "max_steps")] | length
+    | if . == 0 then empty else "\($arm) \(.)" end;
 ([.pairs[] | .a.max_sustainable_rate | numbers] | tint) as $ra
 | ([.pairs[] | .b.max_sustainable_rate | numbers] | tint) as $rb
+| ([([.pairs[].b] | lower_bounds($b)), ([.pairs[].a] | lower_bounds($a))] | join(", ")) as $lower
 | {id: "\($block):per-vcpu", block: $block, kind: "report", rule: "7.5 S2 per vCPU", verdict: "REPORT",
  gated: false, extendable: false,
  text: ("\($block): mean sustainable rate per SUT vCPU (divided by \($cpus), the SUT of the ramp plan having \($workers) worker(s) on CPUs \($cpu_list)): \($b) \($rb.mean | per_cpu | rate), \($a) \($ra.mean | per_cpu | rate) req/s"
+        + (if $lower == "" then ""
+           else "; a lower bound where a rate is one (tool-saturated or all steps passed: \($lower) pair(s))" end)
         + (if $session == "gate"
            then " (reported; 7.5 reference for Brisk: >= 20000 in P, >= 12000 in T; whether a vCPU of the host is a physical core is not confirmed)"
            else " (reported)" end)),
@@ -1652,23 +1763,35 @@ $r[0].loadgen as $lg
 '
 
 # The sustainable rate of a ramp result, by the step condition of contract
-# 05, 6.1: the step's p99 within the limit, no error, and loadgen's validity
-# checks passing. loadgen checks validity once over the whole ramp, whose
-# last step saturates something by design, and keeps no verdict per step;
-# its result does keep the one-second intervals, so each step is checked
-# here over its own intervals with loadgen's limits (validity.rs): emit lag
-# p99 and p99.9 and mock write lag p99 from the interval histograms (base64
-# of an uncompressed HDR V2 serialization, read as hdrhistogram 7.6 reads
-# it), the failure and stale retry shares from the interval counts. The
-# sustainable rate is the last step of the leading run of steps that pass.
-# loadgen's whole-ramp reasons for those rules are thereby judged per step
-# (judged_per_step); a reason no step can own (a clock step, receives
+# 05, 6.1: loadgen's verdict on the step passed, the step's p99 within the
+# limit, no error, and loadgen's validity checks passing. loadgen judges
+# each step and stops the ramp at the first that does not pass (stop_reason,
+# the verdict of that step or of the warmup; null when every step passed),
+# but checks validity only once over the whole ramp, whose last step fails
+# by design; its result does keep the one-second intervals, so each step is
+# checked here over its own intervals with loadgen's limits (validity.rs):
+# emit lag p99 and p99.9 and mock write lag p99 from the interval histograms
+# (base64 of an uncompressed HDR V2 serialization, read as hdrhistogram 7.6
+# reads it), the failure and stale retry shares from the interval counts.
+# The sustainable rate is the last step before the first step that does not
+# pass (ended_by). What ended the run of sustainable steps (end): that
+# step's loadgen verdict (no_requests, errors, p99_exceeded or
+# tool_saturated), checks where loadgen passed it and a check here did not,
+# or, when every judged step passes, tool_saturated for a ramp loadgen
+# stopped for a saturation in its warmup or in a step already judged, and
+# max_steps for one that passed all its steps. The rate of a ramp that ended
+# tool_saturated or max_steps is only a lower bound (lower_bound; Ramp in
+# the header); saturated says where the tool saturated. loadgen's
+# whole-ramp reasons for the rules checked per step are thereby judged per
+# step (judged_per_step); a reason no step can own (a clock step, receives
 # without a kernel timestamp, negative spans, no samples at all) still voids
-# the ramp (run_reasons, valid). The reasons are told apart by the wording
-# of validity.rs, so a reworded one stays a reason of the run. An event
-# counts in the interval it happened in: a request sent at the end of one
-# step and answered in the next counts in the next, a negligible share of
-# a 20 s step. Input: a result file.
+# the ramp (run_reasons, valid). The reasons are told apart by the wording of
+# validity.rs, so a reworded one stays a reason of the run. An event counts
+# in the interval it happened in: a request sent at the end of one step and
+# answered in the next counts in the next, a negligible share of a 20 s
+# step. A result without the step verdicts comes from a brisk-loadgen that
+# predates them, which the session refuses at its start. Input: a result
+# file.
 # shellcheck disable=SC2016
 prog_ramp_evidence="$jq_hdr"'
 def step_rule:
@@ -1678,6 +1801,8 @@ def us1: . / 100 | round / 10;
 def per_us: if . == null then null else . / 1000 end;
 .loadgen.ramp as $r
 | if $r == null then null
+  elif ($r | has("stop_reason")) and all($r.steps[]; has("verdict") and has("unsent") and has("late_sends")) | not
+  then error("the ramp result has no stop_reason or step verdicts; its brisk-loadgen predates them")
   else $r.stop_p99_ns as $lim
        | .warmup_intervals as $w
        | .params.ramp_step_s as $len
@@ -1696,11 +1821,17 @@ def per_us: if . == null then null else . / 1000 end;
                 .requests += $x.requests
                 | reduce ($x.errors | to_entries[]) as $e (.;
                       if $e.key == "stale_retry" then .stale += $e.value else .failures += $e.value end))) as $k
-          | {step: $s.step, rate: $s.rate, requests: $s.requests, errors: $s.errors, censored: $s.censored,
+          | {step: $s.step, rate: $s.rate, verdict: $s.verdict, requests: $s.requests, errors: $s.errors,
+             censored: $s.censored, unsent: $s.unsent, late_sends: $s.late_sends,
+             max_emit_lag_us: ($s.max_emit_lag_ns | per_us),
              p99_us: ($s.p99_ns / 1000), emit_lag_p99_us: ($e99 | per_us), emit_lag_p999_us: ($e999 | per_us),
              mock_write_lag_p99_us: ($m99 | per_us), interval_failures: $k.failures,
              interval_stale_retries: $k.stale,
              reasons: [
+                if $s.verdict == "tool_saturated"
+                then "loadgen verdict tool_saturated (\($s.late_sends) send(s) later than the p99 limit, \($s.unsent) unsent, max emit lag \($s.max_emit_lag_ns | us1) us)"
+                elif $s.verdict != "passed" then "loadgen verdict \($s.verdict)"
+                else empty end,
                 if $s.requests == 0 then "no request completed" else empty end,
                 if $s.errors != 0 then "\($s.errors) failed request(s)" else empty end,
                 if $s.p99_ns > $lim then "p99 \($s.p99_ns | us1) us above \($lim | us1) us" else empty end,
@@ -1721,11 +1852,23 @@ def per_us: if . == null then null else . / 1000 end;
        | (reduce $steps[] as $s ({done: false, ok: []};
             if .done or ($s.reasons | length) > 0 then .done = true else .ok += [$s] end)
           | .ok) as $ok
+       | $steps[$ok | length] as $fail
+       | (if $fail != null then (if $fail.verdict == "passed" then "checks" else $fail.verdict end)
+          elif $r.stop_reason == null then "max_steps"
+          else $r.stop_reason end) as $end
+       | (if $end != "tool_saturated" then null
+          elif $fail != null then {step: $fail.step, rate: $fail.rate}
+          elif ($steps | length) == 0 then {step: 0, rate: .params.ramp_start}
+          else $steps | last | {step, rate} end) as $saturated
        | [.validity.reasons[] | select(step_rule | not)] as $run_reasons
-       | {stop_p99_ns: $lim, steps_judged: ($r.steps | length), stopped_by: $r.stopped_by,
+       | {stop_p99_ns: $lim, steps_judged: ($r.steps | length), max_steps: .params.ramp_max_steps,
+          judge_delay_ns: $r.judge_delay_ns, saturation_lag_ns: $r.saturation_lag_ns,
+          request_timeout_ns: $r.request_timeout_ns,
+          stopped_by: $r.stopped_by, stop_reason: $r.stop_reason,
           loadgen_max_sustainable_rate: $r.max_sustainable_rate,
           max_sustainable_rate: ($ok | last | .rate), last_step: ($ok | last | .step),
-          ended_by: ([$steps[] | select((.reasons | length) > 0) | {step, reasons}] | first),
+          end: $end, lower_bound: ($end == "tool_saturated" or $end == "max_steps"), saturated: $saturated,
+          ended_by: (if $fail == null then null else $fail | {step, verdict, reasons} end),
           valid: (($run_reasons | length) == 0), run_reasons: $run_reasons,
           judged_per_step: [.validity.reasons[] | select(step_rule)],
           steps: $steps}
@@ -1773,7 +1916,8 @@ def kv: split("\n") | map(select(test("=")) | capture("^(?<k>[^=]+)=(?<v>.*)$") 
           c21_status: $c21_status, c21_reason: $c21_reason,
           failed_runs: [$runs[] | select(.kind == "perf" and .failed == true)
                         | {tag, config, arm, reasons, c21_status: .perf.c21.status, c21_reason: .perf.c21.reason}]},
-   invalid_runs: $invalid, retries: $retries, extensions: $extensions, failed_runs: $failed,
+   invalid_runs: $invalid, retries: $retries, ramp_saturation_reruns: $ramp_reruns, extensions: $extensions,
+   failed_runs: $failed,
    evaluation_errors: $evaluation_errors,
    rep_checks: {file: "rep_checks.jsonl", checks: ($pc | length),
                 not_evaluated: ([$pc[] | select(.ok == null)] | length),
@@ -2348,9 +2492,12 @@ record_run() {
         --arg arm "${run_ctx[arm]}" --argjson rep "${run_ctx[rep]}" --argjson attempt "${run_ctx[attempt]}" \
         --argjson order "${run_ctx[order]}" --arg kind "${run_ctx[kind]}" --arg tag "${run_ctx[tag]}" \
         --arg pair "${run_ctx[pair_id]}" --argjson rc "$rc" --arg started "$started" \
-        --arg core_plan "${run_ctx[core_plan]}" \
+        --arg core_plan "${run_ctx[core_plan]}" --argjson saturation_retry "${run_ctx[saturation_retry]:-0}" \
+        --arg saturation_reason "${run_ctx[saturation_reason]:-}" \
         '{scen: $scen, config: $config, var: $var, arm: $arm, rep: $rep, attempt: $attempt, order: $order,
           kind: $kind, tag: $tag, pair_id: (if $pair == "" then null else $pair end),
+          saturation_retry: $saturation_retry,
+          saturation_retry_reason: (if $saturation_reason == "" then null else $saturation_reason end),
           core_plan: $core_plan, loadgen_rc: $rc, started: $started}')"
     if [[ -f "$result" ]]; then
         jq -c --argjson ctx "$ctx" --argjson h "$harness" --arg file "results/${result##*/}" \
@@ -2511,7 +2658,17 @@ execute_run() {
         log "  $tag: connections $(jq -r "$jq_defs"'"upstream \(.new_conns // "n/a") new at \(.mock) in \(.window_s | fixed1) s (\(.new_per_s | fixed3)/s, reuse \(.rate | pct4) of \(.requests // "n/a") requests); \(if .direct then "no inbound leg of its own" else "inbound \(.inbound_fresh // "n/a") fresh after the warmup" end), \(.idle_closed // "n/a") closed idle by the peer over the run, TTFT on fresh connections p50 \(.fresh_conn_ttft.p50_us | fixed1) us, p99 \(.fresh_conn_ttft.p99_us | fixed1) us; cold \(.cold_ratio | pct4) of the requests"' <<<"$reuse")"
     fi
     if [[ "$ramp" != null ]]; then
-        log "  $tag: ramp $(jq -r "$jq_defs"'"sustainable \(.max_sustainable_rate | rate) req/s (step \(.last_step // "n/a") of \(.steps_judged) judged; \(.stopped_by))"
+        local direct_ramp=false
+        if direct_arm "${run_ctx[arm]}"; then
+            direct_ramp=true
+        fi
+        log "  $tag: ramp $(jq -r --argjson direct "$direct_ramp" "$jq_defs"'"sustainable \(.max_sustainable_rate | rate) req/s (step \(.last_step // "n/a") of \(.steps_judged) judged; \(.stopped_by))"
+            + (if .end == "tool_saturated" and $direct
+               then "; ended tool-saturated at \(.saturated | ramp_where): the tool limit, unless a stall of the VM ended it early"
+               elif .end == "tool_saturated"
+               then "; ended tool-saturated at \(.saturated | ramp_where): a lower bound, set by the tool rather than by the arm"
+               elif .end == "max_steps" then "; all \(.max_steps) steps passed: a lower bound, capped by RAMP_MAX_STEPS"
+               else "" end)
             + (if .ended_by == null then "" else "; step \(.ended_by.step) not sustainable: \(.ended_by.reasons | join(", "))" end)
             + (if (.judged_per_step | length) == 0 then ""
                else "; judged per step instead of over the whole ramp: \(.judged_per_step | join("; "))" end)' <<<"$ramp")"
@@ -2764,9 +2921,11 @@ rep_order() {
 
 # One run of one arm on the core plan in effect (use_core_plan); sets run_ok.
 # kind: run (a repetition), tool (the direct ramp of a ramp block), perf (the
-# extra S2 run under perf stat and the C21 profile).
+# extra S2 run under perf stat and the C21 profile). A ramp's saturation
+# rerun (run_ramp_arm) passes its number and reason as well.
 run_arm() {
     local scen="$1" config="$2" var="$3" arm="$4" rep="$5" attempt="$6" pos="$7" kind="$8"
+    local saturation_retry="${9:-0}" saturation_reason="${10:-}"
     local block base pair_id url seed tls=0 spin="$SPIN_US" lag="$MOCK_WRITE_LAG_LIMIT_US"
     local warmup measure open=0 ttft staged
     [[ "$plan_name" == "$(scenario_plan "$scen")" ]] ||
@@ -2778,6 +2937,7 @@ run_arm() {
         perf) base="$block-$arm-perf" pair_id="$block-perf" ;;
     esac
     ((attempt == 0)) || base+="-a$attempt"
+    ((saturation_retry == 0)) || base+="-s$saturation_retry"
     seed=$((SEED + (rep > 0 ? rep - 1 : 0)))
     if arm_over_tls "$config" "$arm"; then
         tls=1
@@ -2838,7 +2998,8 @@ run_arm() {
         [warmup]="$warmup" [measure]="$measure" [open_window]="$open" [perf]=0 [sut_pid]=""
         [idle_rss]="" [check_reuse]=1 [arm_mock]="$(arm_mock "$scen" "$config" "$arm")"
         [staged]="$staged" [result]="$run_dir/results/$base.json"
-        [core_plan]="$plan_name" [loadgen_cpus]="$plan_loadgen_cpus")
+        [core_plan]="$plan_name" [loadgen_cpus]="$plan_loadgen_cpus"
+        [saturation_retry]="$saturation_retry" [saturation_reason]="$saturation_reason")
     if [[ "$kind" == perf ]]; then
         [[ "$perf_status" != available ]] || run_ctx[perf]=1
         [[ "$c21_status" != available ]] || run_ctx[c21]=1
@@ -2997,7 +3158,11 @@ run_rep() {
         for arm in "${order[@]}"; do
             pos=$((pos + 1))
             in_list "$arm" "${run_set[@]}" || continue
-            run_arm "$scen" "$config" "$var" "$arm" "$rep" "$attempt" "$pos" run
+            if [[ "$scen" == ramp ]]; then
+                run_ramp_arm "$config" "$arm" "$rep" "$attempt" "$pos" run
+            else
+                run_arm "$scen" "$config" "$var" "$arm" "$rep" "$attempt" "$pos" run
+            fi
             arm_ok[$arm]=$run_ok
             if ((!run_ok)); then
                 [[ "$arm" == brisk-pt ]] || attempt_gated=0
@@ -3066,7 +3231,7 @@ run_tool_ramp() {
     arm="$(tool_ramp_arm "$config")"
     while true; do
         log "== config $config, ramp, $arm tool limit at $(arm_mock ramp "$config" "$arm")$( ((attempt == 0)) || echo ", rerun $attempt")"
-        run_arm ramp "$config" "" "$arm" 0 "$attempt" 1 tool
+        run_ramp_arm "$config" "$arm" 0 "$attempt" 1 tool
         if ((run_ok)); then
             return 0
         fi
@@ -3077,6 +3242,71 @@ run_tool_ramp() {
         attempt=$((attempt + 1))
         retries=$((retries + 1))
     done
+}
+
+# Whether the ramp of an arm in one attempt runs again for a tool
+# saturation (Ramp in the header): the run that counts of it and its
+# saturation reruns (ramp_best) ended tool-saturated, and it is a direct
+# ramp, or it saturated at a rate at most the block's tool limit, the highest
+# sustainable rate of the valid direct ramps of the block. why says what
+# happened whenever that run ended tool-saturated, rerun or not. Input:
+# runs.jsonl, slurped.
+# shellcheck disable=SC2016
+prog_ramp_retry='
+[.[] | select(.scen == "ramp" and .config == $c)] as $all
+| ([$all[] | select(.kind == "tool")] | ramp_best) as $tool
+| ([$all[] | select(.kind == $kind and .arm == $arm and .rep == $rep and .attempt == $attempt)] | ramp_best) as $best
+| $best.ramp.saturated as $sat
+| $tool.ramp.max_sustainable_rate as $limit
+| if $best == null or $best.ramp.end != "tool_saturated" then {retry: false, why: null}
+  elif $kind == "tool"
+  then {retry: true, why: "the \($arm) ramp ended tool-saturated at \($sat | ramp_where), which may be a stall rather than the tool limit it measures"}
+  elif $tool == null
+  then {retry: false, why: "\($arm) ended tool-saturated at \($sat | ramp_where), and no valid \($tool_arm) ramp gives the block a tool limit to hold that to"}
+  elif $limit == null
+  then {retry: false, why: "\($arm) ended tool-saturated at \($sat | ramp_where), above the tool limit, which lies below RAMP_START: the \($tool_arm) ramp sustained no step"}
+  elif $sat.rate <= $limit
+  then {retry: true, why: "\($arm) ended tool-saturated at \($sat | ramp_where), a rate the \($tool_arm) ramp sustained (\($limit | rate) req/s)"}
+  else {retry: false, why: "\($arm) ended tool-saturated at \($sat | ramp_where), above the \($limit | rate) req/s the \($tool_arm) ramp sustained"} end
+'
+jq_programs+=(prog_ramp_retry)
+
+# One ramp of an arm (kind run in repetition <rep>, or tool), run again with
+# the same seed and position while it ended tool-saturated where a stall of
+# the VM, not the tool limit, explains it (prog_ramp_retry): up to
+# RAMP_TOOL_RETRIES times. Each rerun is a run of its own in runs.jsonl
+# (saturation_retry, saturation_retry_reason). Only a valid run is rerun;
+# an invalid one is RETRY_INVALID's. Sets run_ok to 1 when one of the runs
+# is valid, which the evaluation then picks among (ramp_best).
+run_ramp_arm() {
+    local config="$1" arm="$2" rep="$3" attempt="$4" pos="$5" kind="$6" retry=0 any_ok=0 reason="" check why
+    while true; do
+        run_arm ramp "$config" "" "$arm" "$rep" "$attempt" "$pos" "$kind" "$retry" "$reason"
+        ((!run_ok)) || any_ok=1
+        check="$(jq -sc --arg c "$config" --arg kind "$kind" --arg arm "$arm" --argjson rep "$rep" \
+            --argjson attempt "$attempt" --arg tool_arm "$(tool_ramp_arm "$config")" \
+            "$jq_defs$prog_ramp_retry" "$run_dir/runs.jsonl")" ||
+            die "deciding whether to rerun the $arm ramp of config $config failed"
+        why="$(jq -r '.why // empty' <<<"$check")"
+        [[ -n "$why" ]] || break
+        if [[ "$(jq -r '.retry' <<<"$check")" != true ]]; then
+            log "  $why; not rerun: its rate is a lower bound, which makes the block's throughput comparison tool-limited"
+            break
+        fi
+        if ((retry >= RAMP_TOOL_RETRIES)); then
+            if [[ "$kind" == tool ]]; then
+                log "  $why; so still after $retry saturation rerun(s) (RAMP_TOOL_RETRIES=$RAMP_TOOL_RETRIES): the tool limit is the highest sustainable rate of its valid ramps"
+            else
+                log "  $why; so still after $retry saturation rerun(s) (RAMP_TOOL_RETRIES=$RAMP_TOOL_RETRIES): its rate stays a lower bound, which makes the block's throughput comparison tool-limited"
+            fi
+            break
+        fi
+        retry=$((retry + 1))
+        ramp_reruns=$((ramp_reruns + 1))
+        reason="$why; a stall of the VM can saturate the tool early (m1-calib: one 52.5 ms stall, at about 29.5k req/s)"
+        log "  rerunning the $arm ramp with the same seed (saturation rerun $retry of at most $RAMP_TOOL_RETRIES): $reason"
+    done
+    run_ok=$any_ok
 }
 
 # One more S2 run per SUT arm with perf stat on the SUT and the C21 profile,
@@ -3476,7 +3706,7 @@ evaluate_ramp() {
     if [[ "$SESSION" == gate && "$config" == P ]]; then
         scope=gated
     fi
-    pairs="$(jq -sc --arg c "$config" --arg a "$a" --arg b "$b" "$prog_ramp_pairs" "$run_dir/runs.jsonl")"
+    pairs="$(jq -sc --arg c "$config" --arg a "$a" --arg b "$b" "$jq_defs$prog_ramp_pairs" "$run_dir/runs.jsonl")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" --arg scope "$scope" \
         --argjson share "$RAMP_TOOL_LIMIT_SHARE" --argjson start "$RAMP_START" --arg step_pct "$RAMP_STEP_PCT" \
         --arg tool_arm "$(tool_ramp_arm "$config")" "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
@@ -3971,7 +4201,8 @@ write_manifest() {
         --arg started "$session_started" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg host "$(hostname)" \
         --arg selfcheck "$selfcheck_status" --arg selfcheck_detail "$selfcheck_detail" \
         --arg host_ready "$host_ready" --argjson invalid "$invalid_runs" --argjson failed "$failed_runs" \
-        --argjson retries "$retries" --argjson extensions "$extensions" --argjson rule_b_voided "$rule_b_voided" \
+        --argjson retries "$retries" --argjson ramp_reruns "$ramp_reruns" --argjson extensions "$extensions" \
+        --argjson rule_b_voided "$rule_b_voided" \
         --argjson evaluation_errors "$evaluation_errors" --argjson patch "$patch" \
         --arg arms "${session_arms[$SESSION]}" --arg key_name "$key_name" --arg key_sha256 "$key_sha256" \
         --arg perf_status "$perf_status" --arg perf_reason "$perf_reason" --arg perf_events "$perf_events" \
@@ -3991,8 +4222,9 @@ write_summary() {
         printf 'session %s (%s): %s, exit status %s\n' "$SESSION" "$RUN_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status"
         printf 'configs %s; scenarios %s; selfcheck %s%s\n' "$CONFIGS" "$SCENARIOS" "$selfcheck_status" \
             "${selfcheck_detail:+ ($selfcheck_detail)}"
-        printf 'runs: %d invalid (%d by rule (b) alone; %d repetition rerun(s), %d block extension(s)), %d failed; %d missing or partial comparison(s); %d evaluation error(s)\n' \
-            "$invalid_runs" "$rule_b_voided" "$retries" "$extensions" "$failed_runs" "$failed_compares" "$evaluation_errors"
+        printf 'runs: %d invalid (%d by rule (b) alone; %d repetition rerun(s), %d ramp saturation rerun(s), %d block extension(s)), %d failed; %d missing or partial comparison(s); %d evaluation error(s)\n' \
+            "$invalid_runs" "$rule_b_voided" "$retries" "$ramp_reruns" "$extensions" "$failed_runs" "$failed_compares" \
+            "$evaluation_errors"
         read -r n_pass n_fail n_uncertain n_missing <<<"$counts"
         printf 'gated verdicts: %d PASS, %d FAIL, %d UNCERTAIN, %d MISSING\n' "$n_pass" "$n_fail" "$n_uncertain" "$n_missing"
         echo
@@ -4074,6 +4306,11 @@ for sub in selfcheck stream nonstream bigbody; do
 done
 [[ "$("$loadgen" stream --help)" == *--max-slip-us* ]] ||
     die "$BIN_DIR/brisk-loadgen stream has no --max-slip-us; sync a build that has it"
+# The evidence of a ramp reads loadgen's step verdicts, which an older build
+# does not record; its --help names the tool saturation they tell apart.
+if has_scenario ramp && [[ "$("$loadgen" nonstream --help | tr -d '[:space:]')" != *tool-saturated* ]]; then
+    die "$BIN_DIR/brisk-loadgen nonstream records no ramp step verdicts (stop_reason, tool_saturated); sync a build that does"
+fi
 # compare parses its metrics before it reads a file, so an older build names
 # the one it does not know even for results that do not exist.
 if has_scenario s1 && [[ "$("$loadgen" compare --a /dev/null --b /dev/null --metric ttft_reused \
@@ -4247,7 +4484,7 @@ elif ((n_uncertain > 0)); then
 fi
 write_summary "$counts" "$failed_compares" "$exit_status"
 write_manifest complete "$exit_status"
-log "session $RUN_ID done: selfcheck $selfcheck_status, $invalid_runs invalid run(s) ($rule_b_voided by rule (b) alone; $retries repetition rerun(s), $extensions block extension(s)), $failed_runs failed run(s), $failed_compares missing or partial comparison(s), gated verdicts $n_pass PASS, $n_fail FAIL, $n_uncertain UNCERTAIN, $n_missing MISSING"
+log "session $RUN_ID done: selfcheck $selfcheck_status, $invalid_runs invalid run(s) ($rule_b_voided by rule (b) alone; $retries repetition rerun(s), $ramp_reruns ramp saturation rerun(s), $extensions block extension(s)), $failed_runs failed run(s), $failed_compares missing or partial comparison(s), gated verdicts $n_pass PASS, $n_fail FAIL, $n_uncertain UNCERTAIN, $n_missing MISSING"
 while IFS= read -r line; do
     log "$line"
 done <"$run_dir/summary.txt"
