@@ -102,6 +102,15 @@
 # direct ramp the mock itself, so ramps take their own mock write lag limit
 # (RAMP_MOCK_WRITE_LAG_LIMIT_US).
 #
+# A ramp step is sustainable (6.1) when its p99 is within the limit, it had
+# no error and loadgen's validity checks hold over the step's own intervals.
+# loadgen checks validity once over the whole ramp, saturating last step
+# included, so its emit lag, mock write lag, failure and stale retry rules
+# are applied again per step from the intervals of the result, and only a
+# reason no step can own (a clock step, say) voids a ramp. The saturation
+# that ends a ramp thus ends its run of sustainable steps instead of voiding
+# it; in the direct ramp, loadgen falling behind marks the tool limit.
+#
 # Verdicts (contract 05, 7.5 and 6.3) on the 95% t interval of each paired
 # delta: FAIL when its low end exceeds the limit, PASS when the estimate and
 # its high end are within it, else UNCERTAIN; one repetition is never PASS.
@@ -1106,13 +1115,15 @@ last_by(.id) as $all
    gated: false, extendable: false, text: .text}
 '
 
-# One runs.jsonl record from a result file.
+# One runs.jsonl record from a result file. A ramp's loadgen validity is the
+# one judged per step (prog_ramp_evidence).
 # shellcheck disable=SC2016
 prog_record_run='
 .warmup_intervals as $w
 | $ctx + {file: $file, label, scenario,
-          valid: (.validity.valid and ($h.reasons | length) == 0),
-          loadgen_valid: .validity.valid, reasons: (.validity.reasons + $h.reasons),
+          valid: ((if $h.ramp == null then .validity.valid else $h.ramp.valid end) and ($h.reasons | length) == 0),
+          loadgen_valid: .validity.valid,
+          reasons: ((if $h.ramp == null then .validity.reasons else $h.ramp.run_reasons end) + $h.reasons),
           failed: $h.failed, seed: .params.common.seed,
           duration_s: .loadgen.duration_s, counters: .loadgen.counters,
           errors: ([.intervals[] | select(.index >= $w) | .errors | to_entries[]]
@@ -1192,22 +1203,135 @@ $m[$n] as $s
   end
 '
 
-# The sustainable rate of a ramp result: the last step of the leading run of
-# steps that completed requests without an error and within the p99 limit.
+# The sustainable rate of a ramp result, by the step condition of contract
+# 05, 6.1: the step's p99 within the limit, no error, and loadgen's validity
+# checks passing. loadgen checks validity once over the whole ramp, whose
+# last step saturates something by design, and keeps no verdict per step;
+# its result does keep the one-second intervals, so each step is checked
+# here over its own intervals with loadgen's limits (validity.rs): emit lag
+# p99 and p99.9 and mock write lag p99 from the interval histograms (base64
+# of an uncompressed HDR V2 serialization, read as hdrhistogram 7.6 reads
+# it), the failure and stale retry shares from the interval counts. The
+# sustainable rate is the last step of the leading run of steps that pass.
+# loadgen's whole-ramp reasons for those rules are thereby judged per step
+# (judged_per_step); a reason no step can own (a clock step, receives
+# without a kernel timestamp, negative spans, no samples at all) still voids
+# the ramp (run_reasons, valid). The reasons are told apart by the wording
+# of validity.rs, so a reworded one stays a reason of the run. An event
+# counts in the interval it happened in: a request sent at the end of one
+# step and answered in the next counts in the next, a negligible share of
+# a 20 s step. Input: a result file.
 # shellcheck disable=SC2016
 prog_ramp_evidence='
+def hdr_bytes:
+    [explode[] | if . >= 65 and . <= 90 then . - 65 elif . >= 97 and . <= 122 then . - 71
+                 elif . >= 48 and . <= 57 then . + 4 elif . == 43 then 62 elif . == 47 then 63
+                 else empty end] as $s
+    | ($s | length * 3 / 4 | floor) as $n
+    # The sextets a padded end lacks are zero bits, and the bytes they fill
+    # are cut off below.
+    | [range(0; $s | length; 4) as $i
+       | ($s[$i] * 262144 + ($s[$i + 1] // 0) * 4096 + ($s[$i + 2] // 0) * 64 + ($s[$i + 3] // 0)) as $w
+       | ($w / 65536 | floor), (($w / 256 | floor) % 256), ($w % 256)]
+    | .[:$n];
+def hdr_uint($b; $at; $len): reduce $b[$at:$at + $len][] as $x (0; . * 256 + $x);
+def hdr_decode:
+    hdr_bytes as $b
+    | if hdr_uint($b; 0; 4) != 478450451
+      then error("an interval histogram is not an uncompressed HDR V2 serialization") else . end
+    | {low: hdr_uint($b; 16; 8), sigfig: hdr_uint($b; 12; 4),
+       # [index, count] of the non-empty buckets: LEB128 varints (7 bits a
+       # byte, all 8 in a ninth) of ZigZag i64s, a negative one a run of
+       # empty buckets.
+       counts: (reduce $b[40:40 + hdr_uint($b; 4; 4)][] as $x ({i: 0, v: 0, m: 1, out: []};
+                    (if .m == 72057594037927936 then .v += $x * .m | .done = true
+                     else .v += ($x % 128) * .m | .done = ($x < 128) | .m *= 128 end)
+                    | if .done | not then .
+                      else (if .v % 2 == 0 then .v / 2 else -(.v + 1) / 2 end) as $z
+                           | (if $z < 0 then .i -= $z
+                              elif $z == 0 then .i += 1
+                              else .out += [[.i, $z]] | .i += 1 end)
+                           | .v = 0 | .m = 1
+                      end)
+                | .out)};
+def hdr_merge:
+    if length == 0 then null
+    elif (map([.low, .sigfig]) | unique | length) > 1 then error("the interval histograms differ in their bounds")
+    else {low: .[0].low, sigfig: .[0].sigfig,
+          counts: ([.[].counts[]] | group_by(.[0]) | map([.[0][0], (map(.[1]) | add)]))}
+    end;
+# value_at_quantile of hdrhistogram: the highest value equivalent to the
+# bucket in which the running count reaches ceil(q * total).
+def hdr_quantile($q):
+    if . == null then null
+    else ((2 * pow(10; .sigfig) | log2 | ceil) - 1) as $half_mag
+         | pow(2; $half_mag) as $half
+         | (.low | log2 | floor) as $unit
+         | ([.counts[][1]] | add) as $total
+         | ([($q * $total | ceil), 1] | max) as $target
+         | first(foreach .counts[] as $e (0; . + $e[1]; if . >= $target then $e[0] else empty end)) as $i
+         | (($i / $half | floor) - 1) as $bucket
+         | if $bucket < 0 then ($i + 1) * pow(2; $unit) - 1
+           else (($i % $half) + $half + 1) * pow(2; $bucket + $unit) - 1 end
+    end;
+def step_rule:
+    test("^emit lag p99(\\.9)? [0-9.]+ us over [0-9]+ sends ") or test("^mock write lag p99 [0-9.]+ us is not below ")
+    or test("^[0-9]+ of [0-9]+ requests after the warmup failed ") or test("^[0-9]+ stale keep-alive retries for ");
+def us1: . / 100 | round / 10;
+def per_us: if . == null then null else . / 1000 end;
 .loadgen.ramp as $r
 | if $r == null then null
   else $r.stop_p99_ns as $lim
-       | (reduce $r.steps[] as $s ({done: false, ok: []};
-            if .done or $s.requests == 0 or $s.errors != 0 or $s.p99_ns > $lim
-            then .done = true
-            else .ok += [$s] end)
+       | .warmup_intervals as $w
+       | .params.ramp_step_s as $len
+       # As loadgen converts --max-mock-write-lag-us (dist::seconds_to_ns).
+       | (.params.common.max_mock_write_lag_us / 1e6 * 1e9 | round) as $mwl_lim
+       | (.summary | has("mock_write_lag")) as $markers
+       | .intervals as $iv
+       | [$r.steps[] as $s
+          | [$iv[] | select(.index >= $w + ($s.step - 1) * $len and .index < $w + $s.step * $len)] as $in
+          | ([$in[] | .histograms.emit_lag | select(. != null) | hdr_decode] | hdr_merge) as $emit
+          | ([$in[] | .histograms.mock_write_lag | select(. != null) | hdr_decode] | hdr_merge) as $mwl
+          | ($emit | hdr_quantile(0.99)) as $e99
+          | ($emit | hdr_quantile(0.999)) as $e999
+          | ($mwl | hdr_quantile(0.99)) as $m99
+          | (reduce $in[] as $x ({requests: 0, failures: 0, stale: 0};
+                .requests += $x.requests
+                | reduce ($x.errors | to_entries[]) as $e (.;
+                      if $e.key == "stale_retry" then .stale += $e.value else .failures += $e.value end))) as $k
+          | {step: $s.step, rate: $s.rate, requests: $s.requests, errors: $s.errors, censored: $s.censored,
+             p99_us: ($s.p99_ns / 1000), emit_lag_p99_us: ($e99 | per_us), emit_lag_p999_us: ($e999 | per_us),
+             mock_write_lag_p99_us: ($m99 | per_us), interval_failures: $k.failures,
+             interval_stale_retries: $k.stale,
+             reasons: [
+                if $s.requests == 0 then "no request completed" else empty end,
+                if $s.errors != 0 then "\($s.errors) failed request(s)" else empty end,
+                if $s.p99_ns > $lim then "p99 \($s.p99_ns | us1) us above \($lim | us1) us" else empty end,
+                if $e99 != null and $e99 >= 10000
+                then "emit lag p99 \($e99 | us1) us, loadgen limit 10 us" else empty end,
+                if $e999 != null and $e999 >= 1000000
+                then "emit lag p99.9 \($e999 | us1) us, loadgen limit 1000 us" else empty end,
+                if $m99 != null and $m99 >= $mwl_lim
+                then "mock write lag p99 \($m99 | us1) us, limit \($mwl_lim | us1) us"
+                elif $m99 == null and $markers then "no mock write lag samples"
+                else empty end,
+                if $k.requests + $k.failures > 0 and $k.failures / ($k.requests + $k.failures) > 0.001
+                then "\($k.failures) of \($k.requests + $k.failures) requests in its intervals failed, loadgen limit 0.1%"
+                else empty end,
+                if $k.stale > 0.001 * $k.requests
+                then "\($k.stale) stale keep-alive retries for \($k.requests) requests in its intervals, loadgen limit 0.1%"
+                else empty end]}] as $steps
+       | (reduce $steps[] as $s ({done: false, ok: []};
+            if .done or ($s.reasons | length) > 0 then .done = true else .ok += [$s] end)
           | .ok) as $ok
+       | [.validity.reasons[] | select(step_rule | not)] as $run_reasons
        | {stop_p99_ns: $lim, steps_judged: ($r.steps | length), stopped_by: $r.stopped_by,
           loadgen_max_sustainable_rate: $r.max_sustainable_rate,
           max_sustainable_rate: ($ok | last | .rate), last_step: ($ok | last | .step),
-          steps: [$r.steps[] | {step, rate, requests, errors, censored, p99_us: (.p99_ns / 1000)}]}
+          ended_by: ([$steps[] | select((.reasons | length) > 0) | {step, reasons}] | first),
+          valid: (($run_reasons | length) == 0), run_reasons: $run_reasons,
+          judged_per_step: [.validity.reasons[] | select(step_rule)],
+          steps: $steps}
   end
 '
 
@@ -1828,7 +1952,10 @@ execute_run() {
         log "  $tag: reuse $(jq -r "$jq_defs"'"\(.rate | pct4) at \(.mock) (\(.accepts) accepts, \(.requests) requests)"' <<<"$reuse")"
     fi
     if [[ "$ramp" != null ]]; then
-        log "  $tag: ramp $(jq -r "$jq_defs"'"sustainable \(.max_sustainable_rate | rate) req/s (step \(.last_step // "n/a") of \(.steps_judged) judged; \(.stopped_by))"' <<<"$ramp")"
+        log "  $tag: ramp $(jq -r "$jq_defs"'"sustainable \(.max_sustainable_rate | rate) req/s (step \(.last_step // "n/a") of \(.steps_judged) judged; \(.stopped_by))"
+            + (if .ended_by == null then "" else "; step \(.ended_by.step) not sustainable: \(.ended_by.reasons | join(", "))" end)
+            + (if (.judged_per_step | length) == 0 then ""
+               else "; judged per step instead of over the whole ramp: \(.judged_per_step | join("; "))" end)' <<<"$ramp")"
     fi
     harness="$(jq -nc --argjson failed "$failed" --argjson reuse "$reuse" --argjson sut "$sut" \
         --argjson ramp "$ramp" --argjson perf "$perf_ev" \
