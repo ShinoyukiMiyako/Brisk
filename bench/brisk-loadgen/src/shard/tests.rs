@@ -51,12 +51,24 @@ enum Behavior {
 }
 
 fn spawn_server(behavior: Behavior) -> SocketAddr {
+    spawn_server_with(behavior, None)
+}
+
+/// [`spawn_server`] that also announces every request it reads, so that a
+/// test can wait for requests instead of guessing when they arrive.
+fn spawn_observed_server(behavior: Behavior) -> (SocketAddr, mpsc::Receiver<()>) {
+    let (tx, rx) = mpsc::channel();
+    (spawn_server_with(behavior, Some(tx)), rx)
+}
+
+fn spawn_server_with(behavior: Behavior, received: Option<mpsc::Sender<()>>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = stream.unwrap();
-            thread::spawn(move || serve(stream, behavior));
+            let received = received.clone();
+            thread::spawn(move || serve(stream, behavior, received.as_ref()));
         }
     });
     addr
@@ -140,11 +152,16 @@ fn completion_response(sid: u64, resp_bytes: u32) -> Vec<u8> {
     out
 }
 
-fn serve(mut stream: TcpStream, behavior: Behavior) {
+fn serve(mut stream: TcpStream, behavior: Behavior, received: Option<&mpsc::Sender<()>>) {
     stream.set_nodelay(true).unwrap();
     let mut buf = Vec::new();
     let mut served = 0;
     while let Some(body) = read_request(&mut stream, &mut buf) {
+        if let Some(received) = received {
+            received
+                .send(())
+                .expect("an observing test keeps the receiver until the shard has ended");
+        }
         match behavior {
             Behavior::CloseWithoutResponse => return,
             Behavior::DropSecondRequest if served == 1 => return,
@@ -608,6 +625,18 @@ fn ramp_spec(
     }
 }
 
+/// Sends of `step` that `segments` plan before `t_ns`, counted on a fresh
+/// copy of the schedule the shard runs. The tests bound the shard's sends by
+/// times they observe, not by when the scheduler happened to run each thread.
+fn planned_before(segments: &[RateSegment], step: u32, t_ns: u64) -> u64 {
+    let mut arrivals = FixedArrivals::new(segments.to_vec(), 0, 1, CHUNKS);
+    let planned = std::iter::from_fn(|| arrivals.next_arrival())
+        .take_while(|a| a.sched_ns < t_ns)
+        .filter(|a| a.step == step)
+        .count();
+    u64::try_from(planned).unwrap()
+}
+
 /// The step reports among `messages`.
 fn step_reports(messages: Vec<RampMessage>) -> Vec<StepReport> {
     messages
@@ -636,13 +665,23 @@ fn ramp_steps_are_reported_once_judgeable() {
     assert!(
         reports
             .iter()
-            .all(|r| r.errors == 0 && r.unsent == 0 && r.latency.len() == r.requests + r.censored)
+            .all(|r| r.errors == 0 && r.latency.len() == r.requests + r.censored)
     );
+    // A step's largest lag is that of one of its sends, which the emit lag
+    // measures again a little later, at the syscall.
+    let emit_lag = run.histograms[&Metric::EmitLag].max();
     assert!(
-        reports.iter().all(|r| r.max_emit_lag_ns < 100_000_000),
+        reports.iter().all(|r| r.max_emit_lag_ns <= emit_lag),
+        "{emit_lag} {reports:?}"
+    );
+    // Every warmup and step send went out, but for those a stall kept the
+    // shard from reaching before their step's deadline: dropped unsent.
+    let unsent: u64 = reports.iter().map(|r| r.unsent).sum();
+    assert_eq!(
+        run.output.counters.requests_scheduled + unsent,
+        4 + 6 + 9,
         "{reports:?}"
     );
-    assert_eq!(run.output.counters.requests_scheduled, 4 + 6 + 9);
 }
 
 #[test]
@@ -662,6 +701,7 @@ fn ramp_steps_are_judged_on_time_with_open_requests_above_the_limit() {
     let received: Vec<(u64, RampMessage)> = rx.iter().map(|m| (now_ns(), m)).collect();
     let run = shard.join().unwrap();
     assert_eq!(received.len(), 2, "{received:?}");
+    let mut unsent = 0;
     for ((at, message), seg) in received.into_iter().zip(&steps) {
         let RampMessage::Step(report) = message else {
             panic!("expected a step report, got {message:?}");
@@ -676,19 +716,28 @@ fn ramp_steps_are_judged_on_time_with_open_requests_above_the_limit() {
             seg.step,
             (at - deadline) / 1_000_000
         );
-        // 20/s for 300 ms, all open: each a sample of at least the
+        // 20/s for 300 ms, all open, or not sent if a stall kept the shard
+        // from them until the deadline: each a sample of at least the
         // judging delay, which exceeds any p99 limit it is derived from.
         assert_eq!((report.requests, report.errors), (0, 0));
-        assert_eq!((report.censored, report.unsent), (6, 0));
+        assert_eq!(report.censored, 6);
+        assert!(
+            report.unsent < report.censored,
+            "step {} judged no open request: {report:?}",
+            seg.step
+        );
         assert_eq!(report.latency.len(), 6);
         assert!(
             report.latency.min() >= JUDGE_DELAY_NS - 1_000_000,
             "{}",
             report.latency.min()
         );
+        unsent += report.unsent;
     }
+    // The sends not reported unsent were made and held open to the end.
     let c = run.output.counters;
-    assert_eq!((c.requests_scheduled, c.open_at_end), (12, 12));
+    assert_eq!(c.requests_scheduled + unsent, 12, "{c:?}");
+    assert_eq!(c.open_at_end, c.requests_scheduled);
 }
 
 #[test]
@@ -713,6 +762,7 @@ fn sends_still_unmade_at_a_steps_deadline_are_censored_and_dropped() {
         },
     ];
     let end = now + 200_000_000 + JUDGE_DELAY_NS;
+    let plan = segments.clone();
     let (tx, rx) = mpsc::channel();
     // No saturation: the step 2 backlog is fired late instead.
     let ramp = ramp_spec(&segments, 10 * SEC_NS, tx);
@@ -729,22 +779,27 @@ fn sends_still_unmade_at_a_steps_deadline_are_censored_and_dropped() {
         "{}",
         first.latency.min()
     );
-    // Step 2 (600 ms at 100/s) was sent in full, its first sends about
-    // 400 ms late.
+    // Step 2 (600 ms at 100/s) was sent, its first sends about 400 ms late,
+    // but for any last sends a stall kept the shard from reaching before
+    // the deadline. The dropped sends of step 1 never went out.
     let second = &reports[1];
-    assert_eq!(second.unsent, 0);
     assert_eq!(second.requests + second.censored, 60, "{second:?}");
+    let sent = run.output.counters.requests_scheduled;
+    assert_eq!(sent + second.unsent, 60, "{second:?}");
     assert!(
         second.max_emit_lag_ns >= 390_000_000,
         "{}",
         second.max_emit_lag_ns
     );
-    // About 40 of them were overdue when the shard started, nearly all by
-    // more than the p99 limit; coarse timers off Linux make more late.
-    assert!((38..=60).contains(&second.late_sends), "{second:?}");
+    // The sends are made in schedule order. Those planned more than the p99
+    // limit before the shard started (40) were late by more than it; the
+    // others only if the shard fell behind, as coarse timers off Linux do.
+    let overdue = planned_before(&plan, 2, now - STOP_P99_NS).min(sent);
+    assert!(
+        (overdue..=sent).contains(&second.late_sends),
+        "{overdue} {second:?}"
+    );
     assert_eq!(first.late_sends, 0);
-    // The dropped sends of step 1 never went out.
-    assert_eq!(run.output.counters.requests_scheduled, 60);
     assert!(run.errors.is_empty(), "{:?}", run.errors);
 }
 
@@ -757,6 +812,7 @@ fn a_shard_behind_by_the_saturation_limit_stops_at_once() {
     let origin = started - 300_000_000;
     let segments = ramp_segments(origin, 0, 100.0, 0.0, SEC_NS, 3);
     let end = segments.last().unwrap().end_ns + JUDGE_DELAY_NS;
+    let plan = segments.clone();
     let (tx, rx) = mpsc::channel();
     let ramp = ramp_spec(&segments, 100_000_000, tx);
     let live = Arc::new(Live::default());
@@ -769,7 +825,8 @@ fn a_shard_behind_by_the_saturation_limit_stops_at_once() {
         Some(ramp),
         live.clone(),
     );
-    let elapsed = now_ns() - started;
+    let stopped_by = now_ns();
+    let elapsed = stopped_by - started;
     // Planned to run for another 2.75 s.
     assert!(elapsed < 500_000_000, "ran {} ms", elapsed / 1_000_000);
     assert!(live.stop.load(Ordering::Relaxed));
@@ -787,42 +844,62 @@ fn a_shard_behind_by_the_saturation_limit_stops_at_once() {
     assert_eq!((shard, step), (0, 1));
     assert!(lag_ns >= 300_000_000, "{lag_ns}");
     // Only the started step is reported: its sends due before the stop
-    // were all left unmade.
+    // were all left unmade. That is the 30 overdue when the shard started,
+    // and those that fell due until it stopped, however long it took.
     let RampMessage::Step(report) = &messages[1] else {
         panic!("expected the step report, got {messages:?}");
     };
     assert_eq!(report.step, 1);
     assert_eq!(report.requests, 0);
-    assert!((30..=40).contains(&report.unsent), "{report:?}");
+    let due = planned_before(&plan, 1, started)..=planned_before(&plan, 1, stopped_by);
+    assert!(due.contains(&report.unsent), "{due:?} {report:?}");
     assert_eq!(report.censored, report.unsent);
     assert_eq!(report.max_emit_lag_ns, lag_ns);
 }
 
 #[test]
 fn a_stopped_shard_sends_nothing_more_and_drains_its_requests() {
-    let addr = spawn_server(Behavior::Hold);
+    /// Requests the server holds when the test stops the shard.
+    const HELD: u64 = 7;
+    let (addr, received) = spawn_observed_server(Behavior::Hold);
     let origin = now_ns() + 20_000_000;
-    // Two steps of a second at 20/s: sends every 50 ms.
-    let segments = ramp_segments(origin, 0, 20.0, 0.0, SEC_NS, 2);
+    // Two steps of 3 s at 20/s: sends every 50 ms. Threads that run even two
+    // seconds late still stop the shard in the first step, and its drain
+    // still ends before the plan does and before the server lets go of the
+    // first request, 5 s after it came in.
+    let segments = ramp_segments(origin, 0, 20.0, 0.0, 3 * SEC_NS, 2);
     let end = segments.last().unwrap().end_ns + JUDGE_DELAY_NS;
+    let plan = segments.clone();
     let (tx, rx) = mpsc::channel();
     let ramp = ramp_spec(&segments, SEC_NS, tx);
     let live = Arc::new(Live::default());
     let stopper = {
         let live = live.clone();
         thread::spawn(move || {
-            // Between the sends at 300 and 350 ms.
-            precise::sleep_until(origin + 325_000_000, precise::DEFAULT_SPIN_WINDOW);
+            // Stops the shard once the server holds the sends at 0 to 300 ms.
+            // Waiting for them rather than for a time, a late wakeup cannot
+            // stop the shard short of them; it can let the next send out.
+            for n in 0..HELD {
+                let left = Duration::from_nanos(end.saturating_sub(now_ns()));
+                if let Err(e) = received.recv_timeout(left) {
+                    panic!("the server got {n} of {HELD} requests by the planned end: {e}");
+                }
+            }
             let at = now_ns();
             live.stop.store(true, Ordering::Relaxed);
-            at
+            // The server announces every request it reads to the end.
+            (at, received)
         })
     };
     let run = run_shard_live(addr, WHOLE, segments, end, SEC_NS * 10, Some(ramp), live);
     let ended = now_ns();
-    let stopped_at = stopper.join().unwrap();
-    // The seven requests sent are held by the server: the shard waits the
-    // drain time for them, not the 1.7 s left of its plan.
+    let (stopped_at, _received) = stopper.join().unwrap();
+    // The requests sent are held by the server: the shard waits the drain
+    // time for them, not the 5.7 s left of its plan.
+    assert!(
+        run.output.end_ns < end,
+        "the drain ran into the planned end"
+    );
     let drained = ended - stopped_at;
     assert!(
         (DRAIN_NS..DRAIN_NS + 200_000_000).contains(&drained),
@@ -830,17 +907,26 @@ fn a_stopped_shard_sends_nothing_more_and_drains_its_requests() {
         drained / 1_000_000
     );
     let c = run.output.counters;
-    assert_eq!((c.requests_scheduled, c.open_at_end), (7, 7));
+    assert!(c.requests_scheduled >= HELD, "{c:?}");
+    assert_eq!(c.open_at_end, c.requests_scheduled);
     // The started step is reported with its open requests censored; the
     // second step never started.
     let reports = step_reports(rx.try_iter().collect());
     assert_eq!(reports.len(), 1, "{reports:?}");
-    assert_eq!(reports[0].step, 1);
-    assert_eq!(reports[0].requests, 0);
-    assert_eq!((reports[0].censored, reports[0].unsent), (7, 0));
+    let report = &reports[0];
+    assert_eq!(report.step, 1);
+    assert_eq!(report.requests, 0);
+    // The shard saw the stop at least the drain time before it ended. The
+    // sends it made were planned no later than that, and those due by then
+    // that it had not made were dropped: none planned after the stop went
+    // out, and all of them are censored.
+    let made_or_dropped = c.requests_scheduled + report.unsent;
+    let seen_by = run.output.end_ns - DRAIN_NS;
+    let planned = planned_before(&plan, 1, seen_by + 1);
     assert!(
-        reports[0].latency.min() >= DRAIN_NS,
-        "{}",
-        reports[0].latency.min()
+        made_or_dropped <= planned,
+        "{made_or_dropped} sends made or dropped, {planned} planned by the stop: {c:?} {report:?}"
     );
+    assert_eq!(report.censored, made_or_dropped);
+    assert!(report.latency.min() >= DRAIN_NS, "{}", report.latency.min());
 }
