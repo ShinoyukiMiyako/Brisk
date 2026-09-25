@@ -13,11 +13,10 @@
 //! sha256 = "<64 lowercase hex digits>"
 //! ```
 
-use std::error::Error as StdError;
-use std::fmt;
 use std::fmt::Write as _;
 use std::io;
 
+use brisk_gateway::auth::{self, KEY_RANDOM_BYTES};
 use brisk_gateway::secret::Redacted;
 
 /// A new virtual key and its configuration snippet.
@@ -38,24 +37,29 @@ impl GeneratedKey {
 }
 
 /// Why no key was generated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KeygenError {
     /// The system random number generator failed.
+    #[error("the system random number generator failed")]
     Random,
     /// The name is empty or not printable ASCII.
+    #[error("key name must be non-empty printable ASCII")]
     Name,
 }
 
-impl fmt::Display for KeygenError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Random => "the system random number generator failed",
-            Self::Name => "key name must be non-empty printable ASCII",
-        })
-    }
+/// A fresh key from `aws_lc_rs::rand::fill`, and the `[[keys]]` snippet that
+/// stores its SHA-256 digest under `name`.
+///
+/// The name is checked before any randomness is drawn.
+pub fn generate(name: &str) -> Result<GeneratedKey, KeygenError> {
+    validate_name(name)?;
+    let key = auth::format_key(&random_bytes::<KEY_RANDOM_BYTES>()?);
+    let digest = auth::key_digest(key.expose().as_bytes());
+    Ok(GeneratedKey {
+        toml_snippet: toml_snippet(name, &digest),
+        key,
+    })
 }
-
-impl StdError for KeygenError {}
 
 /// Accepts non-empty printable ASCII (space through `~`), so the name reads
 /// the same in logs, the TOML file and a terminal.
@@ -170,6 +174,75 @@ mod tests {
         );
         assert_eq!(text, expected);
         assert!(!format!("{generated:?}").contains(&"A".repeat(36)));
+    }
+
+    /// The digest a snippet's `sha256` stands for, decoded independently of
+    /// [`toml_snippet`]; panics unless it is 64 lowercase hex digits.
+    fn unhex(hex: &str) -> [u8; 32] {
+        assert_eq!(hex.len(), 64, "{hex:?}");
+        assert!(
+            hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{hex:?}"
+        );
+        let mut digest = [0; 32];
+        for (index, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * index..2 * index + 2], 16).unwrap();
+        }
+        digest
+    }
+
+    #[test]
+    fn generated_keys_are_well_formed() {
+        let generated = generate("local-dev").unwrap();
+        let key = generated.key.expose();
+        assert!(key.starts_with(auth::KEY_PREFIX));
+        assert!(auth::is_well_formed(key.as_bytes()));
+    }
+
+    #[test]
+    fn snippet_stores_the_digest_of_the_generated_key() {
+        for name in ["local-dev", "q\"uote", "back\\slash\\"] {
+            let generated = generate(name).unwrap();
+            let parsed: Snippet = toml::from_str(&generated.toml_snippet).unwrap();
+            assert_eq!(parsed.keys.len(), 1);
+            assert_eq!(parsed.keys[0].name, name);
+            assert_eq!(
+                unhex(&parsed.keys[0].sha256),
+                auth::key_digest(generated.key.expose().as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn stdout_of_a_generated_key_parses_back() {
+        let generated = generate("smoke").unwrap();
+        let mut out = Vec::new();
+        generated.write_stdout(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 5);
+        let (key, snippet) = text.split_once("\n\n").unwrap();
+        assert_eq!(key, generated.key.expose());
+        let parsed: Snippet = toml::from_str(snippet).unwrap();
+        assert_eq!(parsed.keys[0].name, "smoke");
+        assert_eq!(
+            unhex(&parsed.keys[0].sha256),
+            auth::key_digest(key.as_bytes())
+        );
+    }
+
+    #[test]
+    fn generated_keys_differ_between_calls() {
+        let first = generate("same").unwrap();
+        let second = generate("same").unwrap();
+        assert_ne!(first.key.expose(), second.key.expose());
+        assert_ne!(first.toml_snippet, second.toml_snippet);
+    }
+
+    #[test]
+    fn invalid_names_generate_nothing() {
+        for name in ["", "tab\there", "new\nline", "caf\u{e9}"] {
+            assert_eq!(generate(name).unwrap_err(), KeygenError::Name, "{name:?}");
+        }
     }
 
     #[test]

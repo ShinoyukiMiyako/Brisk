@@ -34,7 +34,6 @@
 //! service-group files and Docker secrets (mode 0444) are common deployments.
 //! Windows ACLs are not inspected.
 
-use std::error::Error as StdError;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read as _};
@@ -62,6 +61,20 @@ const DEFAULT_OUTCOME_QUEUE: usize = 16_384;
 /// as an extra digit group would otherwise let a burst hold gigabytes of
 /// records before the logger drains them.
 const MAX_OUTCOME_QUEUE: usize = 1 << 24;
+
+/// Largest accepted `server.max_connections`: `server::serve` sizes a Tokio
+/// semaphore with it and refuses to start above that semaphore's limit, so
+/// the loader rejects such a value before `check-config` can pass it.
+// tokio's `sync` feature is not in this crate's manifest; brisk-gateway, which
+// every build of this crate includes, enables it.
+const MAX_CONNECTIONS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+/// The range of [`MAX_CONNECTIONS`] as error text; `ConfigError::Invalid`
+/// takes a fixed string, and a unit test keeps the two in step.
+#[cfg(target_pointer_width = "64")]
+const MAX_CONNECTIONS_RANGE: &str = "must be in 1..=2305843009213693951";
+#[cfg(target_pointer_width = "32")]
+const MAX_CONNECTIONS_RANGE: &str = "must be in 1..=536870911";
 
 /// Suffix of the only file names allowed to hold inline secrets.
 const LOCAL_SUFFIX: &str = ".local.toml";
@@ -98,9 +111,10 @@ pub struct TlsFiles {
 ///
 /// No variant carries a secret, a TOML source line or a toml or serde error
 /// value, so both `Display` and an `anyhow` chain are safe to print.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// A file could not be opened or read.
+    #[error("cannot read {path}")]
     Io {
         /// The file.
         path: PathBuf,
@@ -108,6 +122,7 @@ pub enum ConfigError {
         source: io::Error,
     },
     /// The TOML is malformed or does not match the schema.
+    #[error("{path}{}: {message}", LineColumn(*.line, *.column))]
     Parse {
         /// The configuration file.
         path: PathBuf,
@@ -120,6 +135,7 @@ pub enum ConfigError {
         message: String,
     },
     /// `api_key = { env = "..." }` names an unset variable.
+    #[error("channel {channel:?}: environment variable {var} for api_key is not set")]
     MissingEnv {
         /// Channel name.
         channel: String,
@@ -127,6 +143,7 @@ pub enum ConfigError {
         var: String,
     },
     /// `api_key = { file = "..." }` could not be read or is not UTF-8.
+    #[error("channel {channel:?}: cannot read api_key file {path}")]
     SecretFile {
         /// Channel name.
         channel: String,
@@ -136,12 +153,17 @@ pub enum ConfigError {
         source: io::Error,
     },
     /// `api_key = { value = "..." }` in a file not named `*.local.toml`.
+    #[error(
+        "channel {channel:?}: api_key = {{ value = ... }} is only allowed in *{suffix} files; use env or file",
+        suffix = LOCAL_SUFFIX
+    )]
     InlineSecretNotAllowed {
         /// Channel name.
         channel: String,
     },
     /// A file that controls routing or holds a secret is writable by other
     /// users (Unix only).
+    #[error("{path} is writable by other users (mode {mode:o}); remove o+w")]
     InsecurePermissions {
         /// The file.
         path: PathBuf,
@@ -150,11 +172,15 @@ pub enum ConfigError {
     },
     /// Plaintext listening on a non-loopback address without
     /// `server.allow_plaintext = true` (D28).
+    #[error(
+        "server.listen {listen} is not a loopback address; configure [server.tls] or set server.allow_plaintext = true"
+    )]
     PlaintextListen {
         /// The configured address.
         listen: SocketAddr,
     },
     /// A channel's `ca_file` could not be read or holds no certificate.
+    #[error("channel {channel:?}: cannot load CA certificates from {path}")]
     CaFile {
         /// Channel name.
         channel: String,
@@ -164,6 +190,7 @@ pub enum ConfigError {
         source: pem::Error,
     },
     /// A value is out of range.
+    #[error("{field}: {reason}")]
     Invalid {
         /// Dotted path of the field, e.g. `channels["cpa-a"].weight`.
         field: String,
@@ -172,55 +199,15 @@ pub enum ConfigError {
     },
 }
 
-impl fmt::Display for ConfigError {
+/// `:line:column` after the path of a [`ConfigError::Parse`], or nothing
+/// unless toml reported both.
+struct LineColumn(Option<usize>, Option<usize>);
+
+impl fmt::Display for LineColumn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io { path, .. } => write!(f, "cannot read {}", path.display()),
-            Self::Parse {
-                path,
-                line: Some(line),
-                column: Some(column),
-                message,
-            } => write!(f, "{}:{line}:{column}: {message}", path.display()),
-            Self::Parse { path, message, .. } => write!(f, "{}: {message}", path.display()),
-            Self::MissingEnv { channel, var } => write!(
-                f,
-                "channel {channel:?}: environment variable {var} for api_key is not set"
-            ),
-            Self::SecretFile { channel, path, .. } => write!(
-                f,
-                "channel {channel:?}: cannot read api_key file {}",
-                path.display()
-            ),
-            Self::InlineSecretNotAllowed { channel } => write!(
-                f,
-                "channel {channel:?}: api_key = {{ value = ... }} is only allowed in *{LOCAL_SUFFIX} files; use env or file"
-            ),
-            Self::InsecurePermissions { path, mode } => write!(
-                f,
-                "{} is writable by other users (mode {mode:o}); remove o+w",
-                path.display()
-            ),
-            Self::PlaintextListen { listen } => write!(
-                f,
-                "server.listen {listen} is not a loopback address; configure [server.tls] or set server.allow_plaintext = true"
-            ),
-            Self::CaFile { channel, path, .. } => write!(
-                f,
-                "channel {channel:?}: cannot load CA certificates from {}",
-                path.display()
-            ),
-            Self::Invalid { field, reason } => write!(f, "{field}: {reason}"),
-        }
-    }
-}
-
-impl StdError for ConfigError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Io { source, .. } | Self::SecretFile { source, .. } => Some(source),
-            Self::CaFile { source, .. } => Some(source),
-            _ => None,
+            Self(Some(line), Some(column)) => write!(f, ":{line}:{column}"),
+            _ => Ok(()),
         }
     }
 }
@@ -594,7 +581,10 @@ impl Builder<'_> {
 fn server_config(raw: &RawServer) -> Result<ServerConfig, ConfigError> {
     let mut server = ServerConfig::default();
     if let Some(max) = raw.max_connections {
-        server.max_connections = positive_usize("server.max_connections", max)?;
+        server.max_connections = usize::try_from(max)
+            .ok()
+            .filter(|max| (1..=MAX_CONNECTIONS).contains(max))
+            .ok_or_else(|| invalid("server.max_connections", MAX_CONNECTIONS_RANGE))?;
     }
     server.header_read_timeout = override_duration(
         "server.header_read_timeout",
@@ -811,13 +801,6 @@ fn invalid(field: impl Into<String>, reason: &'static str) -> ConfigError {
         field: field.into(),
         reason,
     }
-}
-
-fn positive_usize(field: &str, value: i64) -> Result<usize, ConfigError> {
-    usize::try_from(value)
-        .ok()
-        .filter(|&value| value >= 1)
-        .ok_or_else(|| invalid(field, "must be at least 1"))
 }
 
 /// `value` if given, else `default`; either way it must be positive.
@@ -1391,6 +1374,14 @@ mod tests {
     }
 
     #[test]
+    fn the_connection_limit_range_names_the_semaphore_limit() {
+        assert_eq!(
+            MAX_CONNECTIONS_RANGE,
+            format!("must be in 1..={}", tokio::sync::Semaphore::MAX_PERMITS)
+        );
+    }
+
+    #[test]
     fn digests_must_be_lowercase_hex() {
         let lower = "00ff".repeat(16);
         let digest = parse_digest(&lower).unwrap();
@@ -1411,6 +1402,109 @@ mod tests {
         let quote = text.find('"').unwrap();
         assert_eq!(line_column(text, quote), (2, 6));
         assert_eq!(line_column(text, text.len() + 10), (3, 1));
+    }
+
+    #[test]
+    fn errors_render_the_documented_messages() {
+        use std::error::Error as _;
+
+        let path = || PathBuf::from("brisk.toml");
+        let channel = || "cpa".to_owned();
+        let cases = [
+            (
+                ConfigError::Io {
+                    path: path(),
+                    source: io::ErrorKind::NotFound.into(),
+                },
+                "cannot read brisk.toml",
+                true,
+            ),
+            (
+                ConfigError::Parse {
+                    path: path(),
+                    line: Some(3),
+                    column: Some(7),
+                    message: "expected `=`".to_owned(),
+                },
+                "brisk.toml:3:7: expected `=`",
+                false,
+            ),
+            (
+                ConfigError::Parse {
+                    path: path(),
+                    line: Some(3),
+                    column: None,
+                    message: "missing field `server`".to_owned(),
+                },
+                "brisk.toml: missing field `server`",
+                false,
+            ),
+            (
+                ConfigError::Parse {
+                    path: path(),
+                    line: None,
+                    column: None,
+                    message: "missing field `server`".to_owned(),
+                },
+                "brisk.toml: missing field `server`",
+                false,
+            ),
+            (
+                ConfigError::MissingEnv {
+                    channel: channel(),
+                    var: "BRISK_CPA_KEY".to_owned(),
+                },
+                "channel \"cpa\": environment variable BRISK_CPA_KEY for api_key is not set",
+                false,
+            ),
+            (
+                ConfigError::SecretFile {
+                    channel: channel(),
+                    path: PathBuf::from("cpa.key"),
+                    source: io::ErrorKind::PermissionDenied.into(),
+                },
+                "channel \"cpa\": cannot read api_key file cpa.key",
+                true,
+            ),
+            (
+                ConfigError::InlineSecretNotAllowed { channel: channel() },
+                "channel \"cpa\": api_key = { value = ... } is only allowed in *.local.toml files; use env or file",
+                false,
+            ),
+            (
+                ConfigError::InsecurePermissions {
+                    path: path(),
+                    mode: 0o646,
+                },
+                "brisk.toml is writable by other users (mode 646); remove o+w",
+                false,
+            ),
+            (
+                ConfigError::PlaintextListen {
+                    listen: "0.0.0.0:8080".parse().unwrap(),
+                },
+                "server.listen 0.0.0.0:8080 is not a loopback address; configure [server.tls] or set server.allow_plaintext = true",
+                false,
+            ),
+            (
+                ConfigError::CaFile {
+                    channel: channel(),
+                    path: PathBuf::from("ca.pem"),
+                    source: pem::Error::NoItemsFound,
+                },
+                "channel \"cpa\": cannot load CA certificates from ca.pem",
+                true,
+            ),
+            (
+                invalid("forwarding.max_attempts", "must be in 1..=8"),
+                "forwarding.max_attempts: must be in 1..=8",
+                false,
+            ),
+        ];
+        for (err, message, has_source) in cases {
+            assert_eq!(err.to_string(), message);
+            assert_eq!(err.source().is_some(), has_source, "{err:?}");
+        }
     }
 
     #[test]

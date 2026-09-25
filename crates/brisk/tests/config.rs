@@ -13,6 +13,7 @@ use brisk_gateway::spec::{
     WarmupSpec, WarmupTarget,
 };
 use brisk_gateway::upstream::UpstreamClientConfig;
+use tokio::sync::Semaphore;
 
 const TEST_MODEL: &str = "grok-4.6(xhigh)";
 
@@ -566,18 +567,34 @@ fn ranges_are_checked() {
             other => panic!("{text}: {other:?}"),
         }
     }
+    let with_server_line =
+        |line: &str| minimal().replacen("[server]\n", &format!("[server]\n{line}\n"), 1);
+    // `server::serve` refuses a connection limit its semaphore cannot hold.
+    let above_semaphore = format!("max_connections = {}", Semaphore::MAX_PERMITS + 1);
     for (line, field) in [
         ("workers = 0", "server.workers"),
         ("max_connections = 0", "server.max_connections"),
+        (above_semaphore.as_str(), "server.max_connections"),
         ("backlog = 0", "server.backlog"),
         ("backlog = 2147483648", "server.backlog"),
     ] {
-        let text = minimal().replacen("[server]\n", &format!("[server]\n{line}\n"), 1);
-        match load_err(&text) {
+        match load_err(&with_server_line(line)) {
             ConfigError::Invalid { field: got, .. } => assert_eq!(got, field),
             other => panic!("{line}: {other:?}"),
         }
     }
+    assert_eq!(
+        load_err(&with_server_line(&above_semaphore)).to_string(),
+        format!(
+            "server.max_connections: must be in 1..={}",
+            Semaphore::MAX_PERMITS
+        )
+    );
+    let largest = load_ok(&with_server_line(&format!(
+        "max_connections = {}",
+        Semaphore::MAX_PERMITS
+    )));
+    assert_eq!(largest.spec.server.max_connections, Semaphore::MAX_PERMITS);
     for weight in ["0", "-1", "4294967296"] {
         match load_err(&with_channel(&format!(
             "api_key = {{ env = \"BRISK_CPA_KEY\" }}\nweight = {weight}"
