@@ -10,6 +10,11 @@
 //!   puts the request on its way (`write` on a pooled connection, `connect`
 //!   on a new one) minus the scheduled time. Connection setup is therefore
 //!   part of TTFT and request latency, not of `EmitLag`.
+//! - `TtftReused` repeats `Ttft`, censored bounds included, for the requests
+//!   whose attempt went out on a pooled connection. A request sent on a
+//!   newly opened connection, a stale-connection retry included, carries the
+//!   handshake in its TTFT; it stays in `Ttft` and the diagnostics report it
+//!   apart.
 //! - The receive time of a batch is the kernel receive timestamp of its
 //!   `recvmsg` (Linux, converted to `CLOCK_MONOTONIC`), otherwise the clock
 //!   right after the receive.
@@ -225,7 +230,9 @@ pub(crate) struct Counters {
     pub(crate) open_at_end: u64,
     /// Timed-out or open-at-end requests that contributed censored samples.
     pub(crate) censored_requests: u64,
-    /// Censored latency samples (lower bounds) recorded.
+    /// Censored latency samples (lower bounds) recorded, one per metric: the
+    /// TTFT bound of a request on a pooled connection counts under `Ttft`
+    /// and `TtftReused`.
     pub(crate) censored_samples: u64,
 }
 
@@ -836,6 +843,8 @@ impl Shard {
                     recorder.record_span(Metric::Ttft, t_recv, request.sched_ns, t_recv);
                     if request.fresh {
                         diagnostics.fresh_ttft(t_recv, t_recv.saturating_sub(request.sched_ns));
+                    } else {
+                        recorder.record_span(Metric::TtftReused, t_recv, request.sched_ns, t_recv);
                     }
                 }
             }
@@ -1038,6 +1047,9 @@ impl Shard {
                 if request.markers == 0 {
                     if now >= request.sched_ns.saturating_add(ttft_ns) {
                         record(Metric::Ttft, now - request.sched_ns, 1);
+                        if !request.fresh {
+                            record(Metric::TtftReused, now - request.sched_ns, 1);
+                        }
                     }
                 } else {
                     let remaining = u64::from(request.chunks.saturating_sub(request.markers));

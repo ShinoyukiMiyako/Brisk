@@ -102,6 +102,11 @@ pub enum StatsError {
 pub enum Metric {
     /// Time to first token: planned request start to first content byte.
     Ttft,
+    /// [`Self::Ttft`] of the requests sent on a reused connection only:
+    /// planned request start to first content byte, leaving out every
+    /// request sent on a newly opened connection (retries included), whose
+    /// TTFT carries the connection handshake.
+    TtftReused,
     /// `t_recv − t_sched` per chunk.
     ChunkLatency,
     /// `t_recv − t_write` per chunk.
@@ -116,10 +121,11 @@ pub enum Metric {
 
 impl Metric {
     /// Number of metrics.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 7;
     /// All metrics in index order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::Ttft,
+        Self::TtftReused,
         Self::ChunkLatency,
         Self::ChunkWire,
         Self::EmitLag,
@@ -131,6 +137,7 @@ impl Metric {
     pub fn name(self) -> &'static str {
         match self {
             Self::Ttft => "ttft",
+            Self::TtftReused => "ttft_reused",
             Self::ChunkLatency => "chunk_latency",
             Self::ChunkWire => "chunk_wire",
             Self::EmitLag => "emit_lag",
@@ -1243,6 +1250,7 @@ mod tests {
                 format!("\"{}\"", m.name())
             );
         }
+        assert_eq!("ttft_reused".parse::<Metric>().unwrap(), Metric::TtftReused);
         assert!("nope".parse::<Metric>().is_err());
     }
 
@@ -1837,5 +1845,31 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn runs_recorded_before_ttft_reused_still_load_and_compare() {
+        // Result files written before the metric existed (M0) have no
+        // `ttft_reused` key: they still load and compare on the metrics they
+        // hold, and a comparison of the new metric names what is missing.
+        let json = serde_json::to_string(&synthetic_run(1, 10_000, 3, 0)).unwrap();
+        assert!(!json.contains("ttft_reused"));
+        let old: Vec<RunResult> = vec![serde_json::from_str(&json).unwrap()];
+        compare(&old, &old, Metric::ChunkLatency, &[0.5], 100).unwrap();
+        let err = compare(&old, &old, Metric::TtftReused, &[0.5], 100).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StatsError::EmptyArm {
+                    arm: "A",
+                    metric: Metric::TtftReused
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "arm A has no ttft_reused samples after warmup"
+        );
     }
 }

@@ -211,6 +211,54 @@ fn stream_run(url: &str, out: &Path, label: &str) -> RunResult {
     RunResult::read_json(out).unwrap()
 }
 
+/// TTFT on reused connections leaves out the requests sent on a newly
+/// opened connection. `run` must hold no error, so that nothing was retried
+/// and every send either reused a connection or opened one.
+fn assert_reused_ttft_leaves_out_new_connections(run: &RunResult, doc: &serde_json::Value) {
+    // Over the whole run, warmup included, the histograms and the counters
+    // cover the same requests: each records at most one TTFT, and only a
+    // request still open at the end can lack it.
+    let whole_run = |metric: Metric| -> u64 {
+        run.intervals
+            .iter()
+            .filter_map(|i| i.histogram(metric).unwrap())
+            .map(|h| h.len())
+            .sum()
+    };
+    let ttft_all = whole_run(Metric::Ttft);
+    let reused_all = whole_run(Metric::TtftReused);
+    let fresh_all = ttft_all
+        .checked_sub(reused_all)
+        .expect("every reused TTFT is also a TTFT");
+    let counters = &doc["loadgen"]["counters"];
+    let counter = |name: &str| counters[name].as_u64().unwrap();
+    let open_at_end = counter("open_at_end");
+    for (recorded, sends) in [
+        (reused_all, counter("reused_sends")),
+        (fresh_all, counter("connections_opened")),
+    ] {
+        assert!(
+            recorded <= sends && sends <= recorded + open_at_end,
+            "ttft {ttft_all}, ttft_reused {reused_all}, {counters}"
+        );
+    }
+    // After the warmup, the TTFT the diagnostics report for new connections
+    // is outside ttft_reused as well.
+    let ttft = run.summary[&Metric::Ttft];
+    let reused = run.summary[&Metric::TtftReused];
+    assert!(reused.count > 0, "{reused:?}");
+    // The responder waits 20 ms before the first chunk.
+    assert!(reused.min_ns >= 20_000_000, "{reused:?}");
+    let diagnostics = &doc["loadgen"]["diagnostics"];
+    let fresh_measured = diagnostics
+        .get("fresh_conn_ttft")
+        .map_or(0, |s| s["count"].as_u64().unwrap());
+    assert!(
+        reused.count + fresh_measured <= ttft.count,
+        "{reused:?} {ttft:?} {diagnostics}"
+    );
+}
+
 #[test]
 fn stream_records_ttft_and_chunk_metrics_and_compares() {
     let addr = spawn_responder();
@@ -278,6 +326,7 @@ fn stream_records_ttft_and_chunk_metrics_and_compares() {
         .map(brisk_bench_core::result::IntervalResult::error_count)
         .sum();
     assert_eq!(errors, 0, "{:?}", run_a.intervals);
+    assert_reused_ttft_leaves_out_new_connections(&run_a, &read_document(&a));
 
     // The extension carries the offered load and the load check.
     let doc = read_document(&a);
@@ -304,7 +353,7 @@ fn stream_records_ttft_and_chunk_metrics_and_compares() {
             "--b",
             b_path,
             "--metric",
-            "chunk_latency,ttft",
+            "chunk_latency,ttft,ttft_reused",
             "--quantiles",
             "50,99",
             "--resamples",
@@ -322,10 +371,14 @@ fn stream_records_ttft_and_chunk_metrics_and_compares() {
     let doc = read_document(&cmp);
     assert_eq!(doc["scenario"], "stream");
     let comparisons = doc["comparisons"].as_array().unwrap();
-    assert_eq!(comparisons.len(), 2);
+    assert_eq!(comparisons.len(), 3);
     assert_eq!(comparisons[0]["metric"], "chunk_latency");
     assert_eq!(comparisons[0]["quantiles"].as_array().unwrap().len(), 2);
     assert_eq!(comparisons[0]["quantiles"][1]["quantile"], 0.99);
+    // Compared, but only the default gate metrics gate.
+    assert_eq!(comparisons[2]["metric"], "ttft_reused");
+    assert_eq!(comparisons[2]["gate"], false);
+    assert_eq!(comparisons[2]["quantiles"].as_array().unwrap().len(), 2);
     assert!(doc["baseline_p99_ci_ok"].is_boolean());
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -361,6 +414,7 @@ fn nonstream_ramp_records_request_latency_per_step() {
     let latency = result.summary[&Metric::RequestLatency];
     assert_eq!(latency.count, 20 + 30);
     assert!(!result.summary.contains_key(&Metric::Ttft));
+    assert!(!result.summary.contains_key(&Metric::TtftReused));
     // Every completion carries the responder's marker.
     assert_eq!(result.summary[&Metric::MockWriteLag].count, 20 + 30);
     assert_eq!(result.summary[&Metric::ChunkWire].count, 20 + 30);
