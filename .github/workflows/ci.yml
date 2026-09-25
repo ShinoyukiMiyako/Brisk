@@ -5,6 +5,8 @@ on:
     branches:
       - main
       - "feat/**"
+      # The milestone integration branch gates the three-platform exit criterion.
+      - "m1/integration"
   pull_request:
 
 # A newer push to the same branch or PR supersedes the running pipeline.
