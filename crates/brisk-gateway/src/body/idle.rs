@@ -1,8 +1,9 @@
 //! First-byte and idle detection for a committed body on the request's only
 //! timer (D15, D31).
 //!
-//! Resetting a timer locks a shard of tokio's timer wheel, so the per-chunk
-//! path never touches it: [`IdleClock::on_bytes`] only sets a flag. The timer
+//! Resetting a timer to an earlier deadline takes the time driver's lock,
+//! which tokio 1.53 shares across the whole runtime, so the per-chunk path
+//! never touches it: [`IdleClock::on_bytes`] only sets a flag. The timer
 //! fires once per period (`idle / 4`); a period in which no byte arrived is
 //! silent, and four silent periods in a row end the stream. The last byte
 //! therefore lies at most one period before the start of the silent run, and
