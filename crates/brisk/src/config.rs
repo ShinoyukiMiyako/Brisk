@@ -62,6 +62,20 @@ const DEFAULT_OUTCOME_QUEUE: usize = 16_384;
 /// records before the logger drains them.
 const MAX_OUTCOME_QUEUE: usize = 1 << 24;
 
+/// Largest accepted `server.max_connections`: `server::serve` sizes a Tokio
+/// semaphore with it and refuses to start above that semaphore's limit, so
+/// the loader rejects such a value before `check-config` can pass it.
+// tokio's `sync` feature is not in this crate's manifest; brisk-gateway, which
+// every build of this crate includes, enables it.
+const MAX_CONNECTIONS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+/// The range of [`MAX_CONNECTIONS`] as error text; `ConfigError::Invalid`
+/// takes a fixed string, and a unit test keeps the two in step.
+#[cfg(target_pointer_width = "64")]
+const MAX_CONNECTIONS_RANGE: &str = "must be in 1..=2305843009213693951";
+#[cfg(target_pointer_width = "32")]
+const MAX_CONNECTIONS_RANGE: &str = "must be in 1..=536870911";
+
 /// Suffix of the only file names allowed to hold inline secrets.
 const LOCAL_SUFFIX: &str = ".local.toml";
 
@@ -567,7 +581,10 @@ impl Builder<'_> {
 fn server_config(raw: &RawServer) -> Result<ServerConfig, ConfigError> {
     let mut server = ServerConfig::default();
     if let Some(max) = raw.max_connections {
-        server.max_connections = positive_usize("server.max_connections", max)?;
+        server.max_connections = usize::try_from(max)
+            .ok()
+            .filter(|max| (1..=MAX_CONNECTIONS).contains(max))
+            .ok_or_else(|| invalid("server.max_connections", MAX_CONNECTIONS_RANGE))?;
     }
     server.header_read_timeout = override_duration(
         "server.header_read_timeout",
@@ -784,13 +801,6 @@ fn invalid(field: impl Into<String>, reason: &'static str) -> ConfigError {
         field: field.into(),
         reason,
     }
-}
-
-fn positive_usize(field: &str, value: i64) -> Result<usize, ConfigError> {
-    usize::try_from(value)
-        .ok()
-        .filter(|&value| value >= 1)
-        .ok_or_else(|| invalid(field, "must be at least 1"))
 }
 
 /// `value` if given, else `default`; either way it must be positive.
@@ -1361,6 +1371,14 @@ mod tests {
         ] {
             assert_eq!(parse_size(text), None, "{text:?}");
         }
+    }
+
+    #[test]
+    fn the_connection_limit_range_names_the_semaphore_limit() {
+        assert_eq!(
+            MAX_CONNECTIONS_RANGE,
+            format!("must be in 1..={}", tokio::sync::Semaphore::MAX_PERMITS)
+        );
     }
 
     #[test]
