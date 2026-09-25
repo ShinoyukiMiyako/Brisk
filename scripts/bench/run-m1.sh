@@ -123,8 +123,9 @@
 # RAMP_START, which bounds its pair's ratio, and a tool-limited block is
 # only reported. The reuse limit (>= 99.9%) must hold in every run of the
 # Brisk arms, the voided and rerun ones included. The e-sessions print their
-# rules as MET or NOT_MET (TRIGGERED or not in e11) and a decision.
-# Memory, idle RSS, CPU per chunk
+# rules as MET or NOT_MET (TRIGGERED or not in e11) and a decision; a rule
+# on the within-run interval of a single repetition is UNDECIDED (UNCERTAIN
+# in e11) and changes no default. Memory, idle RSS, CPU per chunk
 # and per request, chunk_wire, the strip cost and the HITM counts are
 # reported only, with the contract's reference values where it names them.
 #
@@ -790,10 +791,16 @@ prog_check_delta='
           else ((.hi - .lo) / 2) as $half
                | .verdict = (if $kind == "le" then judge_le(.x; .lo; .hi; $thr; $single)
                              elif $kind == "abs" then judge_abs(.x; .lo; .hi; $thr; $single)
+                             # A decision rule changes a default, which the
+                             # within-run interval of a single repetition is
+                             # too narrow to do (03, 9.2).
+                             elif ($kind == "improve" or $kind == "below0" or $kind == "notworse") and $single
+                             then "UNDECIDED"
                              elif $kind == "improve" then (if .x <= (0 - $thr) and .hi < 0 then "MET" else "NOT_MET" end)
                              elif $kind == "below0" then (if .x < 0 and .hi < 0 then "MET" else "NOT_MET" end)
                              elif $kind == "notworse" then (if .lo <= 0 then "MET" else "NOT_MET" end)
                              else "REPORT" end)
+               | if .verdict == "UNDECIDED" then .note = "a single repetition decides no rule" else . end
                | if $prec > 0 and $half > $prec * 1000
                  then .counts = false
                       | .note = "CI half width \($half / 1000 | fixed1) us above \($prec) us, a quarter of the limit"
@@ -1048,6 +1055,10 @@ p99($fa[0]) as $A
 | p99($fb[0]) as $B
 | p99($ab[0]) as $D
 | (if $A == null or $B == null or $D == null then {verdict: "MISSING", note: "a comparison is missing"}
+   # The rule decides whether to build a pool, which the within-run interval
+   # of a single repetition is too narrow to do (03, 9.2).
+   elif any($fa[0], $fb[0], $ab[0]; .single_repetition_fallback == true)
+   then {verdict: "UNCERTAIN", note: "a single repetition decides no rule"}
    elif $A.delta_ns <= 0 then {verdict: "NOT_TRIGGERED", note: "floor-A adds no p99 over direct"}
    elif $D.delta_ci_high_ns == null then {verdict: "UNCERTAIN", note: "floor-B - floor-A has no finite interval"}
    elif $B.delta_ns < 0.8 * $A.delta_ns and $D.delta_ci_high_ns < 0 then {verdict: "TRIGGERED"}
@@ -1100,6 +1111,9 @@ last_by(.id) as $all
              text: ("E1 decision: make match the default router ("
                     + ([if $lat_met then "latency rule met" else empty end,
                         if $tp_met then "throughput rule met" else empty end] | join(", ")) + ")")}
+       elif any($lat[]; .verdict == "UNDECIDED")
+       then {verdict: "UNDECIDED",
+             text: "E1 decision: undecided, the latency rule rests on a single repetition and the throughput rule is not met (latency \([$lat[].verdict] | join(", ")), throughput \([$tp[].verdict] | join(", "))); the default stays axum"}
        else {verdict: "AXUM",
              text: "E1 decision: keep axum (latency \([$lat[].verdict] | join(", ")), throughput \([$tp[].verdict] | join(", ")))"}
        end)
@@ -1110,6 +1124,10 @@ last_by(.id) as $all
        then {verdict: "UNDECIDED", text: "E2 decision: undecided, S3 or S1 comparisons are missing"}
        elif all($t[]; .verdict == "MET") and all($ch[]; .verdict == "MET")
        then {verdict: "CONCAT", text: "E2 decision: make concat the default splice (TTFT p50 better in all \($t | length) S3 size(s), S1 chunk p99 not worse)"}
+       # No rule decided against concat, but one rests on a single repetition.
+       elif any(($t + $ch)[]; .verdict == "UNDECIDED") and all(($t + $ch)[]; .verdict != "NOT_MET")
+       then {verdict: "UNDECIDED",
+             text: "E2 decision: undecided, a rule rests on a single repetition (S3 TTFT \([$t[].verdict] | join(", ")), S1 chunk p99 \([$ch[].verdict] | join(", "))); the default stays segments"}
        else {verdict: "SEGMENTS",
              text: "E2 decision: keep segments (S3 TTFT \([$t[].verdict] | join(", ")), S1 chunk p99 \([$ch[].verdict] | join(", ")))"}
        end)
@@ -2449,6 +2467,8 @@ add_verdict() {
 #             improve   delta <= -limit and CI high below 0 (E1): MET or NOT_MET
 #             below0    delta and CI high below 0 (E2): MET or NOT_MET
 #             notworse  CI low end at most 0 (E2): MET or NOT_MET
+#             (the last three UNDECIDED on a single repetition, as the le
+#             and abs ones are UNCERTAIN)
 #             report    no rule
 #   precision a positive value keeps the verdict gated only while the CI
 #             half width is within it (TTFT p99, 7.5), microseconds
