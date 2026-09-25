@@ -84,10 +84,14 @@
 //! A connection returns to the pool once its response body has been read to
 //! the end (trailers included) and its [`SendRequest`] is ready again; a body
 //! dropped before its end closes the connection. Readiness normally comes in
-//! the same poll as the end of the body. It waits for the rest of the request
-//! body when the upstream answered before reading all of it, and the end of
-//! the response (for a response without a body, its head) is held back until
-//! then; see [`SameTaskBody`].
+//! the same poll as the end of the body, and the connection is pooled before
+//! that end is passed on. When the upstream answered before reading the whole
+//! request body, readiness waits for the rest of the upload; the end of the
+//! response is then passed on at once, as floor-A does, and a spawned task
+//! drives the connection until it is ready and pools it, as the legacy
+//! client's connection task does. Measurements never take that path, since
+//! brisk-mock reads a chat request in full before answering it. See
+//! [`SameTaskBody`].
 //!
 //! # Deliberate differences from floor-A
 //!
@@ -360,13 +364,16 @@ impl SameTaskForwarder {
             body,
             upstream: Some(upstream),
             owner: Arc::clone(&self.inner),
-            state: BodyState::Streaming,
+            ended: false,
         };
         // hyper never polls a body that is empty from the start, so the
         // connection would be closed with it instead of pooled.
         if body.body.is_end_stream() {
-            poll_fn(|cx| body.poll_release(cx)).await;
-            body.state = BodyState::Done;
+            poll_fn(|cx| {
+                body.finish(cx);
+                Poll::Ready(())
+            })
+            .await;
         }
         Response::from_parts(parts, Either::Left(body))
     }
@@ -441,8 +448,28 @@ impl Inner {
         }
     }
 
-    fn release(&self, upstream: Upstream) {
-        self.lock_idle().push(upstream);
+    /// Takes back a connection whose response has ended. It is pooled at
+    /// once when its sender is ready, the normal case. Otherwise the upstream
+    /// answered before the whole request body was sent: a task spawned on the
+    /// current Tokio runtime then drives the connection through the rest of
+    /// the upload and pools it once it is ready. A finished or failed
+    /// connection is dropped.
+    fn release(self: &Arc<Self>, mut upstream: Upstream, cx: &mut Context<'_>) {
+        match upstream.poll_idle(cx) {
+            Poll::Ready(true) => self.lock_idle().push(upstream),
+            Poll::Ready(false) => {}
+            Poll::Pending => {
+                tracing::debug!(
+                    "upstream answered before the request body was sent; pooling the connection after the upload"
+                );
+                let owner = Arc::clone(self);
+                tokio::spawn(async move {
+                    if poll_fn(|cx| upstream.poll_idle(cx)).await {
+                        owner.lock_idle().push(upstream);
+                    }
+                });
+            }
+        }
     }
 
     /// Opens a new upstream connection, within the connect timeout.
@@ -514,6 +541,29 @@ impl Upstream {
             }
             self.conn = None;
         }
+    }
+
+    /// Drives the connection until it can take the next request: `true`
+    /// then, `false` if it has finished or failed first.
+    fn poll_idle(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        if self.conn.is_none() {
+            return Poll::Ready(false);
+        }
+        let mut ready = self.sender.poll_ready(cx);
+        if ready.is_pending() {
+            // The dispatcher asks for the next request only when it is
+            // polled after the exchange ended, which the last poll of the
+            // body may have preceded; polling it also writes what is left of
+            // the request body.
+            self.poll_conn(cx);
+            if self.conn.is_none() {
+                return Poll::Ready(false);
+            }
+            ready = self.sender.poll_ready(cx);
+        }
+        // An error means the connection is closing, not that the finished
+        // exchange failed.
+        ready.map(|result| result.is_ok())
     }
 
     /// Sends `request` and drives the connection until the response head
@@ -605,18 +655,6 @@ impl AsyncWrite for UpstreamStream {
     }
 }
 
-#[derive(Debug)]
-enum BodyState {
-    /// Frames are still coming from the upstream.
-    Streaming,
-    /// The upstream body ended; the connection is being pooled, and the
-    /// body's last frame is held back until it is (`None` when the end was
-    /// seen as the end of the stream rather than with a frame).
-    Releasing(Option<Frame<Bytes>>),
-    /// Ended, and the connection is pooled or gone.
-    Done,
-}
-
 /// The upstream response body, which also drives its upstream connection.
 ///
 /// Each [`poll_frame`](Body::poll_frame) polls the upstream [`Connection`]
@@ -628,25 +666,27 @@ enum BodyState {
 /// polling a response body as soon as it reports
 /// [`is_end_stream`](Body::is_end_stream), once its `Content-Length` has been
 /// written, or once it has returned trailers, without asking for the end of
-/// the stream. So when the upstream body is complete with a frame (the last
-/// bytes of a known length, or the trailers, which come only after all data),
-/// that frame is held back until the connection is pooled and only then
-/// returned, with `is_end_stream` already true. The connection is
-/// normally ready in the same poll: the connection's dispatcher returns to
-/// idle and asks for the next request while it reads the body's last bytes.
-/// It is not while the request body is still being written, which delays
-/// the end of the response until the upload is complete.
+/// the stream. So the frame that completes the upstream body (the last bytes
+/// of a known length, or the trailers, which come only after all data) ends
+/// it too: the connection is handed back first, and the frame is returned
+/// with `is_end_stream` already true. The connection is normally ready in
+/// that same poll, as its dispatcher returns to idle and asks for the next
+/// request while it reads the body's last bytes, and it is pooled there. It
+/// is not while the request body is still being written; the end of the
+/// response is passed on regardless, and the connection is pooled later, as
+/// the module documentation describes.
 pub struct SameTaskBody {
     body: Incoming,
+    /// `None` once the connection has been handed back.
     upstream: Option<Upstream>,
     owner: Arc<Inner>,
-    state: BodyState,
+    ended: bool,
 }
 
 impl fmt::Debug for SameTaskBody {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SameTaskBody")
-            .field("state", &self.state)
+            .field("ended", &self.ended)
             .field(
                 "connection_open",
                 &self.upstream.as_ref().is_some_and(|u| u.conn.is_some()),
@@ -656,39 +696,11 @@ impl fmt::Debug for SameTaskBody {
 }
 
 impl SameTaskBody {
-    /// Pools the connection once its sender is ready again; drops it if it
-    /// has finished or failed.
-    fn poll_release(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let Some(upstream) = &mut self.upstream else {
-            return Poll::Ready(());
-        };
-        if upstream.conn.is_none() {
-            self.upstream = None;
-            return Poll::Ready(());
-        }
-        let mut ready = upstream.sender.poll_ready(cx);
-        if ready.is_pending() {
-            // The dispatcher asks for the next request only when it is
-            // polled after the exchange ended, which the last poll of the
-            // body may have preceded.
-            upstream.poll_conn(cx);
-            if upstream.conn.is_none() {
-                self.upstream = None;
-                return Poll::Ready(());
-            }
-            ready = upstream.sender.poll_ready(cx);
-        }
-        match ready {
-            Poll::Ready(Ok(())) => {
-                let upstream = self.upstream.take().expect("checked above");
-                self.owner.release(upstream);
-                Poll::Ready(())
-            }
-            Poll::Ready(Err(_closed)) => {
-                self.upstream = None;
-                Poll::Ready(())
-            }
-            Poll::Pending => Poll::Pending,
+    /// Marks the body as ended and hands its connection back.
+    fn finish(&mut self, cx: &mut Context<'_>) {
+        self.ended = true;
+        if let Some(upstream) = self.upstream.take() {
+            self.owner.release(upstream, cx);
         }
     }
 }
@@ -702,44 +714,32 @@ impl Body for SameTaskBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
         let this = self.get_mut();
-        if matches!(this.state, BodyState::Streaming) {
-            if let Some(upstream) = &mut this.upstream {
-                upstream.poll_conn(cx);
-            }
-            match Pin::new(&mut this.body).poll_frame(cx) {
-                Poll::Ready(None) => this.state = BodyState::Releasing(None),
-                Poll::Ready(Some(Ok(frame)))
-                    if frame.is_trailers() || this.body.is_end_stream() =>
-                {
-                    this.state = BodyState::Releasing(Some(frame));
-                }
-                other => return other,
-            }
+        if this.ended {
+            return Poll::Ready(None);
         }
-        if matches!(this.state, BodyState::Releasing(_)) {
-            if this.poll_release(cx).is_pending() {
-                return Poll::Pending;
-            }
-            let BodyState::Releasing(last) = std::mem::replace(&mut this.state, BodyState::Done)
-            else {
-                unreachable!("state checked above");
-            };
-            return Poll::Ready(last.map(Ok));
+        if let Some(upstream) = &mut this.upstream {
+            upstream.poll_conn(cx);
         }
-        Poll::Ready(None)
+        let last = match Pin::new(&mut this.body).poll_frame(cx) {
+            Poll::Ready(None) => None,
+            Poll::Ready(Some(Ok(frame))) if frame.is_trailers() || this.body.is_end_stream() => {
+                Some(frame)
+            }
+            other => return other,
+        };
+        this.finish(cx);
+        Poll::Ready(last.map(Ok))
     }
 
     fn is_end_stream(&self) -> bool {
-        matches!(self.state, BodyState::Done)
+        self.ended
     }
 
     fn size_hint(&self) -> SizeHint {
-        match &self.state {
-            BodyState::Streaming => self.body.size_hint(),
-            BodyState::Releasing(Some(frame)) => {
-                SizeHint::with_exact(frame.data_ref().map_or(0, Bytes::len) as u64)
-            }
-            BodyState::Releasing(None) | BodyState::Done => SizeHint::with_exact(0),
+        if self.ended {
+            SizeHint::with_exact(0)
+        } else {
+            self.body.size_hint()
         }
     }
 }

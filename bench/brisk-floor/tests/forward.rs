@@ -1691,3 +1691,97 @@ async fn floor_b_forwards_trailers_and_pools_the_connection() {
     );
     assert_eq!(stats.closed.load(Ordering::SeqCst), 0);
 }
+
+/// Waits until `forwarder` holds `n` idle connections.
+async fn wait_for_idle(forwarder: &SameTaskForwarder, n: usize) {
+    within("upstream connection pooled", async {
+        while forwarder.idle_connections() != n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn floor_b_delivers_an_early_answer_while_the_request_body_is_uploading() {
+    let (received_tx, mut received_rx) = mpsc::unbounded_channel::<Bytes>();
+    let (upstream, stats, _) = spawn_counting_upstream(
+        move |req: Request<Incoming>| {
+            let received_tx = received_tx.clone();
+            async move {
+                let empty_answer = req.uri().path() == "/v1/empty";
+                // Answers at once and reads the request body afterwards,
+                // keeping the connection, as a server that refuses an upload
+                // early may do.
+                tokio::spawn(async move {
+                    let received = req.into_body().collect().await.unwrap().to_bytes();
+                    received_tx.send(received).unwrap();
+                });
+                if empty_answer {
+                    Response::new(empty())
+                } else {
+                    Response::builder()
+                        .status(StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(full("no"))
+                        .unwrap()
+                }
+            }
+        },
+        None,
+    )
+    .await;
+    let floor = spawn_floor_b(&format!("http://{upstream}"), None);
+    let mut sender = h1_connect(floor.addr).await;
+
+    // An empty answer (the end of the response is its head) and one with a
+    // known length (the end is its last frame).
+    for (path, status, answer) in [
+        ("/v1/empty", StatusCode::OK, ""),
+        ("/v1/sized", StatusCode::PAYLOAD_TOO_LARGE, "no"),
+    ] {
+        let (mut body_sender, body) = channel();
+        let request = Request::post(path)
+            .header("host", "floor.example")
+            .body(body)
+            .unwrap();
+        let response = tokio::spawn(sender.send_request(request));
+        within(
+            "client write",
+            body_sender.send_data(Bytes::from_static(b"first part")),
+        )
+        .await
+        .unwrap();
+
+        // The whole answer reaches the client while it still holds the rest
+        // of its request body back.
+        let response = within("response head", response).await.unwrap().unwrap();
+        assert_eq!(response.status(), status, "{path}");
+        let body = within("response body", response.into_body().collect())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body, answer, "{path}");
+        // Busy with the upload, so not pooled yet.
+        assert_eq!(floor.forwarder.idle_connections(), 0, "{path}");
+
+        within(
+            "client write",
+            body_sender.send_data(Bytes::from_static(b" and the rest")),
+        )
+        .await
+        .unwrap();
+        drop(body_sender);
+        let received = within("upstream request body", received_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(received, "first part and the rest", "{path}");
+        // Pooled once the upload is complete.
+        wait_for_idle(&floor.forwarder, 1).await;
+    }
+    assert_eq!(
+        stats.accepts.load(Ordering::SeqCst),
+        1,
+        "an early answer left its upstream connection unpooled"
+    );
+    assert_eq!(stats.closed.load(Ordering::SeqCst), 0);
+}
