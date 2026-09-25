@@ -343,6 +343,52 @@ impl TestGateway {
             outcomes: self.received,
         }
     }
+
+    /// Ends `serve` as `how` says, waits until its task is gone and drops
+    /// this handle's gateway; returns the outcome receiver, whose `recv`
+    /// yields `None` once every other holder of an `OutcomeSink` is gone.
+    ///
+    /// It skips the one-outcome-per-request check of [`Self::finish`], so it
+    /// refuses a gateway that was sent requests.
+    pub(crate) async fn stop_serve(mut self, how: StopServe) -> OutcomeReceiver {
+        assert_eq!(
+            self.sent(),
+            0,
+            "a gateway that was sent requests ends with finish"
+        );
+        match how {
+            StopServe::Shutdown => {
+                self.begin_shutdown();
+                timeout(Duration::from_secs(60), &mut self.task)
+                    .await
+                    .expect("serve did not return after shutdown")
+                    .expect("serve task panicked")
+                    .expect("serve failed");
+            }
+            StopServe::Drop => {
+                // `self.shutdown` is still held, so `serve` cannot take the
+                // graceful path before the abort lands.
+                self.task.abort();
+                let joined = timeout(Duration::from_secs(10), &mut self.task)
+                    .await
+                    .expect("the aborted serve task did not end");
+                // A cancelled task resolves only after its future was dropped.
+                let error = joined.expect_err("serve returned although it was aborted");
+                assert!(error.is_cancelled(), "{error}");
+            }
+        }
+        self.outcomes
+    }
+}
+
+/// How [`TestGateway::stop_serve`] ends `serve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopServe {
+    /// Completes the `shutdown` future, so `serve` returns.
+    Shutdown,
+    /// Aborts the serve task without completing `shutdown`, dropping the
+    /// `serve` future, as `brisk` does on a second signal.
+    Drop,
 }
 
 /// Protocol of a test client connection.
