@@ -69,9 +69,9 @@
 # square as it is; Brisk against brisk-pt is the cost of strip, reported only.
 # brisk-pt stays out of the gated repetitions: once the gated arms of a
 # repetition are valid, an invalid brisk-pt (or Brisk next to it) reruns only
-# Brisk and brisk-pt, at their positions; the gated comparisons and the reuse
-# verdict never read brisk-pt, and Brisk against brisk-pt uses the latest
-# attempt of each repetition in which the two are valid together.
+# Brisk and brisk-pt, at their positions; the gated comparisons never read
+# brisk-pt, and Brisk against brisk-pt uses the latest attempt of each
+# repetition in which the two are valid together.
 #
 # Besides loadgen's validity, a run of S1, S2 or S3 is invalid when more of
 # its requests failed after the warmup (stale retries aside) than a tenth of
@@ -79,6 +79,34 @@
 # S3_COMPARE_QUANTILES; 0.01% at p99.9): brisk-loadgen compare refuses such
 # a run, which would cost the block its comparisons, while loadgen's validity
 # tolerates 0.1%.
+#
+# Connections (docs/research/m1-reuse-rate.md, section 8.4, in place of the
+# 99.9% reuse floor of contract 05, 6.2 and 7.5, which S1 misses even for
+# direct: its new connections follow from the seed's schedule and the pools'
+# idle limits). The mock statistics are reset (POST /__bench/reset) a second into
+# the measurement window and read once loadgen has exited, both times
+# recorded. The accepts of the arm's mock, the statistics request's own
+# connection left out, are the run's new upstream connections, its requests
+# those of the window (Brisk's periodic warmup requests included); loadgen's
+# fresh_conn_sends after its warmup are the new inbound ones (for direct the
+# same connections). A request is cold when it opened a connection on
+# either leg.
+# (a) An S1, S2 or S3 run with more than MAX_NEW_CONN_RATE new upstream
+#     connections per window second is invalid.
+# (b) Within a repetition, each arm against the first arm of its connection
+#     pool policy (gate: Brisk and brisk-pt against floor-A; e1, e2 and e4:
+#     the second arm against the first; see rep_pairs): the new connections
+#     of either leg may differ by at most max(PAIR_CONN_SLACK_MIN,
+#     PAIR_CONN_SLACK_FRAC x the smaller window request count), else the arm
+#     counts as an invalid run of its attempt (rep_checks.jsonl).
+# (c) Arms of different policies (against direct, floor-B against floor-A)
+#     differ by their seed's schedule, which a rerun repeats, so only the
+#     difference of their cold request shares is reported, per leg.
+# A ramp's connections are only recorded, since its load keeps rising. The
+# reuse verdict of a block fails when a Brisk arm (in e11 floor-A or
+# floor-B) broke (a) in every run of a repetition or (b) in every attempt of
+# one: a violation the same seed repeats is a defect, which must not hide as
+# a missing comparison.
 #
 # Brisk: at the start of the session `brisk keygen` makes a virtual key, read
 # by its frozen output format (contract 05, section 1.5). Its digest goes into
@@ -97,12 +125,11 @@
 #
 # Evidence per run, besides that of run-m0.sh (CPU per core, steal, network,
 # mock shard balance):
-# - the mock statistics are reset (POST /__bench/reset) at the start of the
-#   measurement window, and the accepts and requests of the arm's mock at the
-#   end give the upstream connection reuse 1 - accepts / requests (the
-#   statistics request's own connection left out; Brisk's periodic warmup
-#   requests count as requests); an S1, S2 or S3 run below MIN_REUSE is
-#   invalid, a ramp's reuse is only recorded, since its load keeps rising;
+# - the new upstream and inbound connections over the measurement window
+#   (Connections, above), the upstream reuse 1 - new / requests, loadgen's
+#   idle_closed (connections a peer closed while idle in its pool, over the
+#   whole run) and the TTFT p50 and p99 of the requests sent on fresh
+#   connections;
 # - the SUT's utime + stime over the window (/proc/<pid>/stat, CLK_TCK),
 #   divided by the chunks (S1) or completed requests (S2, S3) loadgen
 #   received in that window, its one-second intervals weighted by their
@@ -146,14 +173,28 @@
 # ratio Brisk / floor-A over at least 3 pairs: all >= 0.85 PASS, mean < 0.85
 # FAIL, else UNCERTAIN; a ramp without a sustainable step lies below
 # RAMP_START, which bounds its pair's ratio, and a tool-limited block is
-# only reported. The reuse limit (>= 99.9%) must hold in every run of the
-# Brisk arms, the voided and rerun ones included. The e-sessions print their
+# only reported. The reuse verdict (Connections, above) is gated like them,
+# but reported in S3. The e-sessions print their
 # rules as MET or NOT_MET (TRIGGERED or not in e11) and a decision; a rule
 # on the within-run interval of a single repetition is UNDECIDED (UNCERTAIN
 # in e11) and changes no default. Memory, idle RSS, CPU per chunk
 # and per request, chunk_wire, the strip cost, the HITM counts and the
 # legacy pool lock share (C21) are reported only, with the contract's
 # reference values where it names them.
+#
+# TTFT in S1, which compares ttft, ttft_reused, chunk_latency, chunk_wire and
+# mock_write_lag: the TTFT rules of 7.5 and E4 read ttft_reused, loadgen's
+# TTFT of the requests sent on a reused connection. floor-A and Brisk close a
+# connection idle for 30 s (hyper's header_read_timeout), so more of their
+# requests than of direct's open a new connection and carry its TCP (in T
+# also TLS) handshake, which the targets of 02 leave out; in M0 this raised
+# the T delta p99 of floor-A over direct from about 110 to 260 us. ttft over
+# all requests keeps its M0 meaning; its p50 and p99 deltas are reported
+# only. So is, per arm, the number of requests whose TTFT exceeds 1 s, after
+# the warmup and over the whole run, from the interval histograms: in the
+# SUT arms, requests that a race in hyper's HTTP/1 client queued behind
+# another stream on a pooled upstream connection, compared before and after
+# its fix.
 #
 # The session refuses to start unless setup-host.sh --check passes
 # (ALLOW_UNPREPARED_HOST=1 overrides), holds $RESULTS_ROOT/.run-m0.lock for
@@ -164,14 +205,16 @@
 # --release -p brisk).
 #
 # Output in $RESULTS_ROOT/$RUN_ID/: manifest.json, summary.txt, runs.jsonl,
-# compares.jsonl and verdicts.jsonl (both append-only: the last record of a
-# name or id counts), processes.jsonl, session.log, results/ (RunResult
+# rep_checks.jsonl (rule (b) per attempt), compares.jsonl and verdicts.jsonl
+# (both append-only: the last record of a name or id counts),
+# processes.jsonl, session.log, results/ (RunResult
 # files), compare/ (JSON and text of every comparison), brisk/ (rendered
 # configurations), logs/, host/, bin/. Every process started here is stopped
 # on exit, failures included. Exit status: 0 when every gated verdict is PASS
 # and nothing failed; 1 when the selfcheck, a run, a comparison or an
 # evaluation failed, or a gated verdict is FAIL or MISSING; 3 when a gated
-# verdict is still UNCERTAIN.
+# verdict is still UNCERTAIN. The S2 perf runs are reported only: a failed
+# one goes into the perf and C21 reports and the manifest's perf field.
 
 set -euo pipefail
 
@@ -296,7 +339,9 @@ knob_table=(
     "BASELINE_METRICS|chunk_latency|S1 metrics of compare's baseline criterion (arm A's p99 CI half width below 5%, run-m0.sh), reported only"
     "S2_BASELINE_METRICS|request_latency|S2 metrics of the baseline criterion"
     "S3_BASELINE_METRICS|ttft|S3 metrics of the baseline criterion"
-    "MIN_REUSE|0.999|upstream connection reuse (1 - accepts / requests at the mock) below which a run is invalid"
+    "MAX_NEW_CONN_RATE|1.0|rule (a): new upstream connections per window second above which an S1, S2 or S3 run is invalid"
+    "PAIR_CONN_SLACK_MIN|2|rule (b): new connections per leg by which two arms of a pool policy may always differ in a repetition"
+    "PAIR_CONN_SLACK_FRAC|0.0003|rule (b): the same as a share of the smaller window request count, where that is larger"
     "IDLE_RSS_S|60|seconds the SUT idles between readiness and the first S1 request, for the idle RSS"
     "READY_TIMEOUT_S|30|seconds Brisk may take until GET /readyz returns 200"
     "PT_CONFIGS|P|gate configs whose S1 also runs brisk-pt (stream_usage passthrough, reported only); empty for none"
@@ -435,11 +480,19 @@ for name in S1_CHUNK_RATE S1_DUR_MEDIAN S1_DUR_P99 S1_DUR_MAX S2_RATE S3_RATE RA
     RAMP_STOP_P99_MS MOCK_WRITE_LAG_LIMIT_US S3_MOCK_WRITE_LAG_LIMIT_US RAMP_MOCK_WRITE_LAG_LIMIT_US; do
     positive_number "${!name}" || die "$name must be a positive number, got '${!name}'"
 done
-for name in MIN_REUSE RAMP_TOOL_LIMIT_SHARE; do
+for name in PAIR_CONN_SLACK_FRAC RAMP_TOOL_LIMIT_SHARE; do
     if ! positive_number "${!name}" || ! awk -v v="${!name}" 'BEGIN { exit !(v <= 1) }'; then
         die "$name must be a number in (0, 1], got '${!name}'"
     fi
 done
+# The reuse rules pass these to jq as JSON numbers, which have no leading
+# zeros.
+for name in MAX_NEW_CONN_RATE PAIR_CONN_SLACK_FRAC PAIR_CONN_SLACK_MIN; do
+    [[ "${!name}" =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]] || die "$name must be a decimal number without leading zeros, got '${!name}'"
+done
+positive_number "$MAX_NEW_CONN_RATE" || die "MAX_NEW_CONN_RATE must be a positive number, got '$MAX_NEW_CONN_RATE'"
+[[ "$PAIR_CONN_SLACK_MIN" =~ ^[0-9]+$ ]] ||
+    die "PAIR_CONN_SLACK_MIN must be a non-negative integer, got '$PAIR_CONN_SLACK_MIN'"
 [[ "$MOCK_EMIT_POLICY" == full-spin || "$MOCK_EMIT_POLICY" == fixed ]] ||
     die "MOCK_EMIT_POLICY must be full-spin or fixed, got '$MOCK_EMIT_POLICY'"
 for name in SC_GATE ALLOW_UNPREPARED_HOST EXTEND_UNCERTAIN; do
@@ -503,7 +556,7 @@ has_quantile() {
 
 compared_metrics() {
     case "$1" in
-        s1) echo ttft,chunk_latency,chunk_wire,mock_write_lag ;;
+        s1) echo ttft,ttft_reused,chunk_latency,chunk_wire,mock_write_lag ;;
         s2) echo request_latency ;;
         s3) echo ttft,chunk_latency ;;
     esac
@@ -656,7 +709,7 @@ if [[ -e "$run_dir" ]] && [[ -n "$(ls -A "$run_dir")" ]]; then
     die "$run_dir already exists and is not empty; choose another RUN_ID"
 fi
 mkdir -p "$run_dir"/{results,compare,logs,host,bin,brisk}
-touch "$run_dir"/{runs,compares,verdicts,processes}.jsonl
+touch "$run_dir"/{runs,rep_checks,compares,verdicts,processes}.jsonl
 # Loadgen results carry the key in their recorded parameters until they are
 # redacted, so they are written where only this user can read them.
 stage_dir="$run_dir/.staging"
@@ -767,16 +820,83 @@ def last_by(f): reduce .[] as $r ({order: [], by: {}};
 def ci_text($t; f): "[\($t.lo | f), \($t.hi | f)]";
 '
 
+# Decoding of loadgen's interval histograms (base64 of an uncompressed HDR V2
+# serialization, read as hdrhistogram 7.6 reads it), shared by the programs
+# that read a result's intervals: hdr_decode gives {low, sigfig, counts}, the
+# counts as [index, count] of the non-empty buckets.
+# shellcheck disable=SC2016
+jq_hdr='
+def hdr_bytes:
+    [explode[] | if . >= 65 and . <= 90 then . - 65 elif . >= 97 and . <= 122 then . - 71
+                 elif . >= 48 and . <= 57 then . + 4 elif . == 43 then 62 elif . == 47 then 63
+                 else empty end] as $s
+    | ($s | length * 3 / 4 | floor) as $n
+    # The sextets a padded end lacks are zero bits, and the bytes they fill
+    # are cut off below.
+    | [range(0; $s | length; 4) as $i
+       | ($s[$i] * 262144 + ($s[$i + 1] // 0) * 4096 + ($s[$i + 2] // 0) * 64 + ($s[$i + 3] // 0)) as $w
+       | ($w / 65536 | floor), (($w / 256 | floor) % 256), ($w % 256)]
+    | .[:$n];
+def hdr_uint($b; $at; $len): reduce $b[$at:$at + $len][] as $x (0; . * 256 + $x);
+def hdr_decode:
+    hdr_bytes as $b
+    | if hdr_uint($b; 0; 4) != 478450451
+      then error("an interval histogram is not an uncompressed HDR V2 serialization") else . end
+    | {low: hdr_uint($b; 16; 8), sigfig: hdr_uint($b; 12; 4),
+       # [index, count] of the non-empty buckets: LEB128 varints (7 bits a
+       # byte, all 8 in a ninth) of ZigZag i64s, a negative one a run of
+       # empty buckets.
+       counts: (reduce $b[40:40 + hdr_uint($b; 4; 4)][] as $x ({i: 0, v: 0, m: 1, out: []};
+                    (if .m == 72057594037927936 then .v += $x * .m | .done = true
+                     else .v += ($x % 128) * .m | .done = ($x < 128) | .m *= 128 end)
+                    | if .done | not then .
+                      else (if .v % 2 == 0 then .v / 2 else -(.v + 1) / 2 end) as $z
+                           | (if $z < 0 then .i -= $z
+                              elif $z == 0 then .i += 1
+                              else .out += [[.i, $z]] | .i += 1 end)
+                           | .v = 0 | .m = 1
+                      end)
+                | .out)};
+def hdr_merge:
+    if length == 0 then null
+    elif (map([.low, .sigfig]) | unique | length) > 1 then error("the interval histograms differ in their bounds")
+    else {low: .[0].low, sigfig: .[0].sigfig,
+          counts: ([.[].counts[]] | group_by(.[0]) | map([.[0][0], (map(.[1]) | add)]))}
+    end;
+# highest_equivalent_value of hdrhistogram for the bucket at counts index
+# $i: the value it reports for anything recorded in that bucket.
+def hdr_value($i):
+    ((2 * pow(10; .sigfig) | log2 | ceil) - 1) as $half_mag
+    | pow(2; $half_mag) as $half
+    | (.low | log2 | floor) as $unit
+    | (($i / $half | floor) - 1) as $bucket
+    | if $bucket < 0 then ($i + 1) * pow(2; $unit) - 1
+      else (($i % $half) + $half + 1) * pow(2; $bucket + $unit) - 1 end;
+# value_at_quantile of hdrhistogram: the highest value equivalent to the
+# bucket in which the running count reaches ceil(q * total).
+def hdr_quantile($q):
+    if . == null then null
+    else ([.counts[][1]] | add) as $total
+         | ([($q * $total | ceil), 1] | max) as $target
+         | hdr_value(first(foreach .counts[] as $e (0; . + $e[1]; if . >= $target then $e[0] else empty end)))
+    end;
+'
+
 # Repetitions of one block whose wanted arms are all valid in one attempt
 # (the latest such attempt of each repetition). An attempt may also hold
 # other arms (brisk-pt next to the gated ones) or only some of the wanted
-# ones (the rerun of Brisk and brisk-pt). Input: runs.jsonl, slurped.
+# ones (the rerun of Brisk and brisk-pt). An attempt in which a wanted arm
+# broke the connection rule (b) against its reference counts as invalid
+# too. Input: runs.jsonl, slurped; $checks: rep_checks.jsonl, slurped.
 # shellcheck disable=SC2016
 prog_select_reps='
 ($arms | split(" ")) as $want
+| [$checks[] | select(.scen == $s and .config == $c and .var == $v)
+   | select(any(.pairs[]; .ok == false and (.b | IN($want[])))) | [.rep, .attempt]] as $broken
 | [.[] | select(.scen == $s and .config == $c and .var == $v and .kind == "run")]
 | [group_by(.rep)[]
    | [group_by(.attempt)[]
+      | select([.[0].rep, .[0].attempt] | IN($broken[]) | not)
       | map(select(.arm | IN($want[])))
       | select(length == ($want | length)
                and all(.[]; .valid == true and .file != null)
@@ -898,8 +1018,11 @@ prog_ramp_pairs='
 # when A has none, no bound when neither has. The 7.5 rule over at least 3
 # pairs: PASS when every ratio is at least 0.85 (every low bound), FAIL when
 # their mean is below 0.85 (the mean of the high bounds), else UNCERTAIN,
-# which more pairs can settle unless a pair has no bound. A tool-limited
-# block is reported only, whatever its ratios.
+# which more pairs can settle unless a pair has no bound or B has no rate in
+# any pair: its high bounds then come from RAMP_START, not from B, and stay
+# at 0.85 or more while A stays close to RAMP_START. A tool-limited block is
+# reported only, whatever its ratios. $tool_arm names the direct arm whose
+# ramp gave the tool limit (tool_ramp_arm).
 # shellcheck disable=SC2016
 prog_ramp_verdict='
 def ramp_rate: if . == null then "<" + ($start | rate) else rate end;
@@ -939,17 +1062,24 @@ def ratio_text: if .lo == .hi then .lo | fixed3
    else
      # Tool-limited first: such a block is reported only, whatever else holds.
      (if $n == 0 then {verdict: "MISSING", note: "no pair of valid ramps"}
-      elif $limited == true then {verdict: "REPORT", note: "tool-limited: \($a) reached \($amax / $tool | pct) of the direct ramp"}
+      elif $limited == true then {verdict: "REPORT", note: "tool-limited: \($a) reached \($amax / $tool | pct) of the \($tool_arm) ramp"}
       elif $limited == null and $tool != null
       then {verdict: "UNCERTAIN",
             note: "\($a) has no sustainable step in any pair, and RAMP_START exceeds \($share) of the tool limit, so whether the block is tool-limited is unknown"}
-      elif $limited == null then {verdict: "UNCERTAIN", note: "tool limit unknown: no valid direct ramp"}
+      elif $limited == null then {verdict: "UNCERTAIN", note: "tool limit unknown: no valid \($tool_arm) ramp"}
       elif $n < 3 then {verdict: "UNCERTAIN", statistical: true, note: "\($n) pair(s), the rule needs 3"}
       elif all($bounds[]; .lo >= 0.85) then {verdict: "PASS"}
       elif all($bounds[]; .hi != null) and ([$bounds[].hi] | add / length) < 0.85 then {verdict: "FAIL"}
       elif $unbounded > 0
       then {verdict: "UNCERTAIN",
             note: "neither ramp of \($unbounded) pair(s) sustained RAMP_START (\($start | rate) req/s), so their ratios have no bound; lower RAMP_START"}
+      # B below RAMP_START in every pair, A with a rate in each (no unbounded
+      # pair): the ratios only have high bounds RAMP_START / A, 0.85 or more
+      # on average, and more pairs with B again below RAMP_START do not bring
+      # them lower while A stays close to RAMP_START.
+      elif all($pairs[]; .b.max_sustainable_rate == null)
+      then {verdict: "UNCERTAIN",
+            note: "\($b) sustained RAMP_START (\($start | rate) req/s) in no pair, so each ratio only has the high bound RAMP_START / \($a), whose mean \([$bounds[].hi] | add / length | fixed3) comes from RAMP_START rather than from \($b); more repetitions do not settle it, lower RAMP_START"}
       else {verdict: "UNCERTAIN", statistical: true} end)
      | . + {rule: "7.5 S2 throughput",
             rule_text: "rule: at least 3 pairs, every ratio >= 0.85 PASS, their mean < 0.85 FAIL"}
@@ -961,11 +1091,11 @@ def ratio_text: if .lo == .hi then .lo | fixed3
    extendable: ($v.counts and $v.verdict == "UNCERTAIN" and $v.statistical == true),
    text: ("\($block): max sustainable rate \($b)/\($a) per pair [\($rates)] req/s, ratios ["
           + ([$bounds[] | ratio_text] | join(", "))
-          + "]; direct tool limit \($tool | rate) req/s; \($v.rule_text): \($v.verdict)"
+          + "]; \($tool_arm) tool limit \($tool | rate) req/s; \($v.rule_text): \($v.verdict)"
           + (if $v.counts then " (gated\($note))"
              elif $session == "e1" then ""
              else " (reported\($note))" end)),
-   data: {tool: $tool, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
+   data: {tool: $tool, tool_arm: $tool_arm, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
 '
 
 # Sustainable rate per vCPU of the SUT, from the ramp pairs.
@@ -983,41 +1113,112 @@ def per_cpu: if . == null then null else . / $cpus end;
  data: {a: $ra, b: $rb, cpus: $cpus}}
 '
 
-# Upstream connection reuse of a block, 7.5: at least 99.9% in the steady
-# state. A run below MIN_REUSE is voided and its repetition rerun (6.2),
-# which keeps cold connections out of the comparisons but does not undo the
-# observation, so the verdict reads every run of the block, voided ones
-# included, and one run of a judged arm below 99.9% fails it. Judged are the
-# Brisk arms of the selection, whose property 7.5 states, or in a block
-# without one every arm but direct; the others are reported. A failed run
-# (loadgen or the SUT broke) has no steady state and is left out. Input: a
-# selection; $runs: runs.jsonl, slurped.
+# Connections of a block over the measurement window, by the rules of
+# docs/research/m1-reuse-rate.md (section 8.4), which replace the 99.9%
+# reuse floor of contract 05, 6.2 and 7.5: no floor holds in S1 even for
+# direct, since new connections follow from the seed's schedule and the
+# pool's idle limit. A run above MAX_NEW_CONN_RATE (a), or an attempt in
+# which an arm's connections differ from its reference's beyond the
+# tolerance (b, rep_checks.jsonl), is voided and rerun with the same seed.
+# A rerun repeats what the schedule causes, so a rule broken again points at
+# a defect: the verdict fails when a judged arm broke (a) in every run of a
+# repetition, or a pair with a judged arm broke (b) in every attempt of one,
+# instead of letting the repetition show up only as a missing comparison.
+# Judged are the Brisk arms, or in a block without one every arm but direct;
+# the others are reported. The other compared pairs, across pool policies
+# (against direct, floor-B against floor-A) or unchecked (Brisk against
+# brisk-pt), are reported only, as the difference of their cold request
+# shares per leg over the compared repetitions (c). A failed run (loadgen or
+# the SUT broke) has no steady state and is left out. Input: a selection;
+# $runs: runs.jsonl, $checks: rep_checks.jsonl, both slurped; $arms: the
+# block's arms; $checked: the pairs of rule (b), $reported: the other
+# compared pairs, both as reference:arm.
 # shellcheck disable=SC2016
 prog_reuse='
-[.runs | keys_unsorted[]] as $arms
-| ([$arms[] | select(startswith("brisk"))] | if length > 0 then . else [$arms[] | select(. != "direct")] end) as $judged
+def avg: if length == 0 then null else add / length end;
+def pairs_of($t): $t | split(" ") | map(select(length > 0) | split(":") | {a: .[0], b: .[1]});
+def spp: if . == null then "n/a" else (. * 100 | signed) + " pp" end;
+def broke($what; $unit):
+    if .over == 0 then ""
+    elif (.persistent_reps | length) > 0
+    then ", \(.over) \($what), in every \($unit) of repetition(s) \(.persistent_reps | map(tostring) | join(", "))"
+    else ", \(.over) \($what) and rerun" end;
+($arms | split(" ")) as $arm_list
+| ([$arm_list[] | select(startswith("brisk"))] | if length > 0 then . else [$arm_list[] | select(. != "direct")] end) as $judged
+| (if .pt == null then . else .runs["brisk-pt"] = .pt.runs["brisk-pt"] end) as $sel
 | [$runs[] | select(.scen == $s and .config == $c and .var == $v and .kind == "run" and .failed != true
-                    and (.reuse.rate | type) == "number")] as $all
-| [$arms[] as $arm
+                    and (.reuse.new_per_s | type) == "number")] as $all
+| [$arm_list[] as $arm
    | [$all[] | select(.arm == $arm)] as $r
-   | {arm: $arm, judged: ($arm | IN($judged[])), runs: ($r | length), lowest: ([$r[].reuse.rate] | min),
-      below: ([$r[] | select(.reuse.rate < 0.999)] | length),
-      voided_below: ([$r[] | select(.reuse.rate < 0.999 and .valid != true)] | length)}] as $by
+   | [($sel.runs[$arm] // [])[].reuse] as $u
+   | {arm: $arm, judged: ($arm | IN($judged[])), runs: ($r | length),
+      max_per_s: ([$r[].reuse.new_per_s] | max),
+      over: ([$r[] | select(.reuse.new_per_s > $max)] | length),
+      persistent_reps: [$r | group_by(.rep)[] | select(all(.[]; .reuse.new_per_s > $max)) | .[0].rep],
+      compared: ($u | length),
+      new_conns: ([$u[].new_conns | numbers] | avg),
+      new_per_s: ([$u[].new_per_s | numbers] | avg),
+      reuse: ([$u[].rate | numbers] | avg),
+      inbound_fresh: ([$u[].inbound_fresh | numbers] | avg),
+      idle_closed: ([$u[].idle_closed | numbers] | avg),
+      fresh_ttft_p50_us: ([$u[].fresh_conn_ttft.p50_us | numbers] | avg),
+      fresh_ttft_p99_us: ([$u[].fresh_conn_ttft.p99_us | numbers] | avg),
+      cold_ratio: ([$u[].cold_ratio | numbers] | avg)}] as $by
+| [$checks[] | select(.scen == $s and .config == $c and .var == $v)
+   | .rep as $rep | .pairs[] | select(.ok != null) | . + {rep: $rep}] as $pc
+| [pairs_of($checked)[] as $p
+   | [$pc[] | select(.a == $p.a and .b == $p.b)] as $k
+   | {a: $p.a, b: $p.b, judged: ($p.b | IN($judged[])), checks: ($k | length),
+      over: ([$k[] | select(.ok == false)] | length),
+      max_inbound: ([$k[].inbound.diff | numbers | absv] | max),
+      max_upstream: ([$k[].upstream.diff | numbers | absv] | max),
+      tolerance: ([$k[].tolerance | numbers] | {min: min, max: max}),
+      persistent_reps: [$k | group_by(.rep)[] | select(all(.[]; .ok == false)) | .[0].rep]}] as $bp
+| [pairs_of($reported)[] as $p
+   | (if $p.a == "brisk-pt" or $p.b == "brisk-pt" then .pt else . end) as $ps
+   | ($ps.runs[$p.a] // []) as $ra
+   | ($ps.runs[$p.b] // []) as $rb
+   | [range(0; [($ra | length), ($rb | length)] | min) as $i
+      | $ra[$i].reuse as $x
+      | $rb[$i].reuse as $y
+      | select($x.requests > 0 and $y.requests > 0 and $x.new_conns != null and $y.new_conns != null)
+      | {pair_id: $rb[$i].pair_id,
+         inbound: (if $x.inbound_fresh == null or $y.inbound_fresh == null then null
+                   else $y.inbound_fresh / $y.requests - $x.inbound_fresh / $x.requests end),
+         upstream: ($y.new_conns / $y.requests - $x.new_conns / $x.requests),
+         cold: (if $x.cold_ratio == null or $y.cold_ratio == null then null
+                else $y.cold_ratio - $x.cold_ratio end)}] as $d
+   | {a: $p.a, b: $p.b, pairs: ($d | length), inbound: ([$d[].inbound | numbers] | avg),
+      upstream: ([$d[].upstream | numbers] | avg), cold: ([$d[].cold | numbers] | avg), per_pair: $d}] as $cp
 | [$by[] | select(.judged)] as $j
 | (if ($j | length) == 0 or any($j[]; .runs == 0) then "MISSING"
-   elif all($j[]; .below == 0) then "PASS"
-   else "FAIL" end) as $verdict
+   elif any($j[]; (.persistent_reps | length) > 0) or any($bp[]; .judged and (.persistent_reps | length) > 0)
+   then "FAIL"
+   else "PASS" end) as $verdict
 | {id: "\($block):reuse", block: $block, kind: "reuse", rule: "7.5 reuse", verdict: $verdict,
    gated: ($scope == "gated"), extendable: false,
-   text: ("\($block) upstream connection reuse over the window, lowest per arm over all its runs, voided ones included: "
-          + ([$by[] | "\(.arm) \(.lowest | pct4) (\(.runs) run(s)"
-                      + (if .below == 0 then ""
-                         else ", \(.below) below 99.9%"
-                              + (if .voided_below > 0 then ", \(.voided_below) of them voided and rerun" else "" end) end)
-                      + (if .judged then "" else ", reported" end) + ")"] | join(", "))
-          + "; limit >= 99.9% in every run of \($judged | join(", ")): \($verdict)"
+   text: ("\($block) connections over the window, mean per compared run: "
+          + ([$by[] | "\(.arm) (\(.compared) run(s)): upstream \(.new_conns | fixed1) new (\(.new_per_s | fixed3)/s, reuse \(.reuse | pct4)),"
+                      + " inbound \(.inbound_fresh | fixed1) fresh, \(.idle_closed | fixed1) closed idle by the peer over the whole run,"
+                      + " TTFT on fresh connections p50 \(.fresh_ttft_p50_us | fixed1) us, p99 \(.fresh_ttft_p99_us | fixed1) us,"
+                      + " cold \(.cold_ratio | pct4) of the requests"] | join("; "))
+          + "; rule (a) at most \($max) new upstream connection(s)/s in a run: "
+          + ([$by[] | "\(.arm) max \(.max_per_s | fixed3)/s over \(.runs) run(s)" + broke("above"; "run")
+                      + (if .judged then "" else ", reported" end)] | join(", "))
+          + (if ($bp | length) == 0 then ""
+             else "; rule (b) arm against reference in a repetition, largest difference in new connections: "
+                  + ([$bp[] | "\(.b) vs \(.a) inbound \(.max_inbound | fixed1), upstream \(.max_upstream | fixed1) over \(.checks) attempt(s), tolerance "
+                              + ((.tolerance.min | fixed1) as $lo | (.tolerance.max | fixed1) as $hi
+                                 | if $lo == $hi then $lo else "\($lo) to \($hi)" end)
+                              + broke("outside"; "attempt")
+                              + (if .judged then "" else ", reported" end)] | join(", ")) end)
+          + (if ($cp | length) == 0 then ""
+             else "; reported only (c), cold request share B - A per compared repetition, inbound leg, upstream leg, both: "
+                  + ([$cp[] | "\(.b) vs \(.a) \(.inbound | spp), \(.upstream | spp), \(.cold | spp) over \(.pairs) pair(s)"]
+                     | join("; ")) end)
+          + "; verdict on \($judged | join(", ")): \($verdict)"
           + (if $scope == "gated" then " (gated)" else " (reported)" end)),
-   data: $by}
+   data: {limit_per_s: $max, arms: $by, checked_pairs: $bp, reported_pairs: $cp}}
 '
 
 # CPU of the SUT per chunk or request, per arm. Input: a selection.
@@ -1081,11 +1282,12 @@ prog_perf_report='
                          then ([$p.counts | to_entries[]
                                 | "\(.key) \(.value | rate) (\($p.per_request[.key] | fixed3)/request)"]
                                | join(", "))
-                         else "not counted (\($p.reason))" end)]
+                         else "not counted (\($p.reason))" end)
+                      + (if .failed then " (the perf run failed: \(.reasons | join("; ")))" else "" end)]
                    | join("; "))
              end)
           + $hitm_note),
-   data: [$recs[] | {arm, perf, requests: .sut.requests}]}
+   data: [$recs[] | {arm, failed, reasons, perf, requests: .sut.requests}]}
 '
 
 # E11 on S1 chunk_latency p99 (contract 05, 6.3).
@@ -1181,7 +1383,7 @@ last_by(.id) as $all
      | if ($e | length) == 0
        then {verdict: "UNDECIDED", text: "E4 decision: undecided, no S1 comparison"}
        elif all($e[]; .verdict == "PASS")
-       then {verdict: "KEEP_2S", text: "E4 decision: keep commit_hold 2s (|TTFT delta p50| <= 10 us and delta p99 <= 30 us everywhere)"}
+       then {verdict: "KEEP_2S", text: "E4 decision: keep commit_hold 2s (ttft_reused |delta p50| <= 10 us and delta p99 <= 30 us everywhere)"}
        elif any($e[]; .verdict == "FAIL")
        then {verdict: "COST", text: "E4 decision: commit_hold 2s exceeds the limits; record the cost for the owner to decide"}
        else {verdict: "UNCERTAIN", text: "E4 decision: uncertain; some intervals straddle the limits or are missing"}
@@ -1268,25 +1470,54 @@ def window_counts($ws; $we):
                             then ($mid - $idle) / 1024 / ($streams / 1000) else null end)}
 '
 
-# Upstream connection reuse at the arm's mock since the window's reset. The
-# statistics request's own connection is the one accept left out.
+# Connections of one run over its measurement window, from the reset of the
+# mock statistics ($reset_at, empty when it failed) to their read
+# ($stats_at), both Unix times. Upstream: the arm's mock's accepts less the
+# statistics request's own connection are its new connections (rule (a):
+# at most $max per window second), its requests the window's requests,
+# Brisk's periodic warmup requests included. Inbound: loadgen's connections
+# opened after its warmup (fresh_conn_sends), with the TTFT of the requests
+# sent on them, and the connections a peer closed while idle in its pool
+# (idle_closed, over the whole run). For direct ($direct) both are the same
+# connections, so its cold requests are the upstream new connections alone;
+# a SUT arm's add both legs. Input: $m: the mock statistics by mock; $r: the
+# result file, slurped (empty without one).
 # shellcheck disable=SC2016
 prog_reuse_evidence='
-$m[$n] as $s
-| if ($ok | not)
-  then {mock: $n, accepts: null, requests: null, rate: null, ok: false,
-        reason: "the mock statistics were not reset at the start of the window"}
+def num: if . == "" then null else tonumber end;
+$r[0].loadgen as $lg
+| $m[$n] as $s
+| ($reset_at | num) as $t0
+| ($stats_at | num) as $t1
+| (if $t0 != null and $t1 != null then $t1 - $t0 else null end) as $w
+| $lg.diagnostics.fresh_conn_ttft as $ft
+| {mock: $n, window_s: $w, accepts: $s.accepts, requests: $s.requests,
+   inbound_fresh: $lg.diagnostics.fresh_conn_sends, idle_closed: $lg.counters.idle_closed,
+   fresh_conn_ttft: (if $ft == null then null
+                     else {count: $ft.count, p50_us: ($ft.p50_ns / 1000), p99_us: ($ft.p99_ns / 1000)} end),
+   new_conns: null, new_per_s: null, rate: null, cold_requests: null, cold_ratio: null} as $e
+| if $t0 == null
+  then $e + {ok: false, reason: "the mock statistics were not reset at the start of the window"}
   elif $s == null
-  then {mock: $n, accepts: null, requests: null, rate: null, ok: false, reason: "no statistics of \($n)"}
-  else ([$s.accepts - 1, 0] | max) as $acc
+  then $e + {ok: false, reason: "no statistics of \($n)"}
+  elif ($s.accepts | type) != "number" or $s.accepts < 1
+  then $e + {ok: false, reason: "\($n) counts \($s.accepts) accepts, not even the statistics request of its own"}
+  elif $w <= 0
+  then $e + {ok: false, reason: "the window from the reset of \($n) to the read of its statistics lasted \($w) s"}
+  else ($s.accepts - 1) as $new
+       | ($new / $w) as $per_s
+       | $e + {new_conns: $new, new_per_s: $per_s}
        | if $s.requests == 0
-         then {mock: $n, accepts: $acc, requests: 0, rate: null, ok: false,
-               reason: "no request reached \($n) in the window"}
-         else (1 - $acc / $s.requests) as $rate
-              | {mock: $n, accepts: $acc, requests: $s.requests, rate: $rate, ok: ($rate >= $min),
-                 reason: (if $rate >= $min then null
-                          else "upstream connection reuse \($rate | pct4) below MIN_REUSE \($min | pct4) (\($acc) accepts, \($s.requests) requests)"
-                          end)}
+         then . + {ok: false, reason: "no request reached \($n) in the window"}
+         else (if $direct then $new
+               elif $e.inbound_fresh == null then null
+               else $e.inbound_fresh + $new end) as $cold
+              | . + {rate: (1 - $new / $s.requests), cold_requests: $cold,
+                     cold_ratio: (if $cold == null then null else $cold / $s.requests end),
+                     ok: ($per_s <= $max),
+                     reason: (if $per_s <= $max then null
+                              else "\($new) new upstream connections at \($n) in the \($w | fixed1) s window, \($per_s | fixed3)/s, above MAX_NEW_CONN_RATE \($max)/s"
+                              end)}
          end
   end
 '
@@ -1310,58 +1541,7 @@ $m[$n] as $s
 # step and answered in the next counts in the next, a negligible share of
 # a 20 s step. Input: a result file.
 # shellcheck disable=SC2016
-prog_ramp_evidence='
-def hdr_bytes:
-    [explode[] | if . >= 65 and . <= 90 then . - 65 elif . >= 97 and . <= 122 then . - 71
-                 elif . >= 48 and . <= 57 then . + 4 elif . == 43 then 62 elif . == 47 then 63
-                 else empty end] as $s
-    | ($s | length * 3 / 4 | floor) as $n
-    # The sextets a padded end lacks are zero bits, and the bytes they fill
-    # are cut off below.
-    | [range(0; $s | length; 4) as $i
-       | ($s[$i] * 262144 + ($s[$i + 1] // 0) * 4096 + ($s[$i + 2] // 0) * 64 + ($s[$i + 3] // 0)) as $w
-       | ($w / 65536 | floor), (($w / 256 | floor) % 256), ($w % 256)]
-    | .[:$n];
-def hdr_uint($b; $at; $len): reduce $b[$at:$at + $len][] as $x (0; . * 256 + $x);
-def hdr_decode:
-    hdr_bytes as $b
-    | if hdr_uint($b; 0; 4) != 478450451
-      then error("an interval histogram is not an uncompressed HDR V2 serialization") else . end
-    | {low: hdr_uint($b; 16; 8), sigfig: hdr_uint($b; 12; 4),
-       # [index, count] of the non-empty buckets: LEB128 varints (7 bits a
-       # byte, all 8 in a ninth) of ZigZag i64s, a negative one a run of
-       # empty buckets.
-       counts: (reduce $b[40:40 + hdr_uint($b; 4; 4)][] as $x ({i: 0, v: 0, m: 1, out: []};
-                    (if .m == 72057594037927936 then .v += $x * .m | .done = true
-                     else .v += ($x % 128) * .m | .done = ($x < 128) | .m *= 128 end)
-                    | if .done | not then .
-                      else (if .v % 2 == 0 then .v / 2 else -(.v + 1) / 2 end) as $z
-                           | (if $z < 0 then .i -= $z
-                              elif $z == 0 then .i += 1
-                              else .out += [[.i, $z]] | .i += 1 end)
-                           | .v = 0 | .m = 1
-                      end)
-                | .out)};
-def hdr_merge:
-    if length == 0 then null
-    elif (map([.low, .sigfig]) | unique | length) > 1 then error("the interval histograms differ in their bounds")
-    else {low: .[0].low, sigfig: .[0].sigfig,
-          counts: ([.[].counts[]] | group_by(.[0]) | map([.[0][0], (map(.[1]) | add)]))}
-    end;
-# value_at_quantile of hdrhistogram: the highest value equivalent to the
-# bucket in which the running count reaches ceil(q * total).
-def hdr_quantile($q):
-    if . == null then null
-    else ((2 * pow(10; .sigfig) | log2 | ceil) - 1) as $half_mag
-         | pow(2; $half_mag) as $half
-         | (.low | log2 | floor) as $unit
-         | ([.counts[][1]] | add) as $total
-         | ([($q * $total | ceil), 1] | max) as $target
-         | first(foreach .counts[] as $e (0; . + $e[1]; if . >= $target then $e[0] else empty end)) as $i
-         | (($i / $half | floor) - 1) as $bucket
-         | if $bucket < 0 then ($i + 1) * pow(2; $unit) - 1
-           else (($i % $half) + $half + 1) * pow(2; $bucket + $unit) - 1 end
-    end;
+prog_ramp_evidence="$jq_hdr"'
 def step_rule:
     test("^emit lag p99(\\.9)? [0-9.]+ us over [0-9]+ sends ") or test("^mock write lag p99 [0-9.]+ us is not below ")
     or test("^[0-9]+ of [0-9]+ requests after the warmup failed ") or test("^[0-9]+ stale keep-alive retries for ");
@@ -1454,7 +1634,10 @@ def kv: split("\n") | map(select(test("=")) | capture("^(?<k>[^=]+)=(?<v>.*)$") 
    virtual_key: (if $key_sha256 == "" then null else {name: $key_name, sha256: $key_sha256} end),
    cpu_method: "per CPU: busy = 1 - (idle + iowait) / wall clock, steal = /proc/stat steal ticks / wall clock, softirq as /proc/softirqs events; per process and SUT: utime + stime over the window",
    selfcheck: $selfcheck, selfcheck_detail: $selfcheck_detail,
-   perf: {status: $perf_status, reason: $perf_reason, events: $perf_events, hitm_events: $perf_hitm},
+   perf: {status: $perf_status, reason: $perf_reason, events: $perf_events, hitm_events: $perf_hitm,
+          c21_status: $c21_status, c21_reason: $c21_reason,
+          failed_runs: [$runs[] | select(.kind == "perf" and .failed == true)
+                        | {tag, config, arm, reasons, c21_status: .perf.c21.status, c21_reason: .perf.c21.reason}]},
    invalid_runs: $invalid, retries: $retries, extensions: $extensions, failed_runs: $failed,
    evaluation_errors: $evaluation_errors,
    gated: {pass: ([$final[] | select(.gated and .verdict == "PASS")] | length),
@@ -1710,7 +1893,8 @@ reset_live_mocks() {
 }
 
 # Background sampler of one run's measurement window. After <offset>
-# seconds it resets the mock statistics (marker <tag>.reset-ok), records the
+# seconds it resets the mock statistics (marker <tag>.reset-ok, holding the
+# Unix time right after the reset, where the reuse window starts), records the
 # load generator's thread placement, snapshots CPU and interrupt counters and,
 # with <perf>, starts perf stat on the SUT for the window, with <c21> the C21
 # profile of SUT_CPUS (c21_evidence reads it); <mid> seconds later
@@ -1730,7 +1914,7 @@ sample_window() {
     nap_pid=$!
     wait "$nap_pid"
     if reset_live_mocks; then
-        : >"$logs/$tag.reset-ok"
+        date +%s.%N >"$logs/$tag.reset-ok"
     fi
     fingerprint_proc loadgen "$tag"
     cat /proc/interrupts >"$logs/$tag.irq-a"
@@ -1946,7 +2130,7 @@ execute_run() {
     local measure="${run_ctx[measure]}" open="${run_ctx[open_window]}" perf="${run_ctx[perf]}"
     local staged="${run_ctx[staged]}" result="${run_ctx[result]}" logs="$run_dir/logs"
     local started rc window=0 mid=0 i name stats mockstats="{}" sut_died=0 failed=0
-    local cpu=null net reset_ok=false sut=null reuse=null ramp=null perf_ev=null
+    local cpu=null net reset_at="" stats_at sut=null reuse=null ramp=null perf_ev=null
     local roles="$roles_scenario" steal balance harness valid
     local -a reasons=() sampled=(mock-plain mock-tls mock-sc sut loadgen)
     run_ok=1
@@ -1987,6 +2171,9 @@ execute_run() {
     fi
     net_snapshot "$logs/$tag.net-b"
     net="$(net_delta "$logs/$tag.net-a" "$logs/$tag.net-b")"
+    # The end of the reuse window, whose length the new connections per
+    # second divide by.
+    stats_at="$(date +%s.%N)"
     for name in mock-plain mock-tls mock-sc; do
         alive "$name" || continue
         stats="$(mock_get "$name" /__bench/stats)" || die "reading the $name statistics failed"
@@ -1997,7 +2184,7 @@ execute_run() {
         stop_proc sut
     fi
     if [[ -f "$logs/$tag.reset-ok" ]]; then
-        reset_ok=true
+        reset_at="$(<"$logs/$tag.reset-ok")"
     fi
     finalize_result "$staged" "$result"
     scrub_file "$logs/$tag.out"
@@ -2014,8 +2201,15 @@ execute_run() {
         failed=1
         reasons+=("the process under test exited during the run (logs/$tag.sut.log)")
     fi
+    # The perf runs are reported only (7.5 HITM, C21): a failed one shows in
+    # the perf and C21 reports and the manifest's perf field, and leaves the
+    # session's exit status alone.
     if ((failed)); then
-        failed_runs=$((failed_runs + 1))
+        if [[ "${run_ctx[kind]}" == perf ]]; then
+            log "  $tag: the perf run failed; it is reported only and does not count as a failed run"
+        else
+            failed_runs=$((failed_runs + 1))
+        fi
     fi
     # compare reads the repetitions of S1, S2 and S3; a run it would refuse
     # is rerun here instead of costing the block its comparisons.
@@ -2033,11 +2227,19 @@ execute_run() {
         fi
     fi
     if [[ "${run_ctx[check_reuse]}" == 1 ]]; then
-        reuse="$(jq -nc --argjson m "$mockstats" --arg n "${run_ctx[arm_mock]}" --argjson ok "$reset_ok" \
-            --argjson min "$MIN_REUSE" "$jq_defs$prog_reuse_evidence")"
+        local doc=/dev/null direct=false
+        if [[ -f "$result" ]]; then
+            doc="$result"
+        fi
+        if direct_arm "${run_ctx[arm]}"; then
+            direct=true
+        fi
+        reuse="$(jq -nc --argjson m "$mockstats" --arg n "${run_ctx[arm_mock]}" --arg reset_at "$reset_at" \
+            --arg stats_at "$stats_at" --argjson direct "$direct" --argjson max "$MAX_NEW_CONN_RATE" \
+            --slurpfile r "$doc" "$jq_defs$prog_reuse_evidence")"
         # A ramp raises the load step by step, so new upstream connections
-        # belong to it; only the steady load of S1, S2 and S3 is held to the
-        # reuse limit.
+        # belong to it; only the steady load of S1, S2 and S3 is held to
+        # rule (a).
         if [[ "$scen" != ramp && "$(jq -r '.ok' <<<"$reuse")" != true ]]; then
             reasons+=("$(jq -r '.reason' <<<"$reuse")")
         fi
@@ -2064,7 +2266,7 @@ execute_run() {
         log "  $tag: SUT $(jq -r "$jq_defs"'"CPU \(.cpu_s | fixed3) s over \(.window_s | fixed1) s: \(.cpu_us_per_chunk | fixed3) us/chunk, \(.cpu_us_per_request | fixed3) us/request; RSS idle \(.idle_rss_kib | mib | fixed1) MiB, middle \(.mid_rss_kib | mib | fixed1) MiB"' <<<"$sut")"
     fi
     if [[ "$reuse" != null ]]; then
-        log "  $tag: reuse $(jq -r "$jq_defs"'"\(.rate | pct4) at \(.mock) (\(.accepts) accepts, \(.requests) requests)"' <<<"$reuse")"
+        log "  $tag: connections $(jq -r "$jq_defs"'"upstream \(.new_conns // "n/a") new at \(.mock) in \(.window_s | fixed1) s (\(.new_per_s | fixed3)/s, reuse \(.rate | pct4) of \(.requests // "n/a") requests); inbound \(.inbound_fresh // "n/a") fresh after the warmup, \(.idle_closed // "n/a") closed idle by the peer over the run, TTFT on fresh connections p50 \(.fresh_conn_ttft.p50_us | fixed1) us, p99 \(.fresh_conn_ttft.p99_us | fixed1) us; cold \(.cold_ratio | pct4) of the requests"' <<<"$reuse")"
     fi
     if [[ "$ramp" != null ]]; then
         log "  $tag: ramp $(jq -r "$jq_defs"'"sustainable \(.max_sustainable_rate | rate) req/s (step \(.last_step // "n/a") of \(.steps_judged) judged; \(.stopped_by))"
@@ -2402,12 +2604,112 @@ run_arm() {
     execute_run
 }
 
+# The arm pairs of rule (b), as reference:arm: every arm against the first
+# of the given arms (in the session's order) with its connection pool
+# policy. floor-A and Brisk share brisk_gateway's server layer (inbound
+# connections closed after 30 s idle) and build_client (reqwest: upstream
+# connections dropped after 90 s idle); floor-B keeps its upstream
+# connections without an idle limit, and direct is loadgen's own pool, which
+# never drops one. So gate pairs Brisk and brisk-pt with floor-A, e1, e2 and
+# e4 the second arm with the first, and e11 nothing.
+rep_pairs() {
+    local arm policy
+    local -A reference=()
+    local -a pairs=()
+    for arm in "$@"; do
+        case "$arm" in
+            floor-a | brisk*) policy=reqwest-idle-90s ;;
+            floor-b) policy=lifo-unbounded ;;
+            direct | direct-tls) policy=loadgen ;;
+            *) die "no connection pool policy for arm $arm" ;;
+        esac
+        if [[ -z "${reference[$policy]:-}" ]]; then
+            reference[$policy]="$arm"
+        else
+            pairs+=("${reference[$policy]}:$arm")
+        fi
+    done
+    echo "${pairs[*]}"
+}
+
+# Rule (b) on one attempt of a repetition: each checked arm run in the
+# attempt against its reference's latest run of the repetition (the one of
+# the attempt, or of the gated arms' attempt when only Brisk and brisk-pt
+# were rerun). Both legs, inbound (loadgen's fresh connections) and upstream
+# (the mock's new ones), may differ by at most max($slack_min, $slack_frac x
+# the smaller window request count at the mock). Arms of one policy under
+# one seed open about the same connections (docs/research/m1-reuse-rate.md,
+# section 5), so a larger difference is an anomaly or a defect, and it would
+# give the two arms different cold request shares. A leg without counts
+# leaves the pair unchecked (ok null); such a run is invalid already.
+# Input: runs.jsonl, slurped; $pairs: rep_pairs.
+# shellcheck disable=SC2016
+prog_rep_pairs='
+def leg($x; $y; $tol):
+    if $x == null or $y == null then null
+    else {a: $x, b: $y, diff: ($y - $x), ok: ((($y - $x) | absv) <= $tol)} end;
+[.[] | select(.kind == "run" and .scen == $s and .config == $c and .var == $v and .rep == $rep
+              and .attempt <= $attempt)] as $mine
+| [$pairs | split(" ")[] | select(length > 0) | split(":") | {a: .[0], b: .[1]} as $p
+   | ([$mine[] | select(.arm == $p.b and .attempt == $attempt)] | last) as $rb
+   | select($rb != null)
+   | ([$mine[] | select(.arm == $p.a)] | max_by(.attempt)) as $ra
+   | [$ra.reuse.requests, $rb.reuse.requests] as $q
+   | (if all($q[]; type == "number") then $q | min else null end) as $req
+   | (if $req == null then null else [$slack_min, $slack_frac * $req] | max end) as $tol
+   | (if $tol == null then null else leg($ra.reuse.inbound_fresh; $rb.reuse.inbound_fresh; $tol) end) as $in
+   | (if $tol == null then null else leg($ra.reuse.new_conns; $rb.reuse.new_conns; $tol) end) as $up
+   | {a: $p.a, b: $p.b, a_tag: $ra.tag, b_tag: $rb.tag, requests: $req, tolerance: $tol,
+      inbound: $in, upstream: $up,
+      ok: (if $in.ok == false or $up.ok == false then false
+           elif $in == null or $up == null then null
+           else true end)}
+   | . + {reason: (if .ok == true then null
+                   elif .ok == false
+                   then "\(.b) differs from \(.a) by \(.inbound.diff // "n/a") inbound and \(.upstream.diff // "n/a") upstream new connections, tolerance \(.tolerance | fixed1)"
+                   elif $ra == null then "no run of \(.a) in the repetition"
+                   else "no connection counts of \(if $in == null and $up == null then "either leg"
+                                                   elif $in == null then "the inbound leg" else "the upstream leg" end)"
+                   end)}]
+| {block: $block, scen: $s, config: $c, var: $v, rep: $rep, attempt: $attempt, pairs: .,
+   ok: (if any(.[]; .ok == false) then false elif length > 0 and all(.[]; .ok == true) then true else null end)}
+'
+jq_programs+=(prog_rep_pairs)
+
+# Checks rule (b) on attempt <attempt> of a repetition of the given arms
+# (prog_rep_pairs), appends the result to rep_checks.jsonl, logs it and sets
+# pair_violations to the checked arms outside the tolerance. A ramp's load
+# keeps rising, so its pairs are not checked.
+check_rep_pairs() {
+    local scen="$1" config="$2" var="$3" rep="$4" attempt="$5" pairs record block
+    shift 5
+    pair_violations=()
+    [[ "$scen" != ramp ]] || return 0
+    pairs="$(rep_pairs "$@")"
+    [[ -n "$pairs" ]] || return 0
+    block="$(block_name "$scen" "$config" "$var")"
+    record="$(jq -sc --arg s "$scen" --arg c "$config" --arg v "$var" --argjson rep "$rep" \
+        --argjson attempt "$attempt" --arg block "$block" --arg pairs "$pairs" \
+        --argjson slack_min "$PAIR_CONN_SLACK_MIN" --argjson slack_frac "$PAIR_CONN_SLACK_FRAC" \
+        "$jq_defs$prog_rep_pairs" "$run_dir/runs.jsonl")" ||
+        die "checking rule (b) on $block repetition $rep, attempt $attempt failed"
+    [[ "$(jq -r '.pairs | length' <<<"$record")" != 0 ]] || return 0
+    printf '%s\n' "$record" >>"$run_dir/rep_checks.jsonl"
+    jq -r "$jq_defs"'.pairs[]
+        | "  connections \(.b) vs \(.a): inbound \(.inbound.b // "n/a") vs \(.inbound.a // "n/a"), upstream \(.upstream.b // "n/a") vs \(.upstream.a // "n/a"), tolerance \(.tolerance | fixed1): "
+          + (if .ok == true then "within" elif .ok == false then "OUTSIDE, \(.b) counts as invalid in this attempt" else "not checked, \(.reason)" end)' \
+        <<<"$record" | while IFS= read -r line; do log "$line"; done
+    mapfile -t pair_violations < <(jq -r '.pairs[] | select(.ok == false) | .b' <<<"$record")
+}
+
 # All arms of one repetition in the Latin square order. A repetition whose
 # gated arms are not all valid (or one failed) is rerun, all arms with the
 # same seed and order. brisk-pt is reported only: once the gated
 # arms are valid, an invalid brisk-pt (or Brisk next to it) reruns just Brisk
 # and brisk-pt at their positions, so that it never costs the gated
 # comparisons a repetition. Both kinds of rerun count against RETRY_INVALID.
+# An arm outside the connection tolerance of rule (b) counts as an invalid
+# run of its attempt.
 run_rep() {
     local scen="$1" config="$2" var="$3" rep="$4" attempt=0 arm pos gated_ok=0 pt_ok=1
     local attempt_gated attempt_pt
@@ -2431,6 +2733,11 @@ run_rep() {
                 [[ "$arm" != brisk && "$arm" != brisk-pt ]] || attempt_pt=0
             fi
         done
+        check_rep_pairs "$scen" "$config" "$var" "$rep" "$attempt" "$@"
+        for arm in "${pair_violations[@]}"; do
+            [[ "$arm" == brisk-pt ]] || attempt_gated=0
+            [[ "$arm" != brisk && "$arm" != brisk-pt ]] || attempt_pt=0
+        done
         # The gated arms are compared from one attempt, so only an attempt
         # of all arms decides them.
         if ((${#run_set[@]} == ${#order[@]})); then
@@ -2447,6 +2754,9 @@ run_rep() {
                 log "  repetition $rep still has an invalid run after $attempt rerun(s); comparisons will leave it out"
             else
                 log "  Brisk and brisk-pt of repetition $rep are still not valid together after $attempt rerun(s); the strip cost comparison will leave it out"
+            fi
+            if ((${#pair_violations[@]} > 0)); then
+                log "  ${pair_violations[*]} of repetition $rep still outside the connection tolerance of rule (b) after $attempt rerun(s); the block's reuse verdict fails an arm that broke it in every attempt"
             fi
             return 0
         fi
@@ -2517,14 +2827,14 @@ select_reps() {
     for arm in $4; do
         [[ "$arm" == brisk-pt ]] || gated+=("$arm")
     done
-    selection="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "${gated[*]}" "$prog_select_reps" \
-        "$run_dir/runs.jsonl")"
+    selection="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "${gated[*]}" \
+        --slurpfile checks "$run_dir/rep_checks.jsonl" "$prog_select_reps" "$run_dir/runs.jsonl")"
     if [[ " $4 " != *" brisk-pt "* ]]; then
         printf '%s\n' "$selection"
         return 0
     fi
-    pt="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "brisk brisk-pt" "$prog_select_reps" \
-        "$run_dir/runs.jsonl")"
+    pt="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "brisk brisk-pt" \
+        --slurpfile checks "$run_dir/rep_checks.jsonl" "$prog_select_reps" "$run_dir/runs.jsonl")"
     jq -c --argjson pt "$pt" '. + {pt: $pt}' <<<"$selection"
 }
 
@@ -2681,12 +2991,23 @@ check_delta() {
         "$jq_defs$prog_check_delta")"
 }
 
-# Upstream connection reuse of the selection's arms over every run of the
-# block (prog_reuse).
+# The connection rules of the block's arms over every run of the block, and
+# the cold request shares of its other compared pairs (prog_reuse).
 report_reuse() {
-    local block="$1" selection="$2" scope="$3" scen="$4" config="$5" var="$6"
-    add_verdict "$(jq -c --slurpfile runs "$run_dir/runs.jsonl" --arg block "$block" --arg scope "$scope" \
-        --arg s "$scen" --arg c "$config" --arg v "$var" "$jq_defs$prog_reuse" <<<"$selection")"
+    local block="$1" selection="$2" scope="$3" scen="$4" config="$5" var="$6" checked pair a b
+    local -a reported=()
+    shift 6
+    checked="$(rep_pairs "$@")"
+    for pair in ${session_compares[$SESSION]}; do
+        a="${pair%%:*}" b="${pair#*:}"
+        if in_list "$a" "$@" && in_list "$b" "$@" && [[ " $checked " != *" $pair "* ]]; then
+            reported+=("$pair")
+        fi
+    done
+    add_verdict "$(jq -c --slurpfile runs "$run_dir/runs.jsonl" --slurpfile checks "$run_dir/rep_checks.jsonl" \
+        --arg block "$block" --arg scope "$scope" --arg s "$scen" --arg c "$config" --arg v "$var" \
+        --arg arms "$*" --arg checked "$checked" --arg reported "${reported[*]}" \
+        --argjson max "$MAX_NEW_CONN_RATE" "$jq_defs$prog_reuse" <<<"$selection")"
 }
 
 # CPU per chunk (S1) or per request (S2, S3) of every SUT arm, and between
@@ -2720,6 +3041,56 @@ report_memory() {
     local block="$1" selection="$2" report_selection
     report_selection="$(pt_report_selection "$selection")"
     add_verdict "$(jq -c --arg block "$block" --arg session "$SESSION" "$jq_defs$prog_memory" <<<"$report_selection")"
+}
+
+# The requests of an S1 block whose TTFT exceeds 1 s, per arm, from the ttft
+# histograms of the intervals: after the warmup, the window ttft is compared
+# over, and over the whole run. A request counts when the highest value
+# equivalent to its bucket, the value compare reports for it, exceeds 1 s
+# (the buckets there are about 0.5 ms wide). The floor arms of M0 had such
+# requests and direct none; in their reproduction every one had waited
+# behind another stream on a pooled upstream connection until that stream
+# ended, by a race in the HTTP/1 client of hyper 1.11.1, which Brisk
+# shares. The counts compare runs before and after its fix. The threshold assumes a mock TTFT far below 1 s
+# (S1_TTFT_US, in e4 E4_TTFTS_US); one near it would count ordinary
+# requests. The largest TTFT after the warmup is loadgen's summary maximum.
+# Input: the result files (inputs); $arms: per arm, its runs as {file,
+# pair_id, max_us}; $dir: the session directory the files are named under.
+# shellcheck disable=SC2016
+prog_ttft_outliers="$jq_hdr"'
+def over_1s: reduce (.[] | .histograms.ttft | select(. != null) | hdr_decode | . as $h
+                     | .counts[] | select(.[0] as $i | $h | hdr_value($i) > 1000000000) | .[1]) as $n (0; . + $n);
+(reduce inputs as $r ({};
+     .[input_filename] = ($r.warmup_intervals as $w
+                          | {after: ([$r.intervals[] | select(.index >= $w)] | over_1s),
+                             whole: ($r.intervals | over_1s)}))) as $by_file
+| [$arms[]
+   | [.runs[] | . as $run | ($by_file[$dir + .file]
+                             // error("no counts of \($run.file)")) as $c | $run + $c] as $runs
+   | {arm, runs: $runs, after: ([$runs[].after] | add), whole: ([$runs[].whole] | add),
+      max_us: ([$runs[].max_us | numbers] | max)}] as $by
+| {id: "\($block):ttft-over-1s", block: $block, kind: "report", rule: "ttft over 1 s", verdict: "REPORT",
+   gated: false, extendable: false,
+   text: ("\($block) requests with TTFT above 1 s per arm, after the warmup (per repetition; whole run), and the largest TTFT after the warmup: "
+          + ([$by[] | if (.runs | length) == 0 then "\(.arm) no valid run"
+                      else "\(.arm) \(.after) (\([.runs[].after | tostring] | join(", ")); \(.whole)), "
+                           + "\(if .max_us == null then "n/a" else .max_us / 1000 | fixed1 end) ms" end]
+             | join("; "))
+          + " (reported)"),
+   data: {threshold_ns: 1000000000, arms: $by}}
+'
+jq_programs+=(prog_ttft_outliers)
+
+report_ttft_outliers() {
+    local block="$1" selection="$2" report_selection arms
+    local -a files
+    report_selection="$(pt_report_selection "$selection")"
+    arms="$(jq -c '[.runs | to_entries[] | {arm: .key, runs: [.value[] | {file, pair_id, max_us: .summary_us.ttft.max}]}]' \
+        <<<"$report_selection")"
+    mapfile -t files < <(jq -r '.[].runs[].file' <<<"$arms")
+    # Without files, inputs would read the standard input.
+    add_verdict "$(jq -nc --argjson arms "$arms" --arg block "$block" --arg dir "$run_dir/" \
+        "$jq_defs$prog_ttft_outliers" "${files[@]/#/$run_dir/}" </dev/null)"
 }
 
 # perf stat counts and the legacy pool lock share (C21) of the S2 perf runs
@@ -2760,6 +3131,9 @@ s3_limit_us() {
     esac
 }
 
+# The 7.5 TTFT rules read ttft_reused, whose requests carry no new
+# connection's handshake (see TTFT in the header); ttft over all requests is
+# reported next to them.
 gate_s1_checks() {
     local block="$1" config="$2" scope="$3" t50=100 t99=300 p99=75 cmp
     shift 3
@@ -2769,13 +3143,17 @@ gate_s1_checks() {
     fi
     check_delta "$block" brisk-vs-floor-a chunk_latency 0.99 le 20 0 "$scope" "7.5 floor-A" "$fa"
     check_delta "$block" brisk-vs-floor-a chunk_latency 0.999 le 100 0 "$scope" "7.5 floor-A" "$fa"
-    check_delta "$block" brisk-vs-floor-a ttft 0.5 le 20 0 "$scope" "7.5 floor-A" "$fa"
-    check_delta "$block" brisk-vs-floor-a ttft 0.99 le 60 15 "$scope" "7.5 floor-A" "$fa"
-    check_delta "$block" brisk-vs-direct ttft 0.5 le "$t50" 0 "$scope" "7.5 direct" "$di"
-    check_delta "$block" brisk-vs-direct ttft 0.99 le "$t99" "$p99" "$scope" "7.5 direct" "$di"
+    check_delta "$block" brisk-vs-floor-a ttft_reused 0.5 le 20 0 "$scope" "7.5 floor-A" "$fa"
+    check_delta "$block" brisk-vs-floor-a ttft_reused 0.99 le 60 15 "$scope" "7.5 floor-A" "$fa"
+    check_delta "$block" brisk-vs-direct ttft_reused 0.5 le "$t50" 0 "$scope" "7.5 direct" "$di"
+    check_delta "$block" brisk-vs-direct ttft_reused 0.99 le "$t99" "$p99" "$scope" "7.5 direct" "$di"
     check_delta "$block" brisk-vs-direct chunk_latency 0.5 le 30 0 "$scope" "7.5 direct" "$di"
     check_delta "$block" brisk-vs-direct chunk_latency 0.99 le 100 0 "$scope" "7.5 direct" "$di"
     check_delta "$block" brisk-vs-direct chunk_latency 0.999 le 500 0 "$scope" "7.5 direct" "$di"
+    check_delta "$block" brisk-vs-floor-a ttft 0.5 report 0 0 reported "ttft all requests" "$fa"
+    check_delta "$block" brisk-vs-floor-a ttft 0.99 report 0 0 reported "ttft all requests" "$fa"
+    check_delta "$block" brisk-vs-direct ttft 0.5 report 0 0 reported "ttft all requests" "$di"
+    check_delta "$block" brisk-vs-direct ttft 0.99 report 0 0 reported "ttft all requests" "$di"
     for cmp in brisk-vs-floor-a brisk-vs-direct; do
         check_delta "$block" "$cmp" chunk_wire 0.5 report 0 0 reported "7.5 chunk_wire" "S1 ${cmp//-vs-/ vs }"
         check_delta "$block" "$cmp" chunk_wire 0.99 report 0 0 reported "7.5 chunk_wire" "S1 ${cmp//-vs-/ vs }"
@@ -2823,7 +3201,7 @@ evaluate_ramp() {
     pairs="$(jq -sc --arg c "$config" --arg a "$a" --arg b "$b" "$prog_ramp_pairs" "$run_dir/runs.jsonl")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" --arg scope "$scope" \
         --argjson share "$RAMP_TOOL_LIMIT_SHARE" --argjson start "$RAMP_START" --arg step_pct "$RAMP_STEP_PCT" \
-        "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
+        --arg tool_arm "$(tool_ramp_arm "$config")" "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" \
         --argjson cpus "$(cpu_count "$SUT_CPUS")" "$jq_defs$prog_ramp_vcpu" <<<"$pairs")"
 }
@@ -2844,13 +3222,14 @@ evaluate_block() {
         scope=gated
     fi
     if [[ "$scen" == s3 ]]; then
-        report_reuse "$block" "$selection" reported "$scen" "$config" "$var"
+        report_reuse "$block" "$selection" reported "$scen" "$config" "$var" "$@"
     else
-        report_reuse "$block" "$selection" "$scope" "$scen" "$config" "$var"
+        report_reuse "$block" "$selection" "$scope" "$scen" "$config" "$var" "$@"
     fi
     report_cpu "$scen" "$block" "$selection" "$@"
     if [[ "$scen" == s1 ]]; then
         report_memory "$block" "$selection"
+        report_ttft_outliers "$block" "$selection"
     fi
     if [[ "$scen" == s2 ]]; then
         report_perf "$block" "$config"
@@ -2872,10 +3251,15 @@ evaluate_block() {
                 e2-chunk "E2 S1 concat vs segments"
             ;;
         e4:s1)
-            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.5 abs 10 0 decision \
+            # As in gate_s1_checks: the rules on ttft_reused, ttft reported.
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft_reused 0.5 abs 10 0 decision \
                 e4-p50 "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
-            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.99 le 30 0 decision \
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft_reused 0.99 le 30 0 decision \
                 e4-p99 "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.5 report 0 0 reported \
+                "ttft all requests" "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.99 report 0 0 reported \
+                "ttft all requests" "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
             ;;
     esac
 }
@@ -3101,11 +3485,13 @@ def pct2: if . == null then "n/a" else (. * 100 | r2 | tostring) + "%" end;
                                  else ", 3% not ruled out" end)
                               + (if $p.lost == null then "" else " (perf: \($p.lost))" end)
                          end)
-                      + (if .valid then "" else " (in an invalid run)" end)]
+                      + (if .failed then " (the perf run failed: \(.reasons | join("; ")))"
+                         elif .valid then ""
+                         else " (in an invalid run)" end)]
                    | join("; "))
              end)
           + "; the Mutex and futex parts count every lock and condvar of the SUT, which bounds the pool from above"),
-   data: [$recs[] | {arm, valid, c21: .perf.c21}]}
+   data: [$recs[] | {arm, valid, failed, reasons, c21: .perf.c21}]}
 '
 jq_programs+=(prog_c21_report)
 
@@ -3294,7 +3680,7 @@ write_manifest() {
         --argjson evaluation_errors "$evaluation_errors" --argjson patch "$patch" \
         --arg arms "${session_arms[$SESSION]}" --arg key_name "$key_name" --arg key_sha256 "$key_sha256" \
         --arg perf_status "$perf_status" --arg perf_reason "$perf_reason" --arg perf_events "$perf_events" \
-        --arg perf_hitm "$perf_hitm_events" \
+        --arg perf_hitm "$perf_hitm_events" --arg c21_status "$c21_status" --arg c21_reason "$c21_reason" \
         --rawfile knobs "$run_dir/host/knobs.env" --rawfile sync "$run_dir/host/sync-info" \
         --rawfile binaries "$run_dir/host/binaries.txt" \
         --slurpfile runs "$run_dir/runs.jsonl" --slurpfile compares "$run_dir/compares.jsonl" \
@@ -3347,7 +3733,7 @@ preflight_jq
 log "session $SESSION ($RUN_ID) in $run_dir"
 log "arms: ${session_arms[$SESSION]}; configs: $CONFIGS; scenarios: $SCENARIOS"
 log "core plan: SUT $SUT_CPUS ($SUT_WORKERS worker(s)), mocks $MOCK_CPUS ($MOCK_SHARDS shard(s)), loadgen $LOADGEN_CPUS ($LOADGEN_SHARDS shard(s)), harness $HARNESS_CPUS"
-log "mock emission policy $MOCK_EMIT_POLICY (commit window $MOCK_COMMIT_US us); mock write lag p99 limit $MOCK_WRITE_LAG_LIMIT_US us (S3 $S3_MOCK_WRITE_LAG_LIMIT_US us, ramp $RAMP_MOCK_WRITE_LAG_LIMIT_US us); minimum reuse $MIN_REUSE"
+log "mock emission policy $MOCK_EMIT_POLICY (commit window $MOCK_COMMIT_US us); mock write lag p99 limit $MOCK_WRITE_LAG_LIMIT_US us (S3 $S3_MOCK_WRITE_LAG_LIMIT_US us, ramp $RAMP_MOCK_WRITE_LAG_LIMIT_US us); new upstream connections at most $MAX_NEW_CONN_RATE/s per run, arms of one pool policy within max($PAIR_CONN_SLACK_MIN, $PAIR_CONN_SLACK_FRAC x window requests) of each other per leg"
 if [[ -f "$repo_root/.sync-info" ]]; then
     cp "$repo_root/.sync-info" "$run_dir/host/sync-info"
     if [[ -f "$repo_root/.sync-diff.patch" ]]; then
@@ -3389,6 +3775,12 @@ for sub in selfcheck stream nonstream bigbody; do
 done
 [[ "$("$loadgen" stream --help)" == *--max-slip-us* ]] ||
     die "$BIN_DIR/brisk-loadgen stream has no --max-slip-us; sync a build that has it"
+# compare parses its metrics before it reads a file, so an older build names
+# the one it does not know even for results that do not exist.
+if has_scenario s1 && [[ "$("$loadgen" compare --a /dev/null --b /dev/null --metric ttft_reused \
+    --out /dev/null 2>&1)" == *"unknown metric"* ]]; then
+    die "$BIN_DIR/brisk-loadgen does not know the metric ttft_reused; sync a build that has it"
+fi
 if ((session_has_floor)); then
     [[ "$("$floor" --help)" == *--mode* ]] || die "$BIN_DIR/brisk-floor has no --mode (floor-B); build the M1 floor"
 fi
