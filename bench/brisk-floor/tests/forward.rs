@@ -728,6 +728,8 @@ async fn h2_inbound_streams_both_bodies_and_joins_cookies() {
 struct UpstreamStats {
     accepts: AtomicUsize,
     closed: AtomicUsize,
+    /// ALPN protocol negotiated on each TLS connection, in accept order.
+    alpn: std::sync::Mutex<Vec<Option<Vec<u8>>>>,
 }
 
 /// Like [`spawn_upstream`], optionally over TLS, and counting accepted and
@@ -763,6 +765,8 @@ where
                 match tls {
                     Some(acceptor) => {
                         if let Ok(stream) = acceptor.accept(stream).await {
+                            let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+                            counted.alpn.lock().unwrap().push(alpn);
                             let _ = builder
                                 .serve_connection(TokioIo::new(stream), service)
                                 .await;
@@ -800,9 +804,16 @@ fn spawn_floor_b_with_inbound(
     certs: Option<&CertDir>,
     inbound_tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> FloorB {
-    let config = ServerConfig::default();
     let tls = certs.map(|certs| bench_tls::client_config(&certs.0.join(CA_CERT_FILE)).unwrap());
-    let forwarder = SameTaskForwarder::new(upstream, tls).unwrap();
+    serve_floor_b(SameTaskForwarder::new(upstream, tls).unwrap(), inbound_tls)
+}
+
+/// Serves `forwarder` as floor-B on an ephemeral port.
+fn serve_floor_b(
+    forwarder: SameTaskForwarder,
+    inbound_tls: Option<tokio_rustls::TlsAcceptor>,
+) -> FloorB {
+    let config = ServerConfig::default();
     let listener = server::bind("127.0.0.1:0".parse().unwrap(), &config).unwrap();
     let addr = listener.local_addr().unwrap();
     let (shutdown, stopped) = oneshot::channel::<()>();
@@ -1784,4 +1795,40 @@ async fn floor_b_delivers_an_early_answer_while_the_request_body_is_uploading() 
         "an early answer left its upstream connection unpooled"
     );
     assert_eq!(stats.closed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn floor_b_offers_only_http11_to_an_https_upstream() {
+    let certs = CertDir::generate();
+    // An upstream that prefers h2, and a caller's configuration that offers
+    // it: the session must still be HTTP/1.1, the only protocol floor-B speaks.
+    let offers = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let mut server_config = Arc::unwrap_or_clone(
+        bench_tls::server_config(
+            &certs.0.join(SERVER_CERT_FILE),
+            &certs.0.join(SERVER_KEY_FILE),
+        )
+        .unwrap(),
+    );
+    server_config.alpn_protocols = offers.clone();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+    let (upstream, stats, _) = spawn_counting_upstream(echo_handler, Some(acceptor)).await;
+    let mut client_config =
+        Arc::unwrap_or_clone(bench_tls::client_config(&certs.0.join(CA_CERT_FILE)).unwrap());
+    client_config.alpn_protocols = offers;
+    let forwarder = SameTaskForwarder::new(
+        &format!("https://localhost:{}", upstream.port()),
+        Some(Arc::new(client_config)),
+    )
+    .unwrap();
+    let floor = serve_floor_b(forwarder, None);
+
+    let client = inbound_client(Vec::new());
+    exchange_echo_round(&client, &format!("http://{}", floor.addr)).await;
+    assert_eq!(
+        *stats.alpn.lock().unwrap(),
+        [Some(b"http/1.1".to_vec())],
+        "floor-B negotiated another protocol than HTTP/1.1"
+    );
+    assert_eq!(floor.forwarder.idle_connections(), 1);
 }

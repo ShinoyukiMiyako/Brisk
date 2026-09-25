@@ -125,6 +125,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use brisk_bench_core::transport::tls::ALPN_HTTP11;
 use brisk_gateway::server::{ServerConfig, serve};
 use brisk_gateway::upstream::UpstreamClientConfig;
 use http::header::{ACCEPT, CONTENT_TYPE, HOST, TE};
@@ -209,7 +210,9 @@ impl SameTaskForwarder {
     /// credentials, a query or a fragment, exactly as for
     /// [`Forwarder::new`](crate::forward::Forwarder::new). `tls` is the
     /// client configuration for an `https` upstream and is required for one;
-    /// it is unused for an `http` upstream.
+    /// floor-B uses a copy whose ALPN list is `http/1.1` alone, the only
+    /// protocol it speaks, whatever `tls` offers. It is unused for an `http`
+    /// upstream.
     pub fn new(
         upstream: &str,
         tls: Option<Arc<ClientConfig>>,
@@ -243,7 +246,11 @@ impl SameTaskForwarder {
             let sni_host = host_str.trim_start_matches('[').trim_end_matches(']');
             let name = ServerName::try_from(sni_host.to_owned())
                 .map_err(|_| SameTaskConfigError::ServerName(sni_host.to_owned()))?;
-            Some((TlsConnector::from(config), name))
+            // An upstream that selected h2 would get HTTP/1.1 bytes on an h2
+            // session, so nothing else may be offered.
+            let mut config = Arc::unwrap_or_clone(config);
+            config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
+            Some((TlsConnector::from(Arc::new(config)), name))
         } else {
             None
         };
@@ -837,6 +844,21 @@ mod tests {
         // The CA is only needed for TLS.
         let fwd = SameTaskForwarder::new("http://localhost:8080", Some(tls_config())).unwrap();
         assert!(fwd.inner.tls.is_none());
+    }
+
+    #[test]
+    fn https_offers_only_alpn_http11_whatever_the_config_offers() {
+        for offered in [vec![b"h2".to_vec(), b"http/1.1".to_vec()], Vec::new()] {
+            let mut config = Arc::unwrap_or_clone(tls_config());
+            config.alpn_protocols = offered.clone();
+            let fwd = SameTaskForwarder::new("https://localhost", Some(Arc::new(config))).unwrap();
+            let (connector, _) = fwd.inner.tls.as_ref().unwrap();
+            assert_eq!(
+                connector.config().alpn_protocols,
+                [b"http/1.1".to_vec()],
+                "{offered:?}"
+            );
+        }
     }
 
     #[test]
