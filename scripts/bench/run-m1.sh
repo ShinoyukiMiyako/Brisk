@@ -62,6 +62,11 @@
 # Brisk with stream_usage = "passthrough" (brisk-pt), right after Brisk in odd
 # repetitions and right before it in even ones, which leaves the three-arm
 # square as it is; Brisk against brisk-pt is the cost of strip, reported only.
+# brisk-pt stays out of the gated repetitions: once the gated arms of a
+# repetition are valid, an invalid brisk-pt (or Brisk next to it) reruns only
+# Brisk and brisk-pt, at their positions; the gated comparisons and the reuse
+# verdict never read brisk-pt, and Brisk against brisk-pt uses the latest
+# attempt of each repetition in which the two are valid together.
 #
 # Brisk: at the start of the session `brisk keygen` makes a virtual key, read
 # by its frozen output format (contract 05, section 1.5). Its digest goes into
@@ -718,14 +723,17 @@ def last_by(f): reduce .[] as $r ({order: [], by: {}};
 def ci_text($t; f): "[\($t.lo | f), \($t.hi | f)]";
 '
 
-# Repetitions of one block whose arms are all valid in one attempt (the
-# latest such attempt of each repetition). Input: runs.jsonl, slurped.
+# Repetitions of one block whose wanted arms are all valid in one attempt
+# (the latest such attempt of each repetition). An attempt may also hold
+# other arms (brisk-pt next to the gated ones) or only some of the wanted
+# ones (the rerun of Brisk and brisk-pt). Input: runs.jsonl, slurped.
 # shellcheck disable=SC2016
 prog_select_reps='
 ($arms | split(" ")) as $want
 | [.[] | select(.scen == $s and .config == $c and .var == $v and .kind == "run")]
 | [group_by(.rep)[]
    | [group_by(.attempt)[]
+      | map(select(.arm | IN($want[])))
       | select(length == ($want | length)
                and all(.[]; .valid == true and .file != null)
                and ((map(.arm) | sort) == ($want | sort)))]
@@ -2135,32 +2143,66 @@ run_arm() {
     execute_run
 }
 
-# All arms of one repetition in the Latin square order; a repetition with an
-# invalid or failed run is rerun, all arms with the same seed and order.
+# All arms of one repetition in the Latin square order. A repetition whose
+# gated arms are not all valid (or one failed) is rerun, all arms with the
+# same seed and order. brisk-pt is reported only: once the gated
+# arms are valid, an invalid brisk-pt (or Brisk next to it) reruns just Brisk
+# and brisk-pt at their positions, so that it never costs the gated
+# comparisons a repetition. Both kinds of rerun count against RETRY_INVALID.
 run_rep() {
-    local scen="$1" config="$2" var="$3" rep="$4" attempt=0 arm pos rep_ok
+    local scen="$1" config="$2" var="$3" rep="$4" attempt=0 arm pos gated_ok=0 pt_ok=1
+    local attempt_gated attempt_pt
     shift 4
-    local -a order
+    local -a order run_set
     read -r -a order <<<"$(rep_order "$rep" "$@")"
+    if in_list brisk-pt "${order[@]}"; then
+        pt_ok=0
+    fi
+    run_set=("${order[@]}")
     while true; do
-        log "== config $config, $scen${var:+ $var}, repetition $rep$( ((attempt == 0)) || echo ", rerun $attempt"): ${order[*]}"
-        rep_ok=1
+        log "== config $config, $scen${var:+ $var}, repetition $rep$( ((attempt == 0)) || echo ", rerun $attempt"): ${run_set[*]}"
+        attempt_gated=1 attempt_pt=1
         pos=0
         for arm in "${order[@]}"; do
             pos=$((pos + 1))
+            in_list "$arm" "${run_set[@]}" || continue
             run_arm "$scen" "$config" "$var" "$arm" "$rep" "$attempt" "$pos" run
-            ((run_ok)) || rep_ok=0
+            if ((!run_ok)); then
+                [[ "$arm" == brisk-pt ]] || attempt_gated=0
+                [[ "$arm" != brisk && "$arm" != brisk-pt ]] || attempt_pt=0
+            fi
         done
-        if ((rep_ok)); then
+        # The gated arms are compared from one attempt, so only an attempt
+        # of all arms decides them.
+        if ((${#run_set[@]} == ${#order[@]})); then
+            gated_ok=$attempt_gated
+        fi
+        if ((attempt_pt)); then
+            pt_ok=1
+        fi
+        if ((gated_ok && pt_ok)); then
             return 0
         fi
         if ((attempt >= RETRY_INVALID)); then
-            log "  repetition $rep still has an invalid run after $attempt rerun(s); comparisons will leave it out"
+            if ((!gated_ok)); then
+                log "  repetition $rep still has an invalid run after $attempt rerun(s); comparisons will leave it out"
+            else
+                log "  Brisk and brisk-pt of repetition $rep are still not valid together after $attempt rerun(s); the strip cost comparison will leave it out"
+            fi
             return 0
         fi
         attempt=$((attempt + 1))
         retries=$((retries + 1))
-        log "  rerunning repetition $rep, all arms, same seed and order"
+        if ((!gated_ok)); then
+            run_set=("${order[@]}")
+            log "  rerunning repetition $rep, all arms, same seed and order"
+        else
+            run_set=()
+            for arm in "${order[@]}"; do
+                [[ "$arm" != brisk && "$arm" != brisk-pt ]] || run_set+=("$arm")
+            done
+            log "  rerunning Brisk and brisk-pt of repetition $rep, same seed and positions; the gated arms stand"
+        fi
     done
 }
 
@@ -2205,9 +2247,42 @@ run_perf_runs() {
 
 # ---------------------------------------------------------------- comparisons
 
-# The block's repetitions whose arms are all valid, as JSON (prog_select_reps).
+# The block's repetitions whose gated arms are all valid, as JSON
+# (prog_select_reps). brisk-pt, reported only, stays out of them; in a block
+# with it, .pt holds the repetitions in which Brisk and brisk-pt are valid
+# together (pt_pair_selection, pt_report_selection).
 select_reps() {
-    jq -sc --arg s "$1" --arg c "$2" --arg v "$3" --arg arms "$4" "$prog_select_reps" "$run_dir/runs.jsonl"
+    local s="$1" c="$2" v="$3" arm selection pt
+    local -a gated=()
+    for arm in $4; do
+        [[ "$arm" == brisk-pt ]] || gated+=("$arm")
+    done
+    selection="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "${gated[*]}" "$prog_select_reps" \
+        "$run_dir/runs.jsonl")"
+    if [[ " $4 " != *" brisk-pt "* ]]; then
+        printf '%s\n' "$selection"
+        return 0
+    fi
+    pt="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "brisk brisk-pt" "$prog_select_reps" \
+        "$run_dir/runs.jsonl")"
+    jq -c --argjson pt "$pt" '. + {pt: $pt}' <<<"$selection"
+}
+
+# The selection a comparison of arms A and B reads: the gated repetitions,
+# or for a pair with brisk-pt those of .pt.
+pt_pair_selection() {
+    local a="$1" b="$2" selection="$3"
+    if [[ "$a" == brisk-pt || "$b" == brisk-pt ]]; then
+        jq -c '.pt' <<<"$selection"
+    else
+        printf '%s\n' "$selection"
+    fi
+}
+
+# The selection of the per-arm reports, which pair no arms: the gated
+# repetitions with brisk-pt's runs of .pt added.
+pt_report_selection() {
+    jq -c 'if .pt == null then . else .runs["brisk-pt"] = .pt.runs["brisk-pt"] end | del(.pt)' <<<"$1"
 }
 
 # Compares arm B against arm A over the block's selected repetitions; writes
@@ -2260,14 +2335,16 @@ compare_pair() {
         log "compare $name: printing the per-metric summary failed; see compare/$name.json"
 }
 
-# Every comparison of the session between two arms of the block.
+# Every comparison of the session between two arms of the block, each over
+# its pt_pair_selection.
 compare_block() {
-    local scen="$1" block="$2" selection="$3" pair a b
+    local scen="$1" block="$2" selection="$3" pair a b pair_selection
     shift 3
     for pair in ${session_compares[$SESSION]}; do
         a="${pair%%:*}" b="${pair#*:}"
         if in_list "$a" "$@" && in_list "$b" "$@"; then
-            compare_pair "$scen" "$block" "$a" "$b" "$selection"
+            pair_selection="$(pt_pair_selection "$a" "$b" "$selection")"
+            compare_pair "$scen" "$block" "$a" "$b" "$pair_selection"
         fi
     done
 }
@@ -2316,15 +2393,17 @@ report_reuse() {
 }
 
 # CPU per chunk (S1) or per request (S2, S3) of every SUT arm, and between
-# every compared pair of SUT arms.
+# every compared pair of SUT arms (over its pt_pair_selection).
 report_cpu() {
     local scen="$1" block="$2" selection="$3" field=cpu_us_per_request unit=request pair a b rule
+    local report_selection pair_selection
     shift 3
     if [[ "$scen" == s1 ]]; then
         field=cpu_us_per_chunk unit=chunk
     fi
+    report_selection="$(pt_report_selection "$selection")"
     add_verdict "$(jq -c --arg block "$block" --arg f "$field" --arg unit "$unit" "$jq_defs$prog_cpu_arms" \
-        <<<"$selection")"
+        <<<"$report_selection")"
     for pair in ${session_compares[$SESSION]}; do
         a="${pair%%:*}" b="${pair#*:}"
         [[ "$a" != direct && "$b" != direct ]] || continue
@@ -2333,15 +2412,17 @@ report_cpu() {
             if [[ "$SESSION" == gate && "$a" == floor-a && "$b" == brisk ]]; then
                 rule="7.5 CPU"
             fi
+            pair_selection="$(pt_pair_selection "$a" "$b" "$selection")"
             add_verdict "$(jq -c --arg block "$block" --arg f "$field" --arg unit "$unit" --arg a "$a" \
-                --arg b "$b" --arg rule "$rule" "$jq_defs$prog_cpu_pair" <<<"$selection")"
+                --arg b "$b" --arg rule "$rule" "$jq_defs$prog_cpu_pair" <<<"$pair_selection")"
         fi
     done
 }
 
 report_memory() {
-    local block="$1" selection="$2"
-    add_verdict "$(jq -c --arg block "$block" --arg session "$SESSION" "$jq_defs$prog_memory" <<<"$selection")"
+    local block="$1" selection="$2" report_selection
+    report_selection="$(pt_report_selection "$selection")"
+    add_verdict "$(jq -c --arg block "$block" --arg session "$SESSION" "$jq_defs$prog_memory" <<<"$report_selection")"
 }
 
 # perf stat counts of the S2 perf runs of a config, or why there are none;
