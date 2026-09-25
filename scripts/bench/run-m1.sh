@@ -27,6 +27,13 @@
 #   config T  direct: loadgen -https-> mock   others: loadgen -https-> SUT -https-> mock
 #   config N  direct: loadgen -http->  mock   others: loadgen -http->  SUT -http->  mock
 #
+# The direct ramp that gives a ramp block its tool limit (see Ramp) reaches
+# the mock the block's SUT arms reach, so in config P it runs loadgen -https->
+# mock (arm direct-tls) rather than the plaintext direct path. It carries
+# loadgen's TLS cost, which the SUT arms of P do not, so that limit errs low:
+# it can turn a gated throughput comparison into a reported one, but never
+# lets one pass that the TLS mock capped.
+#
 # The SUT (process under test) is brisk-floor --mode a (floor-A) or --mode b
 # (floor-B), or brisk serve with a configuration rendered from
 # brisk-bench.toml.in. Core plan (LAYOUT=8vcpu of run-m0.sh): the SUT on CPUs
@@ -55,6 +62,18 @@
 # Brisk with stream_usage = "passthrough" (brisk-pt), right after Brisk in odd
 # repetitions and right before it in even ones, which leaves the three-arm
 # square as it is; Brisk against brisk-pt is the cost of strip, reported only.
+# brisk-pt stays out of the gated repetitions: once the gated arms of a
+# repetition are valid, an invalid brisk-pt (or Brisk next to it) reruns only
+# Brisk and brisk-pt, at their positions; the gated comparisons and the reuse
+# verdict never read brisk-pt, and Brisk against brisk-pt uses the latest
+# attempt of each repetition in which the two are valid together.
+#
+# Besides loadgen's validity, a run of S1, S2 or S3 is invalid when more of
+# its requests failed after the warmup (stale retries aside) than a tenth of
+# the tail above its highest compared quantile (COMPARE_QUANTILES,
+# S3_COMPARE_QUANTILES; 0.01% at p99.9): brisk-loadgen compare refuses such
+# a run, which would cost the block its comparisons, while loadgen's validity
+# tolerates 0.1%.
 #
 # Brisk: at the start of the session `brisk keygen` makes a virtual key, read
 # by its frozen output format (contract 05, section 1.5). Its digest goes into
@@ -220,7 +239,7 @@ knob_table=(
     "LOADGEN_SHARDS|2|loadgen shard threads"
     "HARNESS_CPUS||CPUs of this script and its helpers (default: first LOADGEN_CPUS entry)"
     "MOCK_PLAIN_PORT|19080|plaintext mock (direct in P and N, SUT upstream in N)"
-    "MOCK_TLS_PORT|19443|TLS mock (direct in T, SUT upstream in P and T)"
+    "MOCK_TLS_PORT|19443|TLS mock (direct in T and the tool ramp of P, SUT upstream in P and T)"
     "SUT_P_PORT|19180|process under test, plaintext inbound (P, N)"
     "SUT_T_PORT|19543|process under test, TLS inbound (T)"
     "SC_PORT|19090|selfcheck mock"
@@ -725,14 +744,17 @@ def last_by(f): reduce .[] as $r ({order: [], by: {}};
 def ci_text($t; f): "[\($t.lo | f), \($t.hi | f)]";
 '
 
-# Repetitions of one block whose arms are all valid in one attempt (the
-# latest such attempt of each repetition). Input: runs.jsonl, slurped.
+# Repetitions of one block whose wanted arms are all valid in one attempt
+# (the latest such attempt of each repetition). An attempt may also hold
+# other arms (brisk-pt next to the gated ones) or only some of the wanted
+# ones (the rerun of Brisk and brisk-pt). Input: runs.jsonl, slurped.
 # shellcheck disable=SC2016
 prog_select_reps='
 ($arms | split(" ")) as $want
 | [.[] | select(.scen == $s and .config == $c and .var == $v and .kind == "run")]
 | [group_by(.rep)[]
    | [group_by(.attempt)[]
+      | map(select(.arm | IN($want[])))
       | select(length == ($want | length)
                and all(.[]; .valid == true and .file != null)
                and ((map(.arm) | sort) == ($want | sort)))]
@@ -1785,11 +1807,13 @@ mock_balance() {
 }
 
 # The mock that serves an arm: config P's direct arm reaches the plaintext
-# mock and its SUT the TLS one.
+# mock and its SUT the TLS one; direct-tls always reaches the TLS one.
 arm_mock() {
     local scen="$1" config="$2" arm="$3"
     if [[ "$scen" == sc ]]; then
         echo mock-sc
+    elif [[ "$arm" == direct-tls ]]; then
+        echo mock-tls
     elif [[ "$config" == N || ("$config" == P && "$arm" == direct) ]]; then
         echo mock-plain
     else
@@ -1958,6 +1982,15 @@ execute_run() {
     if ((failed)); then
         failed_runs=$((failed_runs + 1))
     fi
+    # compare reads the repetitions of S1, S2 and S3; a run it would refuse
+    # is rerun here instead of costing the block its comparisons.
+    if [[ "${run_ctx[kind]}" == run && "$scen" != ramp && -f "$result" ]]; then
+        local tail_reason
+        tail_reason="$(tail_screen_reason "$scen" "$result")"
+        if [[ -n "$tail_reason" ]]; then
+            reasons+=("$tail_reason")
+        fi
+    fi
     if [[ -n "${run_ctx[sut_pid]}" ]]; then
         sut="$(sut_evidence "$tag" "$result")"
         if [[ "$(jq -r '.cpu_s' <<<"$sut")" == null ]]; then
@@ -2026,14 +2059,26 @@ sut_port() {
     if [[ "$1" == T ]]; then echo "$SUT_T_PORT"; else echo "$SUT_P_PORT"; fi
 }
 
+# Whether an arm runs without a process under test: direct, and direct-tls,
+# the tool ramp of config P (tool_ramp_arm).
+direct_arm() {
+    [[ "$1" == direct || "$1" == direct-tls ]]
+}
+
+# Whether loadgen reaches an arm over TLS: every arm of config T, and
+# direct-tls.
+arm_over_tls() {
+    [[ "$1" == T || "$2" == direct-tls ]]
+}
+
 target_url() {
     local config="$1" arm="$2" scheme=http port
-    if [[ "$config" == T ]]; then
+    if arm_over_tls "$config" "$arm"; then
         scheme=https
     fi
-    if [[ "$arm" != direct ]]; then
+    if ! direct_arm "$arm"; then
         port="$(sut_port "$config")"
-    elif [[ "$config" == T ]]; then
+    elif [[ "$scheme" == https ]]; then
         port="$MOCK_TLS_PORT"
     else
         port="$MOCK_PLAIN_PORT"
@@ -2241,7 +2286,7 @@ run_arm() {
     esac
     ((attempt == 0)) || base+="-a$attempt"
     seed=$((SEED + (rep > 0 ? rep - 1 : 0)))
-    if [[ "$config" == T ]]; then
+    if arm_over_tls "$config" "$arm"; then
         tls=1
     fi
     url="$(target_url "$config" "$arm")"
@@ -2303,7 +2348,7 @@ run_arm() {
     if [[ "$kind" == perf ]]; then
         run_ctx[perf]=1
     fi
-    if [[ "$arm" != direct ]]; then
+    if ! direct_arm "$arm"; then
         start_sut "$arm" "$config" "$base"
         run_ctx[sut_pid]="${pids[sut]}"
         if [[ "$scen" == s1 ]] && ((IDLE_RSS_S > 0)); then
@@ -2316,46 +2361,89 @@ run_arm() {
     execute_run
 }
 
-# All arms of one repetition in the Latin square order; a repetition with an
-# invalid or failed run is rerun, all arms with the same seed and order.
+# All arms of one repetition in the Latin square order. A repetition whose
+# gated arms are not all valid (or one failed) is rerun, all arms with the
+# same seed and order. brisk-pt is reported only: once the gated
+# arms are valid, an invalid brisk-pt (or Brisk next to it) reruns just Brisk
+# and brisk-pt at their positions, so that it never costs the gated
+# comparisons a repetition. Both kinds of rerun count against RETRY_INVALID.
 run_rep() {
-    local scen="$1" config="$2" var="$3" rep="$4" attempt=0 arm pos rep_ok
+    local scen="$1" config="$2" var="$3" rep="$4" attempt=0 arm pos gated_ok=0 pt_ok=1
+    local attempt_gated attempt_pt
     shift 4
-    local -a order
+    local -a order run_set
     read -r -a order <<<"$(rep_order "$rep" "$@")"
+    if in_list brisk-pt "${order[@]}"; then
+        pt_ok=0
+    fi
+    run_set=("${order[@]}")
     while true; do
-        log "== config $config, $scen${var:+ $var}, repetition $rep$( ((attempt == 0)) || echo ", rerun $attempt"): ${order[*]}"
-        rep_ok=1
+        log "== config $config, $scen${var:+ $var}, repetition $rep$( ((attempt == 0)) || echo ", rerun $attempt"): ${run_set[*]}"
+        attempt_gated=1 attempt_pt=1
         pos=0
         for arm in "${order[@]}"; do
             pos=$((pos + 1))
+            in_list "$arm" "${run_set[@]}" || continue
             run_arm "$scen" "$config" "$var" "$arm" "$rep" "$attempt" "$pos" run
-            ((run_ok)) || rep_ok=0
+            if ((!run_ok)); then
+                [[ "$arm" == brisk-pt ]] || attempt_gated=0
+                [[ "$arm" != brisk && "$arm" != brisk-pt ]] || attempt_pt=0
+            fi
         done
-        if ((rep_ok)); then
+        # The gated arms are compared from one attempt, so only an attempt
+        # of all arms decides them.
+        if ((${#run_set[@]} == ${#order[@]})); then
+            gated_ok=$attempt_gated
+        fi
+        if ((attempt_pt)); then
+            pt_ok=1
+        fi
+        if ((gated_ok && pt_ok)); then
             return 0
         fi
         if ((attempt >= RETRY_INVALID)); then
-            log "  repetition $rep still has an invalid run after $attempt rerun(s); comparisons will leave it out"
+            if ((!gated_ok)); then
+                log "  repetition $rep still has an invalid run after $attempt rerun(s); comparisons will leave it out"
+            else
+                log "  Brisk and brisk-pt of repetition $rep are still not valid together after $attempt rerun(s); the strip cost comparison will leave it out"
+            fi
             return 0
         fi
         attempt=$((attempt + 1))
         retries=$((retries + 1))
-        log "  rerunning repetition $rep, all arms, same seed and order"
+        if ((!gated_ok)); then
+            run_set=("${order[@]}")
+            log "  rerunning repetition $rep, all arms, same seed and order"
+        else
+            run_set=()
+            for arm in "${order[@]}"; do
+                [[ "$arm" != brisk && "$arm" != brisk-pt ]] || run_set+=("$arm")
+            done
+            log "  rerunning Brisk and brisk-pt of repetition $rep, same seed and positions; the gated arms stand"
+        fi
     done
+}
+
+# The direct arm whose ramp gives the ramp block of a config its tool limit:
+# it reaches the mock the block's SUT arms reach, the TLS mock in P and T and
+# the plaintext one in N. Every ramp block measures its own, right before
+# its pairs, so P and T each run the same TLS path once.
+tool_ramp_arm() {
+    if [[ "$1" == P ]]; then echo direct-tls; else echo direct; fi
 }
 
 # The direct ramp that gives a ramp block its tool limit.
 run_tool_ramp() {
-    local config="$1" attempt=0
+    local config="$1" attempt=0 arm
+    arm="$(tool_ramp_arm "$config")"
     while true; do
-        log "== config $config, ramp, direct tool limit$( ((attempt == 0)) || echo ", rerun $attempt")"
-        run_arm ramp "$config" "" direct 0 "$attempt" 1 tool
+        log "== config $config, ramp, $arm tool limit at $(arm_mock ramp "$config" "$arm")$( ((attempt == 0)) || echo ", rerun $attempt")"
+        run_arm ramp "$config" "" "$arm" 0 "$attempt" 1 tool
         if ((run_ok)); then
             return 0
         fi
         if ((attempt >= RETRY_INVALID)); then
-            log "  the direct ramp of config $config is still invalid; its tool limit is unknown"
+            log "  the $arm ramp of config $config is still invalid; its tool limit is unknown"
             return 0
         fi
         attempt=$((attempt + 1))
@@ -2377,9 +2465,74 @@ run_perf_runs() {
 
 # ---------------------------------------------------------------- comparisons
 
-# The block's repetitions whose arms are all valid, as JSON (prog_select_reps).
+# The block's repetitions whose gated arms are all valid, as JSON
+# (prog_select_reps). brisk-pt, reported only, stays out of them; in a block
+# with it, .pt holds the repetitions in which Brisk and brisk-pt are valid
+# together (pt_pair_selection, pt_report_selection).
 select_reps() {
-    jq -sc --arg s "$1" --arg c "$2" --arg v "$3" --arg arms "$4" "$prog_select_reps" "$run_dir/runs.jsonl"
+    local s="$1" c="$2" v="$3" arm selection pt
+    local -a gated=()
+    for arm in $4; do
+        [[ "$arm" == brisk-pt ]] || gated+=("$arm")
+    done
+    selection="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "${gated[*]}" "$prog_select_reps" \
+        "$run_dir/runs.jsonl")"
+    if [[ " $4 " != *" brisk-pt "* ]]; then
+        printf '%s\n' "$selection"
+        return 0
+    fi
+    pt="$(jq -sc --arg s "$s" --arg c "$c" --arg v "$v" --arg arms "brisk brisk-pt" "$prog_select_reps" \
+        "$run_dir/runs.jsonl")"
+    jq -c --argjson pt "$pt" '. + {pt: $pt}' <<<"$selection"
+}
+
+# The selection a comparison of arms A and B reads: the gated repetitions,
+# or for a pair with brisk-pt those of .pt.
+pt_pair_selection() {
+    local a="$1" b="$2" selection="$3"
+    if [[ "$a" == brisk-pt || "$b" == brisk-pt ]]; then
+        jq -c '.pt' <<<"$selection"
+    else
+        printf '%s\n' "$selection"
+    fi
+}
+
+# The selection of the per-arm reports, which pair no arms: the gated
+# repetitions with brisk-pt's runs of .pt added.
+pt_report_selection() {
+    jq -c 'if .pt == null then . else .runs["brisk-pt"] = .pt.runs["brisk-pt"] end | del(.pt)' <<<"$1"
+}
+
+# Why a result fails the tail screen of brisk-loadgen compare, or nothing.
+# Failed requests have no latency, so compare refuses a run (short of
+# --allow-invalid) whose requests after the warmup failed, stale retries
+# aside, in a larger share than a tenth of the tail above the highest
+# compared quantile: 1e-4 at p99.9, where loadgen's validity allows 1e-3.
+# The percentages are read as compare reads them (cli.rs parse_percent moves
+# the decimal point in the text), so the limit is the same double. Input: a
+# result file.
+# shellcheck disable=SC2016
+prog_tail_screen='
+def compare_fraction:
+    gsub(" "; "") | split(".") as $p
+    | ($p[0] | if length < 2 then ("00" + .)[-2:] else . end) as $int
+    | (($int[:-2] | if . == "" then "0" else . end) + "." + $int[-2:] + ($p[1:] | join(""))) | tonumber;
+([$quantiles | split(",")[] | compare_fraction] | max) as $qmax
+| ((1 - $qmax) * 0.1) as $limit
+| .warmup_intervals as $w
+| reduce (.intervals[] | select(.index >= $w)) as $iv ({requests: 0, failures: 0};
+      .requests += $iv.requests
+      | reduce ($iv.errors | to_entries[] | select(.key != "stale_retry") | .value) as $n (.; .failures += $n))
+| (.requests + .failures) as $total
+| if $total > 0 and .failures / $total > $limit
+  then "\(.failures) of \($total) requests after the warmup failed, more than \($limit | pct4) for the \($qmax | qlabel) tail; brisk-loadgen compare would refuse the run"
+  else empty end
+'
+jq_programs+=(prog_tail_screen)
+
+# The tail screen of one result of scenario <scen> (prog_tail_screen).
+tail_screen_reason() {
+    jq -r --arg quantiles "$(compare_quantiles "$1")" "$jq_defs$prog_tail_screen" "$2"
 }
 
 # Compares arm B against arm A over the block's selected repetitions; writes
@@ -2432,14 +2585,16 @@ compare_pair() {
         log "compare $name: printing the per-metric summary failed; see compare/$name.json"
 }
 
-# Every comparison of the session between two arms of the block.
+# Every comparison of the session between two arms of the block, each over
+# its pt_pair_selection.
 compare_block() {
-    local scen="$1" block="$2" selection="$3" pair a b
+    local scen="$1" block="$2" selection="$3" pair a b pair_selection
     shift 3
     for pair in ${session_compares[$SESSION]}; do
         a="${pair%%:*}" b="${pair#*:}"
         if in_list "$a" "$@" && in_list "$b" "$@"; then
-            compare_pair "$scen" "$block" "$a" "$b" "$selection"
+            pair_selection="$(pt_pair_selection "$a" "$b" "$selection")"
+            compare_pair "$scen" "$block" "$a" "$b" "$pair_selection"
         fi
     done
 }
@@ -2493,15 +2648,17 @@ report_reuse() {
 }
 
 # CPU per chunk (S1) or per request (S2, S3) of every SUT arm, and between
-# every compared pair of SUT arms.
+# every compared pair of SUT arms (over its pt_pair_selection).
 report_cpu() {
     local scen="$1" block="$2" selection="$3" field=cpu_us_per_request unit=request pair a b rule
+    local report_selection pair_selection
     shift 3
     if [[ "$scen" == s1 ]]; then
         field=cpu_us_per_chunk unit=chunk
     fi
+    report_selection="$(pt_report_selection "$selection")"
     add_verdict "$(jq -c --arg block "$block" --arg f "$field" --arg unit "$unit" "$jq_defs$prog_cpu_arms" \
-        <<<"$selection")"
+        <<<"$report_selection")"
     for pair in ${session_compares[$SESSION]}; do
         a="${pair%%:*}" b="${pair#*:}"
         [[ "$a" != direct && "$b" != direct ]] || continue
@@ -2510,15 +2667,17 @@ report_cpu() {
             if [[ "$SESSION" == gate && "$a" == floor-a && "$b" == brisk ]]; then
                 rule="7.5 CPU"
             fi
+            pair_selection="$(pt_pair_selection "$a" "$b" "$selection")"
             add_verdict "$(jq -c --arg block "$block" --arg f "$field" --arg unit "$unit" --arg a "$a" \
-                --arg b "$b" --arg rule "$rule" "$jq_defs$prog_cpu_pair" <<<"$selection")"
+                --arg b "$b" --arg rule "$rule" "$jq_defs$prog_cpu_pair" <<<"$pair_selection")"
         fi
     done
 }
 
 report_memory() {
-    local block="$1" selection="$2"
-    add_verdict "$(jq -c --arg block "$block" --arg session "$SESSION" "$jq_defs$prog_memory" <<<"$selection")"
+    local block="$1" selection="$2" report_selection
+    report_selection="$(pt_report_selection "$selection")"
+    add_verdict "$(jq -c --arg block "$block" --arg session "$SESSION" "$jq_defs$prog_memory" <<<"$report_selection")"
 }
 
 # perf stat counts of the S2 perf runs of a config, or why there are none;
