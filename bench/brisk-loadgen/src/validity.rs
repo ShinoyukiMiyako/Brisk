@@ -305,7 +305,7 @@ pub(crate) fn evaluate(evidence: &Evidence<'_>) -> Validity {
         ));
     }
     let negative: u64 = measured.iter().map(|i| i.negative).sum();
-    let samples: u64 = evidence.summary.values().map(|s| s.count).sum();
+    let samples = negative_span_denominator(evidence.summary);
     if as_f64(negative) > MAX_NEGATIVE_SHARE * as_f64(samples) {
         validity.invalidate(format!(
             "{negative} of {samples} spans after the warmup ended before they started \
@@ -349,6 +349,18 @@ pub(crate) fn evaluate(evidence: &Evidence<'_>) -> Validity {
         ));
     }
     validity
+}
+
+/// Total sample count the negative-span rule divides by. `TtftReused`
+/// repeats a subset of `Ttft`'s samples (see its doc comment); counting both
+/// would double-count those samples and loosen the rule. Excluded, the
+/// denominator matches M0's.
+fn negative_span_denominator(summary: &BTreeMap<Metric, MetricSummary>) -> u64 {
+    summary
+        .iter()
+        .filter(|(metric, _)| **metric != Metric::TtftReused)
+        .map(|(_, summary)| summary.count)
+        .sum()
 }
 
 /// Why sends went out late, from the deadline misses.
@@ -922,6 +934,42 @@ mod tests {
         intervals[3].negative = 0;
         intervals[0].negative = 50;
         assert!(judge(&intervals, &NO_COUNTERS).valid);
+    }
+
+    #[test]
+    fn negative_span_rule_denominator_excludes_ttft_reused() {
+        // `TtftReused` duplicates a subset of `Ttft`'s samples; the rule's
+        // denominator must stay the same, and so must the verdict, whether
+        // or not a `TtftReused` summary is present.
+        let intervals: Vec<_> = (0..2).map(|i| interval(i, 1.0, 0, 100)).collect();
+        let mut with_negative = intervals;
+        with_negative[0].negative = 2;
+        let judge = |summary: &BTreeMap<Metric, MetricSummary>| {
+            evaluate(&Evidence {
+                intervals: &with_negative,
+                warmup_intervals: 0,
+                summary,
+                clock_steps: 0,
+                load: None,
+                counters: &NO_COUNTERS,
+                diagnostics: &NO_DIAGNOSTICS,
+                markers_expected: false,
+                mock_lag_limit_ns: 10_000,
+            })
+        };
+
+        // 2 of the 1000 `Ttft` samples is 0.2%, above the 0.1% limit.
+        let without_reused = summary_with(Metric::Ttft, 500);
+        let v = judge(&without_reused);
+        assert!(!v.valid, "{v:?}");
+        assert!(v.reasons[0].starts_with("2 of 1000 spans"), "{v:?}");
+
+        // Counting `ttft_reused`'s samples too would dilute 2 of 1000 to 2
+        // of 2000 (0.1%, at the limit) or lower still with more reused
+        // samples; the denominator and verdict must not move.
+        let mut with_reused = without_reused.clone();
+        with_reused.extend(summary_with(Metric::TtftReused, 500));
+        assert_eq!(judge(&with_reused), v);
     }
 
     #[test]
