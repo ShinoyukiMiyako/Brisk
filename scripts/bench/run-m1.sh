@@ -155,6 +155,20 @@
 # legacy pool lock share (C21) are reported only, with the contract's
 # reference values where it names them.
 #
+# TTFT in S1, which compares ttft, ttft_reused, chunk_latency, chunk_wire and
+# mock_write_lag: the TTFT rules of 7.5 and E4 read ttft_reused, loadgen's
+# TTFT of the requests sent on a reused connection. floor-A and Brisk close a
+# connection idle for 30 s (hyper's header_read_timeout), so more of their
+# requests than of direct's open a new connection and carry its TCP (in T
+# also TLS) handshake, which the targets of 02 leave out; in M0 this raised
+# the T delta p99 of floor-A over direct from about 110 to 260 us. ttft over
+# all requests keeps its M0 meaning; its p50 and p99 deltas are reported
+# only. So is, per arm, the number of requests whose TTFT exceeds 1 s, after
+# the warmup and over the whole run, from the interval histograms: in the
+# SUT arms, requests that a race in hyper's HTTP/1 client queued behind
+# another stream on a pooled upstream connection, compared before and after
+# its fix.
+#
 # The session refuses to start unless setup-host.sh --check passes
 # (ALLOW_UNPREPARED_HOST=1 overrides), holds $RESULTS_ROOT/.run-m0.lock for
 # its whole life (the lock of run-m0.sh, which sync.sh checks, so M0 and M1
@@ -503,7 +517,7 @@ has_quantile() {
 
 compared_metrics() {
     case "$1" in
-        s1) echo ttft,chunk_latency,chunk_wire,mock_write_lag ;;
+        s1) echo ttft,ttft_reused,chunk_latency,chunk_wire,mock_write_lag ;;
         s2) echo request_latency ;;
         s3) echo ttft,chunk_latency ;;
     esac
@@ -765,6 +779,68 @@ def last_by(f): reduce .[] as $r ({order: [], by: {}};
         | .by[$k] = $r)
     | [.order[] as $k | .by[$k]];
 def ci_text($t; f): "[\($t.lo | f), \($t.hi | f)]";
+'
+
+# Decoding of loadgen's interval histograms (base64 of an uncompressed HDR V2
+# serialization, read as hdrhistogram 7.6 reads it), shared by the programs
+# that read a result's intervals: hdr_decode gives {low, sigfig, counts}, the
+# counts as [index, count] of the non-empty buckets.
+# shellcheck disable=SC2016
+jq_hdr='
+def hdr_bytes:
+    [explode[] | if . >= 65 and . <= 90 then . - 65 elif . >= 97 and . <= 122 then . - 71
+                 elif . >= 48 and . <= 57 then . + 4 elif . == 43 then 62 elif . == 47 then 63
+                 else empty end] as $s
+    | ($s | length * 3 / 4 | floor) as $n
+    # The sextets a padded end lacks are zero bits, and the bytes they fill
+    # are cut off below.
+    | [range(0; $s | length; 4) as $i
+       | ($s[$i] * 262144 + ($s[$i + 1] // 0) * 4096 + ($s[$i + 2] // 0) * 64 + ($s[$i + 3] // 0)) as $w
+       | ($w / 65536 | floor), (($w / 256 | floor) % 256), ($w % 256)]
+    | .[:$n];
+def hdr_uint($b; $at; $len): reduce $b[$at:$at + $len][] as $x (0; . * 256 + $x);
+def hdr_decode:
+    hdr_bytes as $b
+    | if hdr_uint($b; 0; 4) != 478450451
+      then error("an interval histogram is not an uncompressed HDR V2 serialization") else . end
+    | {low: hdr_uint($b; 16; 8), sigfig: hdr_uint($b; 12; 4),
+       # [index, count] of the non-empty buckets: LEB128 varints (7 bits a
+       # byte, all 8 in a ninth) of ZigZag i64s, a negative one a run of
+       # empty buckets.
+       counts: (reduce $b[40:40 + hdr_uint($b; 4; 4)][] as $x ({i: 0, v: 0, m: 1, out: []};
+                    (if .m == 72057594037927936 then .v += $x * .m | .done = true
+                     else .v += ($x % 128) * .m | .done = ($x < 128) | .m *= 128 end)
+                    | if .done | not then .
+                      else (if .v % 2 == 0 then .v / 2 else -(.v + 1) / 2 end) as $z
+                           | (if $z < 0 then .i -= $z
+                              elif $z == 0 then .i += 1
+                              else .out += [[.i, $z]] | .i += 1 end)
+                           | .v = 0 | .m = 1
+                      end)
+                | .out)};
+def hdr_merge:
+    if length == 0 then null
+    elif (map([.low, .sigfig]) | unique | length) > 1 then error("the interval histograms differ in their bounds")
+    else {low: .[0].low, sigfig: .[0].sigfig,
+          counts: ([.[].counts[]] | group_by(.[0]) | map([.[0][0], (map(.[1]) | add)]))}
+    end;
+# highest_equivalent_value of hdrhistogram for the bucket at counts index
+# $i: the value it reports for anything recorded in that bucket.
+def hdr_value($i):
+    ((2 * pow(10; .sigfig) | log2 | ceil) - 1) as $half_mag
+    | pow(2; $half_mag) as $half
+    | (.low | log2 | floor) as $unit
+    | (($i / $half | floor) - 1) as $bucket
+    | if $bucket < 0 then ($i + 1) * pow(2; $unit) - 1
+      else (($i % $half) + $half + 1) * pow(2; $bucket + $unit) - 1 end;
+# value_at_quantile of hdrhistogram: the highest value equivalent to the
+# bucket in which the running count reaches ceil(q * total).
+def hdr_quantile($q):
+    if . == null then null
+    else ([.counts[][1]] | add) as $total
+         | ([($q * $total | ceil), 1] | max) as $target
+         | hdr_value(first(foreach .counts[] as $e (0; . + $e[1]; if . >= $target then $e[0] else empty end)))
+    end;
 '
 
 # Repetitions of one block whose wanted arms are all valid in one attempt
@@ -1181,7 +1257,7 @@ last_by(.id) as $all
      | if ($e | length) == 0
        then {verdict: "UNDECIDED", text: "E4 decision: undecided, no S1 comparison"}
        elif all($e[]; .verdict == "PASS")
-       then {verdict: "KEEP_2S", text: "E4 decision: keep commit_hold 2s (|TTFT delta p50| <= 10 us and delta p99 <= 30 us everywhere)"}
+       then {verdict: "KEEP_2S", text: "E4 decision: keep commit_hold 2s (ttft_reused |delta p50| <= 10 us and delta p99 <= 30 us everywhere)"}
        elif any($e[]; .verdict == "FAIL")
        then {verdict: "COST", text: "E4 decision: commit_hold 2s exceeds the limits; record the cost for the owner to decide"}
        else {verdict: "UNCERTAIN", text: "E4 decision: uncertain; some intervals straddle the limits or are missing"}
@@ -1310,58 +1386,7 @@ $m[$n] as $s
 # step and answered in the next counts in the next, a negligible share of
 # a 20 s step. Input: a result file.
 # shellcheck disable=SC2016
-prog_ramp_evidence='
-def hdr_bytes:
-    [explode[] | if . >= 65 and . <= 90 then . - 65 elif . >= 97 and . <= 122 then . - 71
-                 elif . >= 48 and . <= 57 then . + 4 elif . == 43 then 62 elif . == 47 then 63
-                 else empty end] as $s
-    | ($s | length * 3 / 4 | floor) as $n
-    # The sextets a padded end lacks are zero bits, and the bytes they fill
-    # are cut off below.
-    | [range(0; $s | length; 4) as $i
-       | ($s[$i] * 262144 + ($s[$i + 1] // 0) * 4096 + ($s[$i + 2] // 0) * 64 + ($s[$i + 3] // 0)) as $w
-       | ($w / 65536 | floor), (($w / 256 | floor) % 256), ($w % 256)]
-    | .[:$n];
-def hdr_uint($b; $at; $len): reduce $b[$at:$at + $len][] as $x (0; . * 256 + $x);
-def hdr_decode:
-    hdr_bytes as $b
-    | if hdr_uint($b; 0; 4) != 478450451
-      then error("an interval histogram is not an uncompressed HDR V2 serialization") else . end
-    | {low: hdr_uint($b; 16; 8), sigfig: hdr_uint($b; 12; 4),
-       # [index, count] of the non-empty buckets: LEB128 varints (7 bits a
-       # byte, all 8 in a ninth) of ZigZag i64s, a negative one a run of
-       # empty buckets.
-       counts: (reduce $b[40:40 + hdr_uint($b; 4; 4)][] as $x ({i: 0, v: 0, m: 1, out: []};
-                    (if .m == 72057594037927936 then .v += $x * .m | .done = true
-                     else .v += ($x % 128) * .m | .done = ($x < 128) | .m *= 128 end)
-                    | if .done | not then .
-                      else (if .v % 2 == 0 then .v / 2 else -(.v + 1) / 2 end) as $z
-                           | (if $z < 0 then .i -= $z
-                              elif $z == 0 then .i += 1
-                              else .out += [[.i, $z]] | .i += 1 end)
-                           | .v = 0 | .m = 1
-                      end)
-                | .out)};
-def hdr_merge:
-    if length == 0 then null
-    elif (map([.low, .sigfig]) | unique | length) > 1 then error("the interval histograms differ in their bounds")
-    else {low: .[0].low, sigfig: .[0].sigfig,
-          counts: ([.[].counts[]] | group_by(.[0]) | map([.[0][0], (map(.[1]) | add)]))}
-    end;
-# value_at_quantile of hdrhistogram: the highest value equivalent to the
-# bucket in which the running count reaches ceil(q * total).
-def hdr_quantile($q):
-    if . == null then null
-    else ((2 * pow(10; .sigfig) | log2 | ceil) - 1) as $half_mag
-         | pow(2; $half_mag) as $half
-         | (.low | log2 | floor) as $unit
-         | ([.counts[][1]] | add) as $total
-         | ([($q * $total | ceil), 1] | max) as $target
-         | first(foreach .counts[] as $e (0; . + $e[1]; if . >= $target then $e[0] else empty end)) as $i
-         | (($i / $half | floor) - 1) as $bucket
-         | if $bucket < 0 then ($i + 1) * pow(2; $unit) - 1
-           else (($i % $half) + $half + 1) * pow(2; $bucket + $unit) - 1 end
-    end;
+prog_ramp_evidence="$jq_hdr"'
 def step_rule:
     test("^emit lag p99(\\.9)? [0-9.]+ us over [0-9]+ sends ") or test("^mock write lag p99 [0-9.]+ us is not below ")
     or test("^[0-9]+ of [0-9]+ requests after the warmup failed ") or test("^[0-9]+ stale keep-alive retries for ");
@@ -2722,6 +2747,56 @@ report_memory() {
     add_verdict "$(jq -c --arg block "$block" --arg session "$SESSION" "$jq_defs$prog_memory" <<<"$report_selection")"
 }
 
+# The requests of an S1 block whose TTFT exceeds 1 s, per arm, from the ttft
+# histograms of the intervals: after the warmup, the window ttft is compared
+# over, and over the whole run. A request counts when the highest value
+# equivalent to its bucket, the value compare reports for it, exceeds 1 s
+# (the buckets there are about 0.5 ms wide). The floor arms of M0 had such
+# requests and direct none; in their reproduction every one had waited
+# behind another stream on a pooled upstream connection until that stream
+# ended, by a race in the HTTP/1 client of hyper 1.11.1, which Brisk
+# shares. The counts compare runs before and after its fix. The threshold assumes a mock TTFT far below 1 s
+# (S1_TTFT_US, in e4 E4_TTFTS_US); one near it would count ordinary
+# requests. The largest TTFT after the warmup is loadgen's summary maximum.
+# Input: the result files (inputs); $arms: per arm, its runs as {file,
+# pair_id, max_us}; $dir: the session directory the files are named under.
+# shellcheck disable=SC2016
+prog_ttft_outliers="$jq_hdr"'
+def over_1s: reduce (.[] | .histograms.ttft | select(. != null) | hdr_decode | . as $h
+                     | .counts[] | select(.[0] as $i | $h | hdr_value($i) > 1000000000) | .[1]) as $n (0; . + $n);
+(reduce inputs as $r ({};
+     .[input_filename] = ($r.warmup_intervals as $w
+                          | {after: ([$r.intervals[] | select(.index >= $w)] | over_1s),
+                             whole: ($r.intervals | over_1s)}))) as $by_file
+| [$arms[]
+   | [.runs[] | . as $run | ($by_file[$dir + .file]
+                             // error("no counts of \($run.file)")) as $c | $run + $c] as $runs
+   | {arm, runs: $runs, after: ([$runs[].after] | add), whole: ([$runs[].whole] | add),
+      max_us: ([$runs[].max_us | numbers] | max)}] as $by
+| {id: "\($block):ttft-over-1s", block: $block, kind: "report", rule: "ttft over 1 s", verdict: "REPORT",
+   gated: false, extendable: false,
+   text: ("\($block) requests with TTFT above 1 s per arm, after the warmup (per repetition; whole run), and the largest TTFT after the warmup: "
+          + ([$by[] | if (.runs | length) == 0 then "\(.arm) no valid run"
+                      else "\(.arm) \(.after) (\([.runs[].after | tostring] | join(", ")); \(.whole)), "
+                           + "\(if .max_us == null then "n/a" else .max_us / 1000 | fixed1 end) ms" end]
+             | join("; "))
+          + " (reported)"),
+   data: {threshold_ns: 1000000000, arms: $by}}
+'
+jq_programs+=(prog_ttft_outliers)
+
+report_ttft_outliers() {
+    local block="$1" selection="$2" report_selection arms
+    local -a files
+    report_selection="$(pt_report_selection "$selection")"
+    arms="$(jq -c '[.runs | to_entries[] | {arm: .key, runs: [.value[] | {file, pair_id, max_us: .summary_us.ttft.max}]}]' \
+        <<<"$report_selection")"
+    mapfile -t files < <(jq -r '.[].runs[].file' <<<"$arms")
+    # Without files, inputs would read the standard input.
+    add_verdict "$(jq -nc --argjson arms "$arms" --arg block "$block" --arg dir "$run_dir/" \
+        "$jq_defs$prog_ttft_outliers" "${files[@]/#/$run_dir/}" </dev/null)"
+}
+
 # perf stat counts and the legacy pool lock share (C21) of the S2 perf runs
 # of a config, or why there are none.
 report_perf() {
@@ -2760,6 +2835,9 @@ s3_limit_us() {
     esac
 }
 
+# The 7.5 TTFT rules read ttft_reused, whose requests carry no new
+# connection's handshake (see TTFT in the header); ttft over all requests is
+# reported next to them.
 gate_s1_checks() {
     local block="$1" config="$2" scope="$3" t50=100 t99=300 p99=75 cmp
     shift 3
@@ -2769,13 +2847,17 @@ gate_s1_checks() {
     fi
     check_delta "$block" brisk-vs-floor-a chunk_latency 0.99 le 20 0 "$scope" "7.5 floor-A" "$fa"
     check_delta "$block" brisk-vs-floor-a chunk_latency 0.999 le 100 0 "$scope" "7.5 floor-A" "$fa"
-    check_delta "$block" brisk-vs-floor-a ttft 0.5 le 20 0 "$scope" "7.5 floor-A" "$fa"
-    check_delta "$block" brisk-vs-floor-a ttft 0.99 le 60 15 "$scope" "7.5 floor-A" "$fa"
-    check_delta "$block" brisk-vs-direct ttft 0.5 le "$t50" 0 "$scope" "7.5 direct" "$di"
-    check_delta "$block" brisk-vs-direct ttft 0.99 le "$t99" "$p99" "$scope" "7.5 direct" "$di"
+    check_delta "$block" brisk-vs-floor-a ttft_reused 0.5 le 20 0 "$scope" "7.5 floor-A" "$fa"
+    check_delta "$block" brisk-vs-floor-a ttft_reused 0.99 le 60 15 "$scope" "7.5 floor-A" "$fa"
+    check_delta "$block" brisk-vs-direct ttft_reused 0.5 le "$t50" 0 "$scope" "7.5 direct" "$di"
+    check_delta "$block" brisk-vs-direct ttft_reused 0.99 le "$t99" "$p99" "$scope" "7.5 direct" "$di"
     check_delta "$block" brisk-vs-direct chunk_latency 0.5 le 30 0 "$scope" "7.5 direct" "$di"
     check_delta "$block" brisk-vs-direct chunk_latency 0.99 le 100 0 "$scope" "7.5 direct" "$di"
     check_delta "$block" brisk-vs-direct chunk_latency 0.999 le 500 0 "$scope" "7.5 direct" "$di"
+    check_delta "$block" brisk-vs-floor-a ttft 0.5 report 0 0 reported "ttft all requests" "$fa"
+    check_delta "$block" brisk-vs-floor-a ttft 0.99 report 0 0 reported "ttft all requests" "$fa"
+    check_delta "$block" brisk-vs-direct ttft 0.5 report 0 0 reported "ttft all requests" "$di"
+    check_delta "$block" brisk-vs-direct ttft 0.99 report 0 0 reported "ttft all requests" "$di"
     for cmp in brisk-vs-floor-a brisk-vs-direct; do
         check_delta "$block" "$cmp" chunk_wire 0.5 report 0 0 reported "7.5 chunk_wire" "S1 ${cmp//-vs-/ vs }"
         check_delta "$block" "$cmp" chunk_wire 0.99 report 0 0 reported "7.5 chunk_wire" "S1 ${cmp//-vs-/ vs }"
@@ -2851,6 +2933,7 @@ evaluate_block() {
     report_cpu "$scen" "$block" "$selection" "$@"
     if [[ "$scen" == s1 ]]; then
         report_memory "$block" "$selection"
+        report_ttft_outliers "$block" "$selection"
     fi
     if [[ "$scen" == s2 ]]; then
         report_perf "$block" "$config"
@@ -2872,10 +2955,15 @@ evaluate_block() {
                 e2-chunk "E2 S1 concat vs segments"
             ;;
         e4:s1)
-            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.5 abs 10 0 decision \
+            # As in gate_s1_checks: the rules on ttft_reused, ttft reported.
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft_reused 0.5 abs 10 0 decision \
                 e4-p50 "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
-            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.99 le 30 0 decision \
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft_reused 0.99 le 30 0 decision \
                 e4-p99 "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.5 report 0 0 reported \
+                "ttft all requests" "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
+            check_delta "$block" brisk-hold2s-vs-brisk-hold0s ttft 0.99 report 0 0 reported \
+                "ttft all requests" "E4 S1 ${var:+$var }commit_hold 2s vs 0s"
             ;;
     esac
 }
@@ -3389,6 +3477,12 @@ for sub in selfcheck stream nonstream bigbody; do
 done
 [[ "$("$loadgen" stream --help)" == *--max-slip-us* ]] ||
     die "$BIN_DIR/brisk-loadgen stream has no --max-slip-us; sync a build that has it"
+# compare parses its metrics before it reads a file, so an older build names
+# the one it does not know even for results that do not exist.
+if has_scenario s1 && [[ "$("$loadgen" compare --a /dev/null --b /dev/null --metric ttft_reused \
+    --out /dev/null 2>&1)" == *"unknown metric"* ]]; then
+    die "$BIN_DIR/brisk-loadgen does not know the metric ttft_reused; sync a build that has it"
+fi
 if ((session_has_floor)); then
     [[ "$("$floor" --help)" == *--mode* ]] || die "$BIN_DIR/brisk-floor has no --mode (floor-B); build the M1 floor"
 fi
