@@ -4,8 +4,6 @@
 //! versions, no client authentication), written separately because `brisk`
 //! must not depend on the benchmark crates.
 
-use std::error::Error as StdError;
-use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,9 +20,10 @@ use crate::config::TlsFiles;
 pub(crate) const INBOUND_ALPN: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 /// Why the inbound TLS configuration could not be built.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum TlsError {
     /// The certificate file is unreadable or malformed.
+    #[error("cannot load TLS certificates from {}", path.display())]
     Certificate {
         /// The certificate file.
         path: PathBuf,
@@ -32,11 +31,13 @@ pub(crate) enum TlsError {
         source: pem::Error,
     },
     /// The certificate file holds no certificate.
+    #[error("no certificate found in {}", path.display())]
     NoCertificate {
         /// The certificate file.
         path: PathBuf,
     },
     /// The private key file could not be read.
+    #[error("cannot read TLS key {}", path.display())]
     KeyIo {
         /// The key file.
         path: PathBuf,
@@ -45,6 +46,7 @@ pub(crate) enum TlsError {
     },
     /// The private key file holds no usable key. The PEM parser's own error
     /// is not kept: its base64 diagnostics describe bytes of the key file.
+    #[error("TLS key {}: {reason}", path.display())]
     Key {
         /// The key file.
         path: PathBuf,
@@ -52,34 +54,8 @@ pub(crate) enum TlsError {
         reason: &'static str,
     },
     /// rustls rejected the certificate and key, e.g. they do not match.
-    Rustls(rustls::Error),
-}
-
-impl fmt::Display for TlsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Certificate { path, .. } => {
-                write!(f, "cannot load TLS certificates from {}", path.display())
-            }
-            Self::NoCertificate { path } => {
-                write!(f, "no certificate found in {}", path.display())
-            }
-            Self::KeyIo { path, .. } => write!(f, "cannot read TLS key {}", path.display()),
-            Self::Key { path, reason } => write!(f, "TLS key {}: {reason}", path.display()),
-            Self::Rustls(_) => f.write_str("the TLS certificate and key were rejected"),
-        }
-    }
-}
-
-impl StdError for TlsError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Certificate { source, .. } => Some(source),
-            Self::KeyIo { source, .. } => Some(source),
-            Self::Rustls(source) => Some(source),
-            Self::NoCertificate { .. } | Self::Key { .. } => None,
-        }
-    }
+    #[error("the TLS certificate and key were rejected")]
+    Rustls(#[source] rustls::Error),
 }
 
 /// Builds the acceptor from a PEM certificate chain (leaf first) and its PEM
@@ -322,5 +298,52 @@ qF7MmQjyDNIkahf+Fxahp3NxLmmhRANCAATiN1kOnbp8OFPuQSDV+dPDSnMFSv5y
             key: dir.write("key.pem", other_key),
         };
         assert!(matches!(rejection(&files), TlsError::Rustls(_)));
+    }
+
+    #[test]
+    fn every_variant_keeps_its_message_and_source() {
+        use std::error::Error as _;
+
+        let path = PathBuf::from("dir/tls.pem");
+        let cases: [(TlsError, &str, bool); 5] = [
+            (
+                TlsError::Certificate {
+                    path: path.clone(),
+                    source: pem::Error::NoItemsFound,
+                },
+                "cannot load TLS certificates from dir/tls.pem",
+                true,
+            ),
+            (
+                TlsError::NoCertificate { path: path.clone() },
+                "no certificate found in dir/tls.pem",
+                false,
+            ),
+            (
+                TlsError::KeyIo {
+                    path: path.clone(),
+                    source: io::Error::other("denied"),
+                },
+                "cannot read TLS key dir/tls.pem",
+                true,
+            ),
+            (
+                TlsError::Key {
+                    path,
+                    reason: "malformed PEM",
+                },
+                "TLS key dir/tls.pem: malformed PEM",
+                false,
+            ),
+            (
+                TlsError::Rustls(rustls::Error::NoCertificatesPresented),
+                "the TLS certificate and key were rejected",
+                true,
+            ),
+        ];
+        for (err, message, has_source) in cases {
+            assert_eq!(err.to_string(), message);
+            assert_eq!(err.source().is_some(), has_source, "{message}");
+        }
     }
 }
