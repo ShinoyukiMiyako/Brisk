@@ -778,6 +778,7 @@ selfcheck_status=not_run
 selfcheck_detail=""
 perf_status=not_needed
 perf_reason="the session runs no S2 block"
+perf_cmd=()
 perf_events=""
 perf_hitm_events=""
 perf_hitm_note=""
@@ -2010,7 +2011,7 @@ sample_window() {
         return 0
     fi
     if ((perf)) && [[ -n "${pids[sut]:-}" ]]; then
-        perf stat -x, -e "$perf_events" -p "${pids[sut]}" -o "$logs/$tag.perf.csv" -- sleep "$window" \
+        "${perf_cmd[@]}" stat -x, -e "$perf_events" -p "${pids[sut]}" -o "$logs/$tag.perf.csv" -- sleep "$window" \
             >/dev/null 2>"$logs/$tag.perf.err" &
         perf_pid=$!
     fi
@@ -3428,14 +3429,14 @@ perf_generic_events="task-clock,context-switches,cpu-migrations"
 # which case perf reports it as not supported).
 perf_counts() {
     local out
-    out="$(perf stat -x, -e "$1" -- true 2>&1 >/dev/null)" || return 1
+    out="$("${perf_cmd[@]}" stat -x, -e "$1" -- true 2>&1 >/dev/null)" || return 1
     awk -F, -v ev="$1" 'index($3, ev) == 1 && $1 ~ /^[0-9.]+$/ { ok = 1 } END { exit !ok }' <<<"$out"
 }
 
 # Decides whether the S2 perf runs happen and with which events.
 perf_probe() {
-    local paranoid ev out
-    local -a hitm=() candidates
+    local paranoid ev out attempt
+    local -a hitm=() candidates cmd
     if ((session_has_brisk + session_has_floor == 0)) || ! has_scenario s2; then
         return 0
     fi
@@ -3444,11 +3445,24 @@ perf_probe() {
         return 0
     fi
     paranoid="$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)" || paranoid=unreadable
+    # As for the C21 profile, perf may need sudo -n: the benchmark host
+    # (perf_event_paranoid 4) refuses an unprivileged perf stat.
+    perf_cmd=() perf_reason=""
+    if command -v perf >/dev/null; then
+        for attempt in "perf" "sudo -n perf"; do
+            read -r -a cmd <<<"$attempt"
+            if out="$("${cmd[@]}" stat -x, -e task-clock -- true 2>&1 >/dev/null)"; then
+                perf_cmd=("${cmd[@]}")
+                break
+            fi
+            perf_reason+="${perf_reason:+; }$attempt stat fails: $(head -n 1 <<<"$out")"
+        done
+    fi
     if ! command -v perf >/dev/null; then
         perf_status=unavailable perf_reason="perf is not installed"
-    elif ! out="$(perf stat -x, -e task-clock -- true 2>&1 >/dev/null)"; then
+    elif ((${#perf_cmd[@]} == 0)); then
         perf_status=unavailable
-        perf_reason="perf stat fails (perf_event_paranoid $paranoid): $(head -n 1 <<<"$out")"
+        perf_reason+=" (perf_event_paranoid $paranoid)"
     else
         IFS=, read -r -a candidates <<<"${PERF_EVENTS:-$perf_hitm_candidates}"
         for ev in "${candidates[@]}"; do
@@ -3467,7 +3481,7 @@ perf_probe() {
     if [[ "$PERF" == 1 && ("$perf_status" != available || ${#hitm[@]} -eq 0) ]]; then
         die "PERF=1 but ${perf_reason:-$perf_hitm_note}"
     fi
-    log "perf: $perf_status${perf_reason:+ ($perf_reason)}${perf_events:+; events $perf_events}"
+    log "perf: $perf_status${perf_reason:+ ($perf_reason)}${perf_events:+; events $perf_events}${perf_cmd[*]:+; with ${perf_cmd[*]}}"
 }
 
 # ---------------------------------------------------------------- C21
