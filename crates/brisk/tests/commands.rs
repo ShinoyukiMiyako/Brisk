@@ -8,7 +8,7 @@ use std::process::Output;
 
 use brisk_gateway::auth::{is_well_formed, key_digest};
 
-use support::{TEST_MODEL, TempDir, brisk, hex};
+use support::{CERT_PEM, KEY_PEM, TEST_MODEL, TempDir, brisk, hex};
 
 /// Every upstream key in the `check-config` configuration.
 const SECRETS: [&str; 3] = ["sk-inline-secret-1", "sk-file-secret-2", "sk-env-secret-3"];
@@ -109,7 +109,9 @@ fn an_invalid_log_filter_fails_before_any_output() {
 
 /// A `*.local.toml` with every kind of secret source, on local and private
 /// addresses, arranged to raise each kind of channel warning, in a directory
-/// of its own per `test` (tests run in parallel).
+/// of its own per `test` (tests run in parallel). On Unix the configuration,
+/// which holds an inline secret, and the key file are both mode 0644, which
+/// the loader warns about.
 fn check_config_dir(test: &str) -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new(test);
     dir.write("upstream.key", &format!("{}\n", SECRETS[1]));
@@ -157,6 +159,10 @@ connect_timeout = "3s"
             inline = SECRETS[0],
         ),
     );
+    #[cfg(unix)]
+    for path in [dir.path().join("upstream.key"), config.clone()] {
+        support::set_mode(&path, 0o644);
+    }
     (dir, config)
 }
 
@@ -193,23 +199,44 @@ fn check_config_prints_the_summary_without_secrets() {
         ],
         "{stdout}"
     );
-    let warnings: Vec<&str> = lines[8..].to_vec();
-    // On Unix the loader also warns about the world-readable secret files.
+    // The loader's warnings come first, in the order it checked the files:
+    // the key file while building the channels, then the configuration.
+    // Windows ACLs are not inspected, so there are none there.
+    #[cfg(unix)]
+    let loader_warnings: &[String] = &[
+        support::world_readable_warning(&config.with_file_name("upstream.key")),
+        support::world_readable_warning(&config),
+    ];
+    #[cfg(not(unix))]
+    let loader_warnings: &[String] = &[];
+    let channel_warnings = [
+        r#"channel "from-file" has a base_url without a path, so /chat/completions is requested at the root; a version prefix such as /v1 is usually missing"#,
+        r#"channel "from-env" uses plain http to a remote host; its key travels in cleartext"#,
+        "upstream 127.0.0.1:18081 is reached through several client profiles, so its connections are split across pools",
+    ];
+    let expected: Vec<String> = loader_warnings
+        .iter()
+        .map(String::as_str)
+        .chain(channel_warnings)
+        .map(|warning| format!("  {warning}"))
+        .collect();
     assert_eq!(
         lines[7],
-        format!("warnings: {}", warnings.len()),
+        format!("warnings: {}", expected.len()),
         "{stdout}"
     );
-    let channel_warnings = [
-        r#"  channel "from-file" has a base_url without a path, so /chat/completions is requested at the root; a version prefix such as /v1 is usually missing"#,
-        r#"  channel "from-env" uses plain http to a remote host; its key travels in cleartext"#,
-        "  upstream 127.0.0.1:18081 is reached through several client profiles, so its connections are split across pools",
-    ];
-    assert_eq!(
-        warnings[warnings.len() - channel_warnings.len()..],
-        channel_warnings,
-        "{stdout}"
-    );
+    assert_eq!(lines[8..], expected, "{stdout}");
+
+    // `run` also logs each loader warning at warn level once tracing is up
+    // (1.5); the channel warnings are the gateway's to log.
+    let logged: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains(" WARN brisk: "))
+        .collect();
+    assert_eq!(logged.len(), loader_warnings.len(), "{stderr}");
+    for (line, warning) in logged.iter().zip(loader_warnings) {
+        assert!(line.ends_with(warning.as_str()), "{line:?} vs {warning:?}");
+    }
 }
 
 #[test]
@@ -249,30 +276,6 @@ fn check_config_fails_on_a_missing_file() {
     let stderr = text(&output.stderr);
     assert!(stderr.contains("absent.toml"), "{stderr}");
 }
-
-/// Self-signed P-256 end-entity certificate for `localhost`, valid until
-/// 2126, the same as in the `tls` module's tests; test material only.
-const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBuDCCAV+gAwIBAgIUXsfLXsgZaYwGl11TTQjWsMyyqV4wCgYIKoZIzj0EAwIw
-FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkxOTEzMzAxMloYDzIxMjYwODI2
-MTMzMDEyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
-PQMBBwNCAASrldOJF9nKGCFh+pChEbyx+PGi5vJbRR7jOXPqltwRzwDQufBBQKWg
-cuYmuVafqOso38OO9iq6f3Zb4RmURh4Ao4GMMIGJMB0GA1UdDgQWBBSDnnfakiQN
-pmtLrjzU765j9mMchTAfBgNVHSMEGDAWgBSDnnfakiQNpmtLrjzU765j9mMchTAU
-BgNVHREEDTALgglsb2NhbGhvc3QwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMC
-B4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDRwAwRAIge9OlM9/8
-LrXfZOG22zaiM7D/202t8i707sZkljieD7sCIGlhT4LplDyqsoO23EAx0AjOCQ2a
-DN/cZ0O6hhVqXyVN
------END CERTIFICATE-----
-";
-
-/// The key of [`CERT_PEM`]; test material only.
-const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmPbhLbDR/HLa13Fn
-X/D6JwJLDAUkp7EMndkpEFCXzcahRANCAASrldOJF9nKGCFh+pChEbyx+PGi5vJb
-RR7jOXPqltwRzwDQufBBQKWgcuYmuVafqOso38OO9iq6f3Zb4RmURh4A
------END PRIVATE KEY-----
-";
 
 /// A valid P-256 key that does not match [`CERT_PEM`]; test material only.
 const OTHER_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----

@@ -8,6 +8,30 @@ use std::process::Command;
 /// Default model of every test (4.1); the brackets must pass through.
 pub(crate) const TEST_MODEL: &str = "grok-4.6(xhigh)";
 
+/// Self-signed P-256 end-entity certificate for `localhost`, valid until
+/// 2126, the same as in the `tls` module's tests; test material only.
+pub(crate) const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBuDCCAV+gAwIBAgIUXsfLXsgZaYwGl11TTQjWsMyyqV4wCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkxOTEzMzAxMloYDzIxMjYwODI2
+MTMzMDEyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAASrldOJF9nKGCFh+pChEbyx+PGi5vJbRR7jOXPqltwRzwDQufBBQKWg
+cuYmuVafqOso38OO9iq6f3Zb4RmURh4Ao4GMMIGJMB0GA1UdDgQWBBSDnnfakiQN
+pmtLrjzU765j9mMchTAfBgNVHSMEGDAWgBSDnnfakiQNpmtLrjzU765j9mMchTAU
+BgNVHREEDTALgglsb2NhbGhvc3QwDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMC
+B4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDRwAwRAIge9OlM9/8
+LrXfZOG22zaiM7D/202t8i707sZkljieD7sCIGlhT4LplDyqsoO23EAx0AjOCQ2a
+DN/cZ0O6hhVqXyVN
+-----END CERTIFICATE-----
+";
+
+/// The key of [`CERT_PEM`]; test material only.
+pub(crate) const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmPbhLbDR/HLa13Fn
+X/D6JwJLDAUkp7EMndkpEFCXzcahRANCAASrldOJF9nKGCFh+pChEbyx+PGi5vJb
+RR7jOXPqltwRzwDQufBBQKWgcuYmuVafqOso38OO9iq6f3Zb4RmURh4A
+-----END PRIVATE KEY-----
+";
+
 /// The `brisk` binary with the default log filter: `RUST_LOG` from the
 /// environment running the tests is removed.
 pub(crate) fn brisk() -> Command {
@@ -48,6 +72,24 @@ impl Drop for TempDir {
         // Best effort: a leftover directory in the temp dir harms nothing.
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// Sets the permission bits of `path`, so that which files the loader warns
+/// about does not depend on the umask of the machine running the tests.
+#[cfg(unix)]
+pub(crate) fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .expect("set the file mode");
+}
+
+/// The loader's warning about `path`, a file holding a secret at mode 0644.
+pub(crate) fn world_readable_warning(path: &Path) -> String {
+    format!(
+        "{} holds a secret and is readable by other users (mode 644); consider chmod o-r",
+        path.display()
+    )
 }
 
 /// Lowercase hexadecimal of `bytes`.
