@@ -109,8 +109,10 @@
 # whose interval half width exceeds a quarter of its limit is reported only.
 # While a gated verdict of a block is UNCERTAIN, the block gets one more
 # repetition at a time, up to EXTEND_MAX_REPS (EXTEND_UNCERTAIN). The ramp
-# ratio Brisk / floor-A: all of at least 3 pairs >= 0.85 PASS, mean < 0.85
-# FAIL, else UNCERTAIN. The e-sessions print their rules as MET or NOT_MET
+# ratio Brisk / floor-A over at least 3 pairs: all >= 0.85 PASS, mean < 0.85
+# FAIL, else UNCERTAIN; a ramp without a sustainable step lies below
+# RAMP_START, which bounds its pair's ratio, and a tool-limited block is
+# only reported. The e-sessions print their rules as MET or NOT_MET
 # (TRIGGERED or not in e11) and a decision. Memory, idle RSS, CPU per chunk
 # and per request, chunk_wire, the strip cost and the HITM counts are
 # reported only, with the contract's reference values where it names them.
@@ -826,16 +828,39 @@ prog_ramp_pairs='
                  b: (map(select(.arm == $b)) | .[0].ramp)}])}
 '
 
-# The throughput verdict of a ramp block: 7.5 (gate) or the E1 rule.
+# The throughput verdict of a ramp block: 7.5 (gate) or the E1 rule. A ramp
+# without a sustainable step failed its first step, so its rate lies below
+# RAMP_START ($start), and its pair gets bounds of the ratio B / A instead
+# of a value: [0, RAMP_START / A] when B has no rate, [B / RAMP_START, none]
+# when A has none, no bound when neither has. The 7.5 rule over at least 3
+# pairs: PASS when every ratio is at least 0.85 (every low bound), FAIL when
+# their mean is below 0.85 (the mean of the high bounds), else UNCERTAIN,
+# which more pairs can settle unless a pair has no bound. A tool-limited
+# block is reported only, whatever its ratios.
 # shellcheck disable=SC2016
 prog_ramp_verdict='
+def ramp_rate: if . == null then "<" + ($start | rate) else rate end;
+def ratio_text: if .lo == .hi then .lo | fixed3
+                elif .hi != null then "<" + (.hi | fixed3)
+                elif .lo > 0 then ">" + (.lo | fixed3)
+                else "n/a" end;
 .tool as $tool
 | .pairs as $pairs
 | ($pairs | length) as $n
 | ([$pairs[] | .a.max_sustainable_rate | numbers] | max) as $amax
-| (if $tool == null or $amax == null then null else ($amax >= $share * $tool) end) as $limited
-| [$pairs[] | if ((.a.max_sustainable_rate // 0) > 0) and (.b.max_sustainable_rate != null)
-              then .b.max_sustainable_rate / .a.max_sustainable_rate else null end] as $ratios
+# Without any rate A stays below RAMP_START, which the tool limit, a step
+# rate itself, is at least.
+| (if $tool == null then null
+   elif $amax != null then ($amax >= $share * $tool)
+   elif $share * $tool >= $start then false
+   else null end) as $limited
+| [$pairs[] | .a.max_sustainable_rate as $ra | .b.max_sustainable_rate as $rb
+   | if $ra != null and $rb != null then {lo: ($rb / $ra), hi: ($rb / $ra)}
+     elif $ra != null then {lo: 0, hi: ($start / $ra)}
+     elif $rb != null then {lo: ($rb / $start), hi: null}
+     else {lo: 0, hi: null} end] as $bounds
+| [$bounds[] | if .lo == .hi then .lo else null end] as $ratios
+| ([$bounds[] | select(.lo == 0 and .hi == null)] | length) as $unbounded
 | (if $session == "e1" then
      {rule: "e1-throughput", counts: false, statistical: false,
       rule_text: "rule: at least 3 pairs, \($b) never a step below \($a) and a step (\($step_pct)%) above it in 2",
@@ -849,28 +874,35 @@ prog_ramp_verdict='
                                              and .b.last_step >= .a.last_step + 1)] | length) >= 2
                 then "MET" else "NOT_MET" end)}
    else
+     # Tool-limited first: such a block is reported only, whatever else holds.
      (if $n == 0 then {verdict: "MISSING", note: "no pair of valid ramps"}
-      elif any($ratios[]; . == null) then {verdict: "UNCERTAIN", note: "a ramp has no sustainable step"}
       elif $limited == true then {verdict: "REPORT", note: "tool-limited: \($a) reached \($amax / $tool | pct) of the direct ramp"}
+      elif $limited == null and $tool != null
+      then {verdict: "UNCERTAIN",
+            note: "\($a) has no sustainable step in any pair, and RAMP_START exceeds \($share) of the tool limit, so whether the block is tool-limited is unknown"}
       elif $limited == null then {verdict: "UNCERTAIN", note: "tool limit unknown: no valid direct ramp"}
-      elif $n >= 3 and all($ratios[]; . >= 0.85) then {verdict: "PASS"}
-      elif ($ratios | add / length) < 0.85 then {verdict: "FAIL"}
+      elif $n < 3 then {verdict: "UNCERTAIN", statistical: true, note: "\($n) pair(s), the rule needs 3"}
+      elif all($bounds[]; .lo >= 0.85) then {verdict: "PASS"}
+      elif all($bounds[]; .hi != null) and ([$bounds[].hi] | add / length) < 0.85 then {verdict: "FAIL"}
+      elif $unbounded > 0
+      then {verdict: "UNCERTAIN",
+            note: "neither ramp of \($unbounded) pair(s) sustained RAMP_START (\($start | rate) req/s), so their ratios have no bound; lower RAMP_START"}
       else {verdict: "UNCERTAIN", statistical: true} end)
      | . + {rule: "7.5 S2 throughput",
-            rule_text: "rule: all of at least 3 ratios >= 0.85 PASS, mean < 0.85 FAIL"}
+            rule_text: "rule: at least 3 pairs, every ratio >= 0.85 PASS, their mean < 0.85 FAIL"}
      | .counts = ($scope == "gated" and .verdict != "REPORT")
    end) as $v
-| ([$pairs[] | "\(.b.max_sustainable_rate | rate)/\(.a.max_sustainable_rate | rate)"] | join(", ")) as $rates
+| ([$pairs[] | "\(.b.max_sustainable_rate | ramp_rate)/\(.a.max_sustainable_rate | ramp_rate)"] | join(", ")) as $rates
 | (if $v.note == null then "" else ": \($v.note)" end) as $note
 | {id: "\($block):ramp", block: $block, kind: "ramp", rule: $v.rule, verdict: $v.verdict, gated: $v.counts,
    extendable: ($v.counts and $v.verdict == "UNCERTAIN" and $v.statistical == true),
    text: ("\($block): max sustainable rate \($b)/\($a) per pair [\($rates)] req/s, ratios ["
-          + ([$ratios[] | fixed3] | join(", "))
+          + ([$bounds[] | ratio_text] | join(", "))
           + "]; direct tool limit \($tool | rate) req/s; \($v.rule_text): \($v.verdict)"
           + (if $v.counts then " (gated\($note))"
              elif $session == "e1" then ""
              else " (reported\($note))" end)),
-   data: {tool: $tool, limited: $limited, ratios: $ratios, pairs: $pairs}}
+   data: {tool: $tool, limited: $limited, ratios: $ratios, ratio_bounds: $bounds, pairs: $pairs}}
 '
 
 # Sustainable rate per vCPU of the SUT, from the ramp pairs.
@@ -2410,8 +2442,8 @@ evaluate_ramp() {
     fi
     pairs="$(jq -sc --arg c "$config" --arg a "$a" --arg b "$b" "$prog_ramp_pairs" "$run_dir/runs.jsonl")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" --arg scope "$scope" \
-        --argjson share "$RAMP_TOOL_LIMIT_SHARE" --arg step_pct "$RAMP_STEP_PCT" "$jq_defs$prog_ramp_verdict" \
-        <<<"$pairs")"
+        --argjson share "$RAMP_TOOL_LIMIT_SHARE" --argjson start "$RAMP_START" --arg step_pct "$RAMP_STEP_PCT" \
+        "$jq_defs$prog_ramp_verdict" <<<"$pairs")"
     add_verdict "$(jq -c --arg block "$block" --arg a "$a" --arg b "$b" --arg session "$SESSION" \
         --argjson cpus "$(cpu_count "$SUT_CPUS")" "$jq_defs$prog_ramp_vcpu" <<<"$pairs")"
 }
