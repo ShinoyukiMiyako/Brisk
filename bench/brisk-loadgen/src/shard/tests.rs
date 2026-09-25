@@ -43,6 +43,9 @@ enum Behavior {
     CloseWithoutResponse,
     /// Read the request and never answer.
     Hold,
+    /// Answer the first request of a connection, then read the second one
+    /// and never answer.
+    HoldSecondRequest,
     /// Send the head and the first chunk of a stream, then stall.
     StallAfterFirstChunk,
 }
@@ -150,6 +153,10 @@ fn serve(mut stream: TcpStream, behavior: Behavior) {
                 return;
             }
             Behavior::Hold => {
+                thread::sleep(Duration::from_secs(5));
+                return;
+            }
+            Behavior::HoldSecondRequest if served == 1 => {
                 thread::sleep(Duration::from_secs(5));
                 return;
             }
@@ -303,6 +310,22 @@ fn streams_record_ttft_and_chunk_metrics() {
     let d = crate::diagnostics::Diagnostics::summarize(&run.output.diagnostics, 0);
     assert_eq!(d.fresh_conn_sends, 1);
     assert_eq!(d.fresh_conn_ttft.map(|s| s.count), Some(1));
+    // TTFT on reused connections is the TTFT of all requests less the one
+    // that opened the connection, value for value.
+    let fresh = d
+        .fresh_conn_ttft
+        .expect("the first request opened the connection");
+    assert_eq!(
+        run.count(Metric::TtftReused),
+        run.count(Metric::Ttft) - fresh.count
+    );
+    assert_eq!(run.count(Metric::TtftReused), c.reused_sends);
+    let mut handshake = run.histograms[&Metric::Ttft].clone();
+    handshake
+        .subtract(&run.histograms[&Metric::TtftReused])
+        .expect("every reused TTFT is also a TTFT");
+    assert_eq!(handshake.len(), fresh.count);
+    assert!(handshake.equivalent(handshake.min(), fresh.min_ns));
     let slip = d.request_slip.expect("pooled sends measure the slip");
     assert_eq!(slip.count, 19);
     assert!(slip.max_ns < 100_000_000, "{slip:?}");
@@ -367,6 +390,23 @@ fn stale_keep_alive_connections_are_retried_once() {
     // The retry keeps the original scheduled time, so its latency includes
     // the failed attempt; the emit lag is recorded once per request.
     assert_eq!(run.count(Metric::EmitLag), 10);
+}
+
+#[test]
+fn stale_retries_stay_out_of_ttft_on_reused_connections() {
+    let addr = spawn_server(Behavior::DropSecondRequest);
+    let (segments, end) = fixed(10.0, 1_000);
+    let run = run_shard(addr, STREAM, segments, end + 200_000_000, SEC_NS * 5, None);
+    let c = run.output.counters;
+    assert_eq!(run.requests, 10, "{:?}", run.errors);
+    assert_eq!(c.stale_retries, 9);
+    // Every request is answered on a connection it opened: the first on its
+    // only attempt, the others on their retry after the pooled attempt.
+    let d = crate::diagnostics::Diagnostics::summarize(&run.output.diagnostics, 0);
+    assert_eq!(d.fresh_conn_sends, 10);
+    assert_eq!(d.fresh_conn_ttft.map(|s| s.count), Some(10));
+    assert_eq!(run.count(Metric::Ttft), 10);
+    assert_eq!(run.count(Metric::TtftReused), 0);
 }
 
 #[test]
@@ -468,9 +508,41 @@ fn unanswered_streams_leave_a_ttft_lower_bound() {
     let ttft = &run.histograms[&Metric::Ttft];
     assert_eq!(ttft.len(), 3);
     assert!(ttft.min() >= 199_000_000, "{}", ttft.min());
+    // Each request found the pool empty and opened a connection of its own,
+    // so none of the bounds is a TTFT on a reused connection.
+    assert_eq!(c.connections_opened, 3);
+    assert_eq!(run.count(Metric::TtftReused), 0);
     // Without a marker the mock's chunk schedule is unknown.
     assert_eq!(run.count(Metric::ChunkLatency), 0);
     assert_eq!((c.censored_requests, c.censored_samples), (3, 3));
+}
+
+#[test]
+fn unanswered_streams_on_reused_connections_leave_a_reused_ttft_lower_bound() {
+    let addr = spawn_server(Behavior::HoldSecondRequest);
+    let (segments, end) = fixed(10.0, 300);
+    let run = run_shard(addr, STREAM, segments, end + 100_000_000, SEC_NS * 10, None);
+    let c = run.output.counters;
+    // Scheduled 400, 300 and 200 ms before the end: the first request opens
+    // a connection and is answered, the second reuses it and is held, the
+    // third finds the pool empty and is answered on a connection of its own.
+    assert!(run.errors.is_empty(), "{:?}", run.errors);
+    assert_eq!(run.requests, 2);
+    assert_eq!((c.connections_opened, c.reused_sends), (2, 1));
+    assert_eq!(c.open_at_end, 1);
+    let d = crate::diagnostics::Diagnostics::summarize(&run.output.diagnostics, 0);
+    let fresh = d
+        .fresh_conn_ttft
+        .expect("two requests opened a connection")
+        .count;
+    assert_eq!(fresh, 2);
+    assert_eq!(run.count(Metric::Ttft), 3);
+    // The held request's lower bound is the only TTFT on a reused
+    // connection, recorded under both metrics.
+    let reused = &run.histograms[&Metric::TtftReused];
+    assert_eq!(reused.len(), run.count(Metric::Ttft) - fresh);
+    assert!(reused.min() >= 299_000_000, "{}", reused.min());
+    assert_eq!((c.censored_requests, c.censored_samples), (1, 2));
 }
 
 #[test]
